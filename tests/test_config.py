@@ -15,12 +15,14 @@ def test_cors_origins_parsing():
     assert settings.CORS_ORIGINS == ["http://example.com", "https://agent.app"]
 
 
-def test_database_url_asyncpg_enforcement():
+def test_database_url_psycopg_enforcement():
     settings = Settings(DATABASE_URL="postgresql://user:pass@localhost:5432/testdb")
-    assert settings.DATABASE_URL == "postgresql+asyncpg://user:pass@localhost:5432/testdb"
+    assert settings.DATABASE_URL == "postgresql+psycopg://user:pass@localhost:5432/testdb"
+    assert settings.raw_database_url == "postgresql://user:pass@localhost:5432/testdb"
 
 
-def test_database_url_neon_sslmode_conversion():
+def test_database_url_preserves_query_params_for_psycopg():
     neon_url = "postgresql://user:pass@ep-test.neon.tech/neondb?sslmode=require&channel_binding=require"
     settings = Settings(DATABASE_URL=neon_url)
-    assert settings.DATABASE_URL == "postgresql+asyncpg://user:pass@ep-test.neon.tech/neondb?ssl=require"
+    assert settings.DATABASE_URL == "postgresql+psycopg://user:pass@ep-test.neon.tech/neondb?sslmode=require&channel_binding=require"
+    assert settings.raw_database_url == neon_url

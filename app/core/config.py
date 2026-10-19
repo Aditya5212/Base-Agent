@@ -43,7 +43,7 @@ class Settings(BaseSettings):
         return []
 
     # Database Settings
-    DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/base_agent"
+    DATABASE_URL: str = "postgresql+psycopg://postgres:postgres@localhost:5432/base_agent"
     DATABASE_POOL_SIZE: int = 10
     DATABASE_MAX_OVERFLOW: int = 20
     DATABASE_POOL_TIMEOUT: int = 30
@@ -52,38 +52,27 @@ class Settings(BaseSettings):
 
     @field_validator("DATABASE_URL", mode="before")
     @classmethod
-    def enforce_asyncpg_scheme(cls, v: Any) -> str:
+    def enforce_psycopg_scheme(cls, v: Any) -> str:
         if not isinstance(v, str):
             return v
 
-        # Convert standard postgresql:// or postgres:// to postgresql+asyncpg://
+        # Convert standard postgresql://, postgres://, or postgresql+asyncpg:// to postgresql+psycopg://
+        if v.startswith("postgresql+asyncpg://"):
+            return v.replace("postgresql+asyncpg://", "postgresql+psycopg://", 1)
         if v.startswith("postgresql://"):
-            v = v.replace("postgresql://", "postgresql+asyncpg://", 1)
-        elif v.startswith("postgres://"):
-            v = v.replace("postgres://", "postgresql+asyncpg://", 1)
-
-        # Normalize parameters for asyncpg if using asyncpg driver
-        parsed = urllib.parse.urlsplit(v)
-        if "asyncpg" in parsed.scheme and parsed.query:
-            query_params = urllib.parse.parse_qs(parsed.query)
-            clean_params: dict[str, str] = {}
-            for k, val_list in query_params.items():
-                if not val_list:
-                    continue
-                # asyncpg expects 'ssl' parameter rather than libpq's 'sslmode'
-                if k == "sslmode":
-                    clean_params["ssl"] = val_list[0]
-                # channel_binding is a libpq parameter unsupported by asyncpg
-                elif k == "channel_binding":
-                    continue
-                else:
-                    clean_params[k] = val_list[0]
-            new_query = urllib.parse.urlencode(clean_params)
-            v = urllib.parse.urlunsplit(
-                (parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment)
-            )
+            return v.replace("postgresql://", "postgresql+psycopg://", 1)
+        if v.startswith("postgres://"):
+            return v.replace("postgres://", "postgresql+psycopg://", 1)
 
         return v
+
+    @property
+    def raw_database_url(self) -> str:
+        """Returns standard postgresql:// DSN without SQLAlchemy driver prefix.
+
+        Useful for LangGraph's AsyncPostgresSaver and direct psycopg AsyncConnectionPool.
+        """
+        return self.DATABASE_URL.replace("postgresql+psycopg://", "postgresql://", 1)
 
     # Auth (Clerk)
     CLERK_SECRET_KEY: str | None = None
