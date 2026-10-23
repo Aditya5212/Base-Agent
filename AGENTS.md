@@ -1,13 +1,67 @@
 # Base Agent — Architecture & Agent Design
 
-This document describes the agent architecture for Base Agent, covering the current implementation and the future extensibility model for the Agent Builder platform.
+This document serves as the comprehensive architectural specification for **Base Agent**, detailing the current conversational agent implementation, persistence layer, LLM provider integration, repository structure, and the future Agent Builder platform.
 
 ---
 
-## 1. Current Agent: Simple Conversational Bot
+## 1. Repository & Codebase Structure
+
+The project follows production-grade FastAPI and LangGraph modular conventions:
+
+```text
+Base-Agent/
+├── pyproject.toml              # Project dependencies, build system (uv), pytest configuration
+├── uv.lock                     # Deterministic dependency lockfile
+├── .python-version             # Python version pin (3.12)
+├── .env.example                # Documented environment variables template
+├── .env                        # Local secret configurations (git-ignored)
+├── README.md                   # Project overview, getting started, roadmap
+├── AGENTS.md                   # System architecture and agent design specifications
+├── main.py                     # Root development runner (python main.py / uvicorn)
+├── app/
+│   ├── __init__.py             # Package init & WindowsSelectorEventLoopPolicy setup
+│   ├── main.py                 # FastAPI application factory, lifespan, CORS & root route
+│   ├── core/                   # Infrastructure & singleton configurations
+│   │   ├── __init__.py         # Core exports
+│   │   ├── config.py           # Pydantic-settings environment configuration
+│   │   ├── database.py         # Async SQLAlchemy engine & session dependency
+│   │   └── llm.py              # DeepSeek LLM configuration, model registry & client factory
+│   ├── api/                    # HTTP presentation layer
+│   │   ├── __init__.py
+│   │   └── v1/
+│   │       ├── __init__.py
+│   │       ├── router.py       # API v1 aggregator router
+│   │       └── endpoints/
+│   │           ├── __init__.py
+│   │           ├── health.py   # Health & liveness probes (/health, /ping)
+│   │           └── chat.py     # Conversation turns, thread history & memory deletion
+│   ├── models/                 # Database persistence models
+│   │   ├── __init__.py
+│   │   └── base.py             # Declarative Base & UTC TimestampMixin
+│   ├── schemas/                # Request & response Pydantic contracts
+│   │   ├── __init__.py
+│   │   ├── health.py           # Health response models
+│   │   └── chat.py             # ChatRequest, ChatResponse, ThreadHistoryResponse
+│   └── services/               # Business logic & agent workflows
+│       ├── __init__.py
+│       ├── agent.py            # LangGraph agent topology, state schema & execution
+│       └── memory.py           # PostgreSQL checkpointer service (AsyncPostgresSaver)
+├── scripts/
+│   └── test_deepseek_live.py   # Interactive script testing live DeepSeek + PostgreSQL turns
+└── tests/
+    ├── __init__.py
+    ├── test_api.py             # API route tests (health, ping, chat endpoints)
+    ├── test_config.py          # Settings validation & URL normalization tests
+    ├── test_agent.py           # Multi-turn memory & thread isolation tests
+    └── test_llm.py             # DeepSeek model registry & alias resolution tests
+```
+
+---
+
+## 2. Current Agent: Single-Node Conversational Agent
 
 ### Overview
-The initial agent is a single-node LangGraph that handles conversational messages with persistent memory. It uses PostgreSQL as the checkpoint store to maintain conversation state across requests.
+The initial agent is a single-node **LangGraph** workflow that processes conversational turns with persistent short-term memory. State is automatically committed to PostgreSQL after each graph execution.
 
 ### State Schema
 
@@ -16,31 +70,86 @@ class AgentState(TypedDict):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     user_id: str
     thread_id: str
-    # Phase 2 additions:
+    # Future Phase 2 additions:
     # rag_context: str
     # tool_calls: list
     # agent_config: dict
 ```
 
+- **`messages`**: Chronological sequence of messages (`HumanMessage`, `AIMessage`, `SystemMessage`). The `add_messages` reducer handles appending new messages and processing removals.
+- **`user_id`**: Identifier of the current authenticated user (prepares for Clerk auth).
+- **`thread_id`**: Unique conversation session identifier ensuring memory isolation.
+
 ### Graph Topology
 
 ```
-START → [chat_node] → END
+START ──► [chat_node] ──► END
 ```
 
-- **chat_node**: Receives the current message history, invokes the LLM, and appends the response to the message list.
-
-### Persistence
-- **Checkpointer**: `AsyncPostgresSaver` (LangGraph native)
-- **Storage**: Same PostgreSQL instance as the main application database
-- **Key**: Composite key of `(user_id, thread_id)` ensures conversation isolation per user and per chat thread.
+- **`chat_node`**:
+  1. Reads conversation history from the checkpointer.
+  2. Ensures a system instruction prompt is prepended.
+  3. Resolves the requested LLM model (`deepseek-flash` or `deepseek-v4-pro`).
+  4. Invokes the model asynchronously.
+  5. Appends the model response to the state message list.
 
 ---
 
-## 2. Future Agent Builder Architecture
+## 3. Persistent Memory Architecture
+
+### Single Connection Driver Strategy (`psycopg3`)
+To avoid running duplicate connection pools and mismatched database drivers, both **SQLAlchemy** and **LangGraph** share the exact same `psycopg3` driver ecosystem:
+- **Application ORM**: `postgresql+psycopg://` via async SQLAlchemy engine.
+- **LangGraph Checkpointer**: `AsyncPostgresSaver` backed by a dedicated `psycopg_pool.AsyncConnectionPool`.
+
+### PostgreSQL Checkpointer (`AsyncPostgresSaver`)
+- **Tables**: `checkpoints`, `checkpoint_blobs`, `checkpoint_writes` (auto-created at startup via `setup_checkpointer()`).
+- **Isolation**: Each conversation turn is isolated by `configurable = {"thread_id": "...", "user_id": "..."}`.
+- **Operations Supported**:
+  - `execute_agent()`: Resumes state, executes node, writes new checkpoint.
+  - `get_thread_messages()`: Fetches full message history directly from storage.
+  - `delete_thread_memory()`: Drops all checkpoints for a thread upon user request.
+
+---
+
+## 4. LLM Provider Design: DeepSeek
+
+The application connects to **DeepSeek** via its OpenAI-compatible endpoint:
+
+- **Base URL (OpenAI format)**: `https://api.deepseek.com`
+- **Base URL (Anthropic format)**: `https://api.deepseek.com/anthropic`
+
+### Supported Models
+
+| Shorthand / API Identifier | Underlying Model Version | Context | Max Output | Vision | Concurrency | Primary Use Case |
+| -------------------------- | ------------------------ | ------- | ---------- | ------ | ----------- | ---------------- |
+| **`deepseek-flash`** (Default) | `DeepSeek-V4.1-Flash-1017` | 1M | 384K | Yes | 2500 | Fast, high-throughput conversational chatbot |
+| **`deepseek-v4-pro`** | `DeepSeek-V4-Pro-0813` | 1M | 384K | No | 500 | Advanced reasoning & complex multi-step tasks |
+
+### Model Resolution
+The [resolve_model_name](file:///c:/Users/Aditya/Desktop/Base-Agent/app/core/llm.py) function transparently accepts:
+- `deepseek-flash`, `DeepSeek-V4.1-Flash-1017`, `flash` &rarr; `deepseek-flash`
+- `deepseek-v4-pro`, `DeepSeek-V4-Pro-0813`, `pro` &rarr; `deepseek-v4-pro`
+
+---
+
+## 5. API Endpoints
+
+| Method | Path | Summary | Description |
+| ------ | ---- | ------- | ----------- |
+| `GET` | `/` | Root | Service info and API status |
+| `GET` | `/api/v1/health` | Readiness Probe | Verifies PostgreSQL connectivity |
+| `GET` | `/api/v1/ping` | Liveness Probe | Lightweight health check |
+| `POST` | `/api/v1/chat` | Send Message | Executes a conversation turn with memory persistence |
+| `GET` | `/api/v1/chat/{thread_id}/history` | Get History | Retrieves full conversation history from PostgreSQL |
+| `DELETE` | `/api/v1/chat/{thread_id}` | Clear Memory | Deletes stored checkpoints for a thread |
+
+---
+
+## 6. Future Agent Builder Architecture (Phase 2)
 
 ### Concept
-The Agent Builder will allow users to define custom agent workflows through a configuration API. Each "agent" becomes a configurable LangGraph that can be instantiated at runtime.
+The Agent Builder will allow users to define custom agent workflows dynamically through a configuration API. Each user-defined agent becomes a configurable LangGraph instantiated at runtime.
 
 ### Agent Configuration Schema (Draft)
 
@@ -49,7 +158,7 @@ class AgentConfig(BaseModel):
     agent_id: str
     name: str
     description: str
-    model: str                          # e.g., "gpt-4o", "claude-3"
+    model: str = "deepseek-flash"        # "deepseek-flash" or "deepseek-v4-pro"
     temperature: float = 0.0
     system_prompt: str
     tools: list[str] = []               # Registered tool names
@@ -61,24 +170,13 @@ class AgentConfig(BaseModel):
 
 ### Graph Types
 
-| Type        | Description                                      | Use Case              |
-| ----------- | ------------------------------------------------ | --------------------- |
-| `linear`    | Single node, input → LLM → output               | Simple chatbot        |
-| `cyclic`    | LLM → Tool → LLM loop until done                | ReAct-style agents    |
-| `multi_agent` | Multiple sub-graphs orchestrated by a supervisor | Complex workflows     |
+| Type | Description | Use Case |
+| ---- | ----------- | -------- |
+| `linear` | Input &rarr; LLM &rarr; Output | Conversational chatbot |
+| `cyclic` | Input &rarr; LLM &rarr; Tool &rarr; LLM loop | ReAct-style agents with function execution |
+| `multi_agent` | Supervisor orchestrating multiple sub-agents | Complex multi-stage business workflows |
 
-### Extensibility Points
-
-1. **Tools**: Agents can be equipped with callable tools (API calls, database queries, code execution).
-2. **RAG Pipelines**: Agents can be attached to knowledge bases using BM25 or LightRAG retrieval.
-3. **Sub-Agents**: Agents can spawn child agents for delegated tasks.
-4. **Human-in-the-Loop**: Graphs can pause and wait for user approval before proceeding.
-
----
-
-## 3. Node Registry (Future)
-
-All available nodes will be registered in a central registry. The Agent Builder will reference these by name when constructing graphs.
+### Planned Node Registry
 
 ```python
 NODE_REGISTRY = {
@@ -92,10 +190,10 @@ NODE_REGISTRY = {
 
 ---
 
-## 4. Design Principles
+## 7. Design Principles
 
-1. **Stateless API, Stateful Graph**: FastAPI endpoints remain stateless; all conversation state lives in the LangGraph checkpointer.
-2. **Configuration over Code**: New agent behaviors should be achievable through configuration, not code changes.
-3. **Async First**: All nodes, tools, and database calls are fully async to maximize throughput.
-4. **Observable**: Every agent execution logs to LangSmith for debugging and cost tracking.
-
+1. **Stateless API, Stateful Graph**: FastAPI endpoints remain stateless; conversation state is persisted across turns via the checkpointer.
+2. **Unified Driver Ecosystem**: Single `psycopg3` engine and pool for both ORM and LangGraph.
+3. **Cross-Platform Compatibility**: Automatic selector loop policy for Windows (`WindowsSelectorEventLoopPolicy`) and standard selector on POSIX.
+4. **Configuration over Hardcoding**: Dynamic model switching, base URLs, and parameters driven by environment and request payloads.
+5. **Async First**: Fully async database queries, network calls, and agent invocations for maximum throughput.

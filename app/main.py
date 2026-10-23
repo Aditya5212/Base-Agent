@@ -9,6 +9,7 @@ from fastapi.responses import JSONResponse
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.database import check_db_connection, close_db_connection
+from app.services.memory import close_checkpointer_pool, setup_checkpointer
 
 # Configure logging
 logging.basicConfig(
@@ -33,6 +34,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     db_connected, err = await check_db_connection()
     if db_connected:
         logger.info("Database connection successfully established.")
+        try:
+            await setup_checkpointer()
+            logger.info("PostgreSQL checkpointer initialized successfully.")
+        except Exception as checkpointer_err:
+            logger.warning("Failed to initialize checkpointer tables: %s", checkpointer_err)
     else:
         logger.warning("Database connection failed during startup: %s", err)
 
@@ -40,6 +46,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Graceful shutdown
     logger.info("Shutting down %s...", settings.PROJECT_NAME)
+    await close_checkpointer_pool()
     await close_db_connection()
     logger.info("Shutdown completed.")
 

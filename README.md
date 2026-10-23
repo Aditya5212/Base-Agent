@@ -100,9 +100,9 @@ API docs will be available at `http://localhost:8000/docs`.
 
 - [x] Project scaffolding with `uv` and FastAPI
 - [x] LangGraph agent skeleton
-- [x] Clerk authentication middleware
-- [ ] Persistent conversation memory (Postgres checkpointer)
-- [ ] Conversation CRUD endpoints (list, get, delete threads)
+- [x] Persistent conversation memory (Postgres checkpointer)
+- [x] Conversation CRUD endpoints (chat turn, get history, delete thread)
+- [ ] Clerk authentication middleware
 - [ ] Cloudflare R2 file upload service
 - [ ] BM25 + LightRAG retrieval pipeline
 - [ ] Agent Builder configuration API

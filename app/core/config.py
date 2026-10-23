@@ -78,10 +78,21 @@ class Settings(BaseSettings):
     CLERK_SECRET_KEY: str | None = None
     CLERK_FRONTEND_API_URL: str | None = None
 
-    # LLM Settings
-    OPENAI_API_KEY: str | None = None
-    OPENAI_MODEL: str = "gpt-4o"
+    # LLM / AI Providers (DeepSeek OpenAI-compatible format)
+    DEEPSEEK_API_KEY: str | None = None
+    DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
+    DEEPSEEK_MODEL: str = "deepseek-flash"
+
+    # Generic fallbacks
+    LLM_BASE_URL: str = "https://api.deepseek.com"
+    LLM_MODEL: str = "deepseek-flash"
     DEFAULT_TEMPERATURE: float = 0.0
+    OPENAI_API_KEY: str | None = None
+
+    @property
+    def effective_llm_api_key(self) -> str | None:
+        """Returns DEEPSEEK_API_KEY if present, falling back to OPENAI_API_KEY."""
+        return self.DEEPSEEK_API_KEY or self.OPENAI_API_KEY
 
     # Object Storage (Cloudflare R2 - Phase 2)
     CLOUDFLARE_R2_ACCESS_KEY: str | None = None
