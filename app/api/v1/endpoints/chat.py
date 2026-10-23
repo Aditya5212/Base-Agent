@@ -2,6 +2,7 @@
 
 import logging
 from fastapi import APIRouter, HTTPException, status
+from fastapi.responses import StreamingResponse
 from langchain_core.messages import BaseMessage
 
 from app.schemas.chat import (
@@ -9,9 +10,10 @@ from app.schemas.chat import (
     ChatRequest,
     ChatResponse,
     DeleteThreadResponse,
+    StreamEvent,
     ThreadHistoryResponse,
 )
-from app.services.agent import execute_agent
+from app.services.agent import execute_agent, stream_agent_events
 from app.services.memory import delete_thread_memory, get_thread_messages
 
 logger = logging.getLogger(__name__)
@@ -31,9 +33,11 @@ def _map_message_to_schema(msg: BaseMessage) -> ChatMessage:
     else:
         display_role = role
 
+    content = getattr(msg, "text", None) or str(msg.content)
+
     return ChatMessage(
         role=display_role,
-        content=str(msg.content),
+        content=content,
         id=getattr(msg, "id", None),
     )
 
@@ -63,7 +67,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
             )
 
         last_message = messages[-1]
-        response_text = str(last_message.content)
+        response_text = getattr(last_message, "text", None) or str(last_message.content)
 
         return ChatResponse(
             thread_id=request.thread_id,
@@ -78,6 +82,47 @@ async def chat(request: ChatRequest) -> ChatResponse:
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Chat execution failed: {exc}",
         )
+
+
+@router.post(
+    "/stream",
+    summary="Stream agent response via Server-Sent Events (SSE)",
+    description=(
+        "Streams real-time token and reasoning updates from LangGraph event streaming (v3) "
+        "with persistent PostgreSQL short-term memory."
+    ),
+)
+async def chat_stream(request: ChatRequest) -> StreamingResponse:
+    """Streams conversation turn tokens and completion metadata using Server-Sent Events (SSE)."""
+
+    async def sse_event_generator():
+        try:
+            async for event in stream_agent_events(
+                message=request.message,
+                thread_id=request.thread_id,
+                user_id=request.user_id,
+                model=request.model,
+            ):
+                yield event.to_sse()
+        except Exception as exc:
+            logger.error(
+                "Streaming endpoint error for thread_id=%s: %s",
+                request.thread_id,
+                exc,
+                exc_info=True,
+            )
+            yield StreamEvent.error(error=f"Streaming execution failed: {exc}").to_sse()
+
+    return StreamingResponse(
+        sse_event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
 
 
 @router.get(

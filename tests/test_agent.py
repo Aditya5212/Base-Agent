@@ -4,7 +4,8 @@ from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.core.llm import MODEL_DEEPSEEK_FLASH, MODEL_DEEPSEEK_PRO
-from app.services.agent import execute_agent, get_agent_graph
+from app.services.agent import execute_agent, get_agent_graph, stream_agent_events
+
 
 
 @pytest.mark.asyncio
@@ -82,3 +83,90 @@ async def test_agent_thread_isolation():
         )
         assert len(res_b["messages"]) == 2
         assert res_b["messages"][0].content == "Message for thread B"
+
+
+@pytest.mark.asyncio
+async def test_stream_agent_events_single_turn():
+    saver = InMemorySaver()
+    thread_id = "stream-thread-1"
+
+    with patch("app.services.agent.get_llm", return_value=None):
+        events = []
+        async for event in stream_agent_events(
+            message="Hello streaming",
+            thread_id=thread_id,
+            user_id="stream_user",
+            checkpointer=saver,
+        ):
+            events.append(event)
+
+        assert len(events) >= 2
+        token_events = [e for e in events if e.event == "token"]
+        end_events = [e for e in events if e.event == "end"]
+
+        assert len(token_events) >= 1
+        assert len(end_events) == 1
+        assert end_events[0].data["thread_id"] == thread_id
+        assert end_events[0].data["history_length"] == 2
+        assert "Hello streaming" in end_events[0].data["response"]
+
+
+@pytest.mark.asyncio
+async def test_stream_agent_events_multi_turn_memory():
+    saver = InMemorySaver()
+    thread_id = "stream-mem-thread"
+
+    with patch("app.services.agent.get_llm", return_value=None):
+        # Turn 1
+        turn1_events = []
+        async for event in stream_agent_events(
+            message="I am Alice",
+            thread_id=thread_id,
+            user_id="user_alice",
+            checkpointer=saver,
+        ):
+            turn1_events.append(event)
+
+        turn1_end = [e for e in turn1_events if e.event == "end"][0]
+        assert turn1_end.data["history_length"] == 2
+
+        # Turn 2: same thread_id
+        turn2_events = []
+        async for event in stream_agent_events(
+            message="Who am I?",
+            thread_id=thread_id,
+            user_id="user_alice",
+            checkpointer=saver,
+        ):
+            turn2_events.append(event)
+
+        turn2_end = [e for e in turn2_events if e.event == "end"][0]
+        assert turn2_end.data["history_length"] == 4
+
+
+@pytest.mark.asyncio
+async def test_stream_agent_events_with_fake_llm():
+    from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
+    fake_model = FakeListChatModel(responses=["Streaming works great!"])
+    saver = InMemorySaver()
+
+    with patch("app.services.agent.get_llm", return_value=fake_model):
+        tokens = []
+        end_event = None
+        async for event in stream_agent_events(
+            message="Say hi",
+            thread_id="fake-llm-thread",
+            checkpointer=saver,
+        ):
+            if event.event == "token":
+                tokens.append(event.data["delta"])
+            elif event.event == "end":
+                end_event = event
+
+        assert len(tokens) > 0
+        full_text = "".join(tokens)
+        assert full_text == "Streaming works great!"
+        assert end_event is not None
+        assert end_event.data["history_length"] == 2
+

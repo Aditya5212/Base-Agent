@@ -7,7 +7,8 @@ Implements the architecture specified in AGENTS.md:
 - Model Provider: DeepSeek via OpenAI-compatible endpoint
 """
 
-from collections.abc import Sequence
+import asyncio
+from collections.abc import AsyncGenerator, Sequence
 import logging
 from typing import Annotated, Any, TypedDict
 
@@ -20,7 +21,9 @@ from langgraph.graph.state import CompiledStateGraph
 
 from app.core.config import settings
 from app.core.llm import DEFAULT_MODEL, get_llm
+from app.schemas.chat import StreamEvent
 from app.services.memory import get_checkpointer
+
 
 logger = logging.getLogger(__name__)
 
@@ -124,3 +127,118 @@ async def execute_agent(
 
     result = await graph.ainvoke(input_payload, config=thread_config)
     return result, resolved_model
+
+
+async def stream_agent_events(
+    message: str,
+    thread_id: str,
+    user_id: str = "default_user",
+    model: str | None = None,
+    checkpointer: BaseCheckpointSaver | None = None,
+) -> AsyncGenerator[StreamEvent, None]:
+    """Streams a conversational turn using LangGraph v3 event streaming with persistent memory.
+
+    Emits structured StreamEvent instances for token deltas, reasoning content, and the
+    final completion turn snapshot. All turns are checkpointed to PostgreSQL.
+
+    Args:
+        message: The user's input text.
+        thread_id: Unique thread identifier for conversation memory isolation.
+        user_id: Unique user identifier.
+        model: Optional model override (e.g. 'DeepSeek-V4.1-Flash-1017' or 'DeepSeek-V4-Pro-0813').
+        checkpointer: Optional checkpointer override (defaults to global AsyncPostgresSaver).
+
+    Yields:
+        StreamEvent objects (token, reasoning, end, or error).
+    """
+    if checkpointer is None:
+        checkpointer = await get_checkpointer()
+
+    resolved_model = model or settings.LLM_MODEL or DEFAULT_MODEL
+    graph = get_agent_graph(checkpointer=checkpointer)
+
+    thread_config: RunnableConfig = {
+        "configurable": {
+            "thread_id": thread_id,
+            "user_id": user_id,
+            "model": resolved_model,
+        }
+    }
+
+    input_payload = {
+        "messages": [HumanMessage(content=message)],
+        "user_id": user_id,
+        "thread_id": thread_id,
+    }
+
+    queue: asyncio.Queue[tuple[str, Any, str] | None] = asyncio.Queue()
+
+    async def _pump_stream() -> None:
+        try:
+            stream = await graph.astream_events(input_payload, config=thread_config, version="v3")
+            async for msg in stream.messages:
+                node_name = getattr(msg, "node", "chat_node")
+
+                async def read_reasoning() -> None:
+                    async for r in msg.reasoning:
+                        await queue.put(("reasoning", r, node_name))
+
+                async def read_text() -> None:
+                    async for d in msg.text:
+                        await queue.put(("token", d, node_name))
+
+                await asyncio.gather(read_reasoning(), read_text())
+
+            final_output = await stream.output()
+            await queue.put(("final", final_output, "chat_node"))
+        except Exception as exc:
+            logger.error(
+                "Streaming execution failed for thread_id=%s: %s",
+                thread_id,
+                exc,
+                exc_info=True,
+            )
+            await queue.put(("error", str(exc), "chat_node"))
+        finally:
+            await queue.put(None)
+
+    producer_task = asyncio.create_task(_pump_stream())
+
+    try:
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            kind, val, node = item
+            if kind == "token":
+                yield StreamEvent.token(delta=val, node=node)
+            elif kind == "reasoning":
+                yield StreamEvent.reasoning(delta=val, node=node)
+            elif kind == "final":
+                messages = val.get("messages", []) if val else []
+                last_msg = messages[-1] if messages else None
+                response_text = ""
+                if last_msg:
+                    response_text = getattr(last_msg, "text", None) or str(last_msg.content)
+                yield StreamEvent.end(
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    response=response_text,
+                    model=resolved_model,
+                    history_length=len(messages),
+                )
+            elif kind == "error":
+                yield StreamEvent.error(error=val)
+    finally:
+        if not producer_task.done():
+            producer_task.cancel()
+            try:
+                await producer_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        else:
+            try:
+                await producer_task
+            except Exception:
+                pass
+

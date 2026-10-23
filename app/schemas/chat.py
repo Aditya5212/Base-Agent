@@ -1,3 +1,5 @@
+import json
+from typing import Any
 import uuid
 from pydantic import BaseModel, Field
 
@@ -49,3 +51,72 @@ class DeleteThreadResponse(BaseModel):
     thread_id: str = Field(..., description="Thread ID that was deleted")
     deleted: bool = Field(..., description="Whether memory was deleted successfully")
     message: str = Field(..., description="Status description")
+
+
+class StreamEventType:
+    """Standard SSE event type constants."""
+
+    TOKEN = "token"
+    REASONING = "reasoning"
+    END = "end"
+    ERROR = "error"
+
+
+class StreamEvent(BaseModel):
+    """Standardized event envelope for Server-Sent Events (SSE) streaming."""
+
+    event: str = Field(..., description="Event type: token, reasoning, end, or error")
+    data: dict[str, Any] = Field(..., description="Structured payload dictionary")
+
+    def to_sse(self) -> str:
+        """Serializes event to Server-Sent Events wire format."""
+        import json
+        payload = json.dumps(self.data)
+        return f"event: {self.event}\ndata: {payload}\n\n"
+
+    @classmethod
+    def token(cls, delta: str, node: str = "chat_node") -> "StreamEvent":
+        """Factory for text token deltas."""
+        return cls(
+            event=StreamEventType.TOKEN,
+            data={"type": StreamEventType.TOKEN, "delta": delta, "node": node},
+        )
+
+    @classmethod
+    def reasoning(cls, delta: str, node: str = "chat_node") -> "StreamEvent":
+        """Factory for reasoning/thinking token deltas."""
+        return cls(
+            event=StreamEventType.REASONING,
+            data={"type": StreamEventType.REASONING, "delta": delta, "node": node},
+        )
+
+    @classmethod
+    def end(
+        cls,
+        thread_id: str,
+        user_id: str,
+        response: str,
+        model: str,
+        history_length: int,
+    ) -> "StreamEvent":
+        """Factory for final turn completion event."""
+        return cls(
+            event=StreamEventType.END,
+            data={
+                "type": StreamEventType.END,
+                "thread_id": thread_id,
+                "user_id": user_id,
+                "response": response,
+                "model": model,
+                "history_length": history_length,
+            },
+        )
+
+    @classmethod
+    def error(cls, error: str) -> "StreamEvent":
+        """Factory for streaming error event."""
+        return cls(
+            event=StreamEventType.ERROR,
+            data={"type": StreamEventType.ERROR, "error": error},
+        )
+

@@ -92,3 +92,46 @@ def test_clear_memory_endpoint():
         data = response.json()
         assert data["deleted"] is True
         assert data["thread_id"] == "test-t-1"
+
+
+def test_chat_stream_endpoint_success():
+    from app.schemas.chat import StreamEvent
+
+    async def mock_stream_events(**kwargs):
+        yield StreamEvent.token(delta="Hello")
+        yield StreamEvent.token(delta=" world!")
+        yield StreamEvent.end(
+            thread_id="test-stream-t1",
+            user_id="user-1",
+            response="Hello world!",
+            model="deepseek-flash",
+            history_length=2,
+        )
+
+    with patch("app.api.v1.endpoints.chat.stream_agent_events", side_effect=mock_stream_events):
+        payload = {"message": "Hello", "thread_id": "test-stream-t1", "user_id": "user-1"}
+        response = client.post("/api/v1/chat/stream", json=payload)
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+        body = response.text
+        assert "event: token" in body
+        assert "Hello" in body
+        assert " world!" in body
+        assert "event: end" in body
+        assert "test-stream-t1" in body
+
+
+def test_chat_stream_endpoint_error_handling():
+    async def mock_stream_error(**kwargs):
+        raise RuntimeError("LLM connection timeout")
+        yield  # Make it an async generator
+
+    with patch("app.api.v1.endpoints.chat.stream_agent_events", side_effect=mock_stream_error):
+        payload = {"message": "Hello", "thread_id": "test-stream-err", "user_id": "user-1"}
+        response = client.post("/api/v1/chat/stream", json=payload)
+        assert response.status_code == 200
+        assert "text/event-stream" in response.headers["content-type"]
+        body = response.text
+        assert "event: error" in body
+        assert "LLM connection timeout" in body
+

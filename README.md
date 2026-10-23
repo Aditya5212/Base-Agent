@@ -102,8 +102,11 @@ API docs will be available at `http://localhost:8000/docs`.
 - [x] LangGraph agent skeleton
 - [x] Persistent conversation memory (Postgres checkpointer)
 - [x] Conversation CRUD endpoints (chat turn, get history, delete thread)
+- [x] Real-time Server-Sent Events (SSE) streaming (`POST /api/v1/chat/stream`)
+- [x] DeepSeek integration (`deepseek-flash` & `deepseek-v4-pro`)
 - [ ] Clerk authentication middleware
 - [ ] Cloudflare R2 file upload service
 - [ ] BM25 + LightRAG retrieval pipeline
 - [ ] Agent Builder configuration API
 - [ ] Next.js frontend
+

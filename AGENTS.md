@@ -47,7 +47,8 @@ Base-Agent/
 │       ├── agent.py            # LangGraph agent topology, state schema & execution
 │       └── memory.py           # PostgreSQL checkpointer service (AsyncPostgresSaver)
 ├── scripts/
-│   └── test_deepseek_live.py   # Interactive script testing live DeepSeek + PostgreSQL turns
+│   ├── test_deepseek_live.py        # Interactive script testing live DeepSeek + PostgreSQL turns
+│   └── test_deepseek_stream_live.py # Interactive script testing live DeepSeek SSE streaming
 └── tests/
     ├── __init__.py
     ├── test_api.py             # API route tests (health, ping, chat endpoints)
@@ -133,7 +134,43 @@ The [resolve_model_name](file:///c:/Users/Aditya/Desktop/Base-Agent/app/core/llm
 
 ---
 
-## 5. API Endpoints
+## 5. Event Streaming Architecture (SSE & LangChain v3 Protocol)
+
+### Overview
+In addition to synchronous request-response execution, Base Agent supports real-time token and reasoning event streaming over HTTP via **Server-Sent Events (SSE)**.
+
+The streaming engine is built on LangGraph's native `astream_events(..., version="v3")` protocol, providing typed projections (`stream.messages`, `message.text`, `message.reasoning`, `stream.output`).
+
+### Event Pipeline
+
+```
+Client (SSE) ◄── [POST /api/v1/chat/stream]
+                      ▲
+                      │ (yields StreamEvent.to_sse())
+               [stream_agent_events()]
+                      ▲
+                      │ (asyncio.Queue pump)
+         [graph.astream_events(..., version="v3")]
+             ├── stream.messages.reasoning  ──► "event: reasoning"
+             ├── stream.messages.text       ──► "event: token"
+             └── stream.output()            ──► "event: end" + PostgreSQL Checkpoint
+```
+
+### Server-Sent Events (SSE) Wire Format
+
+| Event Type | Field | Description | Example Data Payload |
+| ---------- | ----- | ----------- | -------------------- |
+| `token` | Text Delta | Incremental response text chunk | `{"type": "token", "delta": "Hello", "node": "chat_node"}` |
+| `reasoning` | Thinking Delta | Incremental reasoning token (DeepSeek thinking mode) | `{"type": "reasoning", "delta": "Analyzing query...", "node": "chat_node"}` |
+| `end` | Completion | Final turn completion with thread snapshot | `{"type": "end", "thread_id": "...", "user_id": "...", "response": "...", "model": "deepseek-flash", "history_length": 4}` |
+| `error` | Failure | Safe execution error description | `{"type": "error", "error": "Execution timeout"}` |
+
+### PostgreSQL Persistence During Streaming
+State persistence remains atomic: as the stream is driven to completion, the LangGraph checkpointer commits the new checkpoint to PostgreSQL with the full conversation state, ensuring that subsequent turns (streaming or non-streaming) have identical access to conversation context.
+
+---
+
+## 6. API Endpoints
 
 | Method | Path | Summary | Description |
 | ------ | ---- | ------- | ----------- |
@@ -141,12 +178,13 @@ The [resolve_model_name](file:///c:/Users/Aditya/Desktop/Base-Agent/app/core/llm
 | `GET` | `/api/v1/health` | Readiness Probe | Verifies PostgreSQL connectivity |
 | `GET` | `/api/v1/ping` | Liveness Probe | Lightweight health check |
 | `POST` | `/api/v1/chat` | Send Message | Executes a conversation turn with memory persistence |
+| `POST` | `/api/v1/chat/stream` | Stream Message | Streams real-time tokens & reasoning via SSE with memory persistence |
 | `GET` | `/api/v1/chat/{thread_id}/history` | Get History | Retrieves full conversation history from PostgreSQL |
 | `DELETE` | `/api/v1/chat/{thread_id}` | Clear Memory | Deletes stored checkpoints for a thread |
 
 ---
 
-## 6. Future Agent Builder Architecture (Phase 2)
+## 7. Future Agent Builder Architecture (Phase 2)
 
 ### Concept
 The Agent Builder will allow users to define custom agent workflows dynamically through a configuration API. Each user-defined agent becomes a configurable LangGraph instantiated at runtime.
