@@ -18,6 +18,7 @@ A production-grade, extensible AI chatbot built with FastAPI and LangGraph. Star
 | Database / ORM | PostgreSQL + SQLAlchemy (async, psycopg3) |
 | Vector Store   | `pgvector` (HNSW Cosine Index) via `langchain-postgres` |
 | Sparse Search  | PostgreSQL Native Full-Text Search (GIN `to_tsvector`) |
+| Graph RAG      | LightRAG (`PGTableGraphStorage` native tables on Neon) |
 | Hybrid Ranking | Reciprocal Rank Fusion (RRF)        |
 | Embeddings     | OpenAI `text-embedding-3-small` (1536-dim) |
 | LLM Chat Model | DeepSeek (`deepseek-flash` & `deepseek-v4-pro`) |
@@ -41,11 +42,19 @@ Base-Agent/
 ├── app/
 │   ├── main.py                 # FastAPI factory & lifespan setup
 │   ├── core/                   # Infrastructure configuration
-│   │   ├── config.py           # Pydantic settings
+│   │   ├── config.py           # Pydantic settings & postgres environment sync
 │   │   ├── database.py         # Async SQLAlchemy engine & session dependency
 │   │   ├── llm.py              # DeepSeek model registry & client factory
 │   │   ├── embedding.py        # Decoupled OpenAI embedding factory
-│   │   └── rag_config.py       # Precision vs Recall presets & RRF config
+│   │   ├── rag_config.py       # Precision vs Recall presets & RRF config
+│   │   └── rag/                # Pluggable KnowledgeProvider architecture
+│   │       ├── protocols.py    # KnowledgeProvider protocol & data contracts
+│   │       ├── workspace.py    # Multi-tenant workspace isolation (user, thread, global)
+│   │       ├── registry.py     # Provider registry & decorator (@register_provider)
+│   │       ├── factory.py      # Workspace-scoped cached provider factory with locks
+│   │       └── providers/
+│   │           ├── hybrid.py   # PGVector HNSW + PostgreSQL FTS + RRF provider
+│   │           └── lightrag_provider.py # LightRAG + PGTableGraphStorage provider
 │   ├── api/                    # HTTP presentation layer
 │   │   └── v1/
 │   │       ├── router.py       # API v1 aggregator
@@ -78,8 +87,9 @@ Base-Agent/
 ├── scripts/
 │   ├── test_rag_live.py             # Live RAG ingestion and hybrid search verification
 │   ├── test_deepseek_live.py        # Live DeepSeek multi-turn chat test
-│   └── test_deepseek_stream_live.py # Live DeepSeek SSE streaming test
-└── tests/                           # Complete pytest suite (54 tests)
+│   ├── test_deepseek_stream_live.py # Live DeepSeek SSE streaming test
+│   └── test_lightrag_live.py        # Live LightRAG + PGTableGraphStorage smoke test
+└── tests/                           # Complete pytest suite (61 tests)
 ```
 
 ## 🔌 API Endpoints Summary
@@ -199,6 +209,9 @@ uv run python -m scripts.test_deepseek_live
 
 # Test live DeepSeek SSE token and reasoning streaming
 uv run python -m scripts.test_deepseek_stream_live
+
+# Test live LightRAG entity/relationship extraction and graph retrieval on Neon
+uv run python -m scripts.test_lightrag_live
 ```
 
 ## 🗺️ Roadmap
@@ -220,6 +233,8 @@ uv run python -m scripts.test_deepseek_stream_live
 - [x] Thread asset tracking with signed URLs and dynamic prompt context injection
 - [x] Production DB tables (`users` with auto-seeded root user, `threads`, and `thread_assets`)
 - [x] RAG-augmented LangGraph conversational agent with source citations (`use_rag=True`)
+- [x] Pluggable RAG architecture (`KnowledgeProvider` protocol, registry, workspace isolation, factory)
+- [x] LightRAG integration with `PGTableGraphStorage` (native graph tables on Neon, zero Apache AGE dependency)
 - [ ] Clerk authentication middleware
 - [ ] ParadeDB `pg_search` BM25 extension migration (see `TODO.md`)
 - [ ] Agent Builder dynamic configuration API

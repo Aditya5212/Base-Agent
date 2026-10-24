@@ -24,11 +24,19 @@ Base-Agent/
 │   ├── main.py                 # FastAPI application factory, lifespan, CORS & root route
 │   ├── core/                   # Infrastructure & singleton configurations
 │   │   ├── __init__.py         # Core exports
-│   │   ├── config.py           # Pydantic-settings environment configuration
+│   │   ├── config.py           # Pydantic-settings & postgres environment sync
 │   │   ├── database.py         # Async SQLAlchemy engine & session dependency
 │   │   ├── llm.py              # DeepSeek LLM configuration, model registry & client factory
 │   │   ├── embedding.py        # Decoupled OpenAI embedding factory (1536 dims)
-│   │   └── rag_config.py       # Precision vs Recall presets & RRF configuration
+│   │   ├── rag_config.py       # Precision vs Recall presets & RRF configuration
+│   │   └── rag/                # Pluggable KnowledgeProvider framework
+│   │       ├── protocols.py    # KnowledgeProvider protocol & data contracts
+│   │       ├── workspace.py    # Multi-tenant workspace isolation (user, thread, global)
+│   │       ├── registry.py     # Provider registry & decorator (@register_provider)
+│   │       ├── factory.py      # Workspace-scoped cached provider factory with locks
+│   │       └── providers/
+│   │           ├── hybrid.py   # PGVector HNSW + PostgreSQL FTS + RRF provider
+│   │           └── lightrag_provider.py # LightRAG + PGTableGraphStorage provider
 │   ├── api/                    # HTTP presentation layer
 │   │   ├── __init__.py
 │   │   └── v1/
@@ -66,7 +74,8 @@ Base-Agent/
 ├── scripts/
 │   ├── test_rag_live.py             # Interactive script testing live RAG + PGVector + FTS + RRF
 │   ├── test_deepseek_live.py        # Interactive script testing live DeepSeek + PostgreSQL turns
-│   └── test_deepseek_stream_live.py # Interactive script testing live DeepSeek SSE streaming
+│   ├── test_deepseek_stream_live.py # Interactive script testing live DeepSeek SSE streaming
+│   └── test_lightrag_live.py        # Interactive script testing live LightRAG + PGTableGraphStorage
 └── tests/
     ├── __init__.py
     ├── conftest.py             # Pytest session setup & database table auto-initialization
@@ -80,7 +89,8 @@ Base-Agent/
     ├── test_embedding.py       # Embedding factory tests
     ├── test_retriever.py       # RRF fusion logic tests
     ├── test_documents_api.py   # Document upload, search, and delete endpoint tests
-    └── test_rag_agent.py       # RAG-augmented agent execution and streaming tests
+    ├── test_rag_agent.py       # RAG-augmented agent execution and streaming tests
+    └── test_rag_providers.py   # Pluggable RAG framework and provider tests
 ```
 
 ---
@@ -166,30 +176,41 @@ The application connects to **DeepSeek** via its OpenAI-compatible endpoint:
 
 ---
 
-## 5. Hybrid Search & Knowledge Retrieval (RAG)
+## 5. Knowledge Retrieval & Pluggable RAG Architecture
 
-Base Agent implements a production-grade **Hybrid Retrieval** architecture combining dense semantic vector search and sparse keyword search:
+Base Agent implements a modular **Pluggable RAG Architecture** (`app/core/rag/`) that allows the agent and future Agent Builder workflows to bind against standardized knowledge retrieval and graph reasoning backends:
 
-### 1. Dense Semantic Search (PGVector + HNSW)
-- **Model**: OpenAI `text-embedding-3-small` (1536-dimensional embeddings), decoupled strictly from conversational chat models.
-- **Index**: PostgreSQL HNSW cosine distance index (`vector_cosine_ops`) providing sub-millisecond approximate nearest-neighbor retrieval.
+```
+app/core/rag/
+├── protocols.py            # KnowledgeProvider Protocol + standardized contracts
+├── registry.py             # PROVIDER_REGISTRY + @register_provider decorator
+├── factory.py              # Workspace-scoped cached provider factory with locks
+├── workspace.py            # Multi-tenant workspace isolation (user, thread, global)
+└── providers/
+    ├── hybrid.py           # Dense PGVector HNSW + Sparse PostgreSQL FTS + RRF
+    └── lightrag_provider.py # LightRAG + PGTableGraphStorage knowledge graph provider
+```
 
-### 2. Sparse Keyword Search (PostgreSQL Full-Text Search)
-- **Index**: GIN index on `to_tsvector('english', document)`.
-- **Query**: Executed via `plainto_tsquery` and ranked with `ts_rank_cd`.
-- **Roadmap**: ParadeDB `pg_search` BM25 migration path documented in `TODO.md`.
+### 1. Hybrid Search Provider (`hybrid`)
+Combines dense semantic vector search and sparse keyword search:
+- **Dense Semantic Search**: OpenAI `text-embedding-3-small` (1536-dimensional embeddings) with PostgreSQL HNSW cosine distance index (`vector_cosine_ops`).
+- **Sparse Keyword Search**: PostgreSQL Full-Text Search with GIN index on `to_tsvector('english', document)` and `plainto_tsquery` / `ts_rank_cd`.
+- **Reciprocal Rank Fusion (RRF)**:
+  $$\text{RRF}(d) = \frac{w_{\text{dense}}}{k + \text{rank}_{\text{dense}}} + \frac{w_{\text{sparse}}}{k + \text{rank}_{\text{sparse}}}$$
+- **Presets**: `high_precision` (200 tokens), `balanced` (500 tokens), `high_recall` (1000 tokens).
 
-### 3. Reciprocal Rank Fusion (RRF)
-Combines dense and sparse ranked result lists into an optimal fused ranking:
-$$\text{RRF}(d) = \frac{w_{\text{dense}}}{k + \text{rank}_{\text{dense}}} + \frac{w_{\text{sparse}}}{k + \text{rank}_{\text{sparse}}}$$
+### 2. Knowledge Graph Provider (`lightrag`)
+For zero-hallucination factual precision and multi-hop relationship reasoning, Base Agent integrates **LightRAG** with native PostgreSQL tables:
+- **Storage Backend (`PGTableGraphStorage`)**: Plain indexed PostgreSQL tables (`lightrag_graph_nodes`, `lightrag_graph_edges`, `lightrag_doc_full`, `lightrag_doc_chunks`, `lightrag_doc_status`) with JSONB properties and B-tree indexes. Requires **zero Apache AGE extension**, enabling seamless deployment on managed cloud PostgreSQL like **Neon**.
+- **Context-Only Mode (`only_need_context=True`)**: Extracts and returns graph entities, relations, and relevant chunks without triggering duplicate LLM answer generation, letting the LangGraph conversational agent own generation and streaming.
+- **Modes Supported**: `mix` (integrated local + global graph reasoning), `local` (neighborhood entities), `global` (thematic relations), `hybrid`, and `naive` (pure vector).
 
-### 4. Precision vs Recall Presets
-
-| Preset | Target Chunk Size | Overlap | Top-K Dense | Top-K Sparse | Use Case |
-| ------ | ----------------- | ------- | ----------- | ------------ | -------- |
-| `high_precision` | 200 tokens | 40 tokens | 5 | 5 | Exact fact lookup, specific definitions, Q&A |
-| `balanced` (Default) | 500 tokens | 100 tokens | 10 | 10 | General question answering and thematic analysis |
-| `high_recall` | 1000 tokens | 200 tokens | 20 | 20 | Broad summaries, cross-document synthesis |
+### 3. Multi-Tenant Workspace Isolation
+Tenant boundaries are enforced at the storage level using LightRAG's native `workspace` column:
+- **`user_workspace(user_id)`**: Shared global knowledge base for the user (e.g. `u_root`).
+- **`thread_workspace(user_id, thread_id)`**: Thread-isolated graph bucket providing session-scoped memory and zero cross-thread pollution.
+- **`agent_workspace(user_id, agent_id)`**: Dedicated knowledge base for custom Agent Builder agents.
+- **`global_workspace()`**: Shared cross-user knowledge base (`global_kb`).
 
 ---
 

@@ -15,3 +15,8 @@ ENV/
 .env
 .env.*
 !.env.example
+
+# Logs and local storage
+*.log
+data/
+.pytest_cache/

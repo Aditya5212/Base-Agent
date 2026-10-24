@@ -61,6 +61,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Graceful shutdown
     logger.info("Shutting down %s...", settings.PROJECT_NAME)
+    try:
+        from app.core.rag import shutdown_all_providers
+        await shutdown_all_providers()
+    except Exception as rag_err:
+        logger.warning("Error shutting down knowledge providers: %s", rag_err)
+
     await close_checkpointer_pool()
     await close_db_connection()
     logger.info("Shutdown completed.")

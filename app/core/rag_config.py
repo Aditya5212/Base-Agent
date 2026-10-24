@@ -126,3 +126,6 @@ def get_rag_config(
     base_values.update(overrides)
 
     return RAGConfig(**base_values)
+
+
+get_rag_preset = get_rag_config

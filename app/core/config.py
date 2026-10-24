@@ -1,10 +1,51 @@
 import json
+import os
 import urllib.parse
 from functools import lru_cache
 from typing import Any
 
+from dotenv import load_dotenv
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# MUST run before Settings() and before any LightRAG import/init
+load_dotenv(override=False)
+
+
+def _sync_postgres_env_vars() -> None:
+    """Ensure POSTGRES_* environment variables required by LightRAG are set.
+
+    If discrete variables are already in os.environ (e.g. from .env), they take precedence.
+    Otherwise, parse DATABASE_URL and populate POSTGRES_HOST, PORT, USER, PASSWORD, DATABASE.
+    """
+    db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        return
+
+    cleaned_url = (
+        db_url.replace("postgresql+psycopg://", "postgresql://")
+        .replace("postgresql+asyncpg://", "postgresql://")
+    )
+    parsed = urllib.parse.urlparse(cleaned_url)
+
+    if "POSTGRES_HOST" not in os.environ and parsed.hostname:
+        os.environ["POSTGRES_HOST"] = parsed.hostname
+    if "POSTGRES_PORT" not in os.environ:
+        os.environ["POSTGRES_PORT"] = str(parsed.port) if parsed.port else "5432"
+    if "POSTGRES_USER" not in os.environ and parsed.username:
+        os.environ["POSTGRES_USER"] = urllib.parse.unquote(parsed.username)
+    if "POSTGRES_PASSWORD" not in os.environ and parsed.password:
+        os.environ["POSTGRES_PASSWORD"] = urllib.parse.unquote(parsed.password)
+    if "POSTGRES_DATABASE" not in os.environ and parsed.path:
+        os.environ["POSTGRES_DATABASE"] = parsed.path.lstrip("/")
+    if "POSTGRES_SSL_MODE" not in os.environ:
+        if "sslmode=require" in (parsed.query or "").lower() or (
+            parsed.hostname and "neon.tech" in parsed.hostname
+        ):
+            os.environ["POSTGRES_SSL_MODE"] = "require"
+
+
+_sync_postgres_env_vars()
 
 
 class Settings(BaseSettings):
@@ -139,7 +180,70 @@ class Settings(BaseSettings):
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     EMBEDDING_DIMENSIONS: int = 1536
     RAG_COLLECTION_NAME: str = "base_agent_rag"
+    EMBEDDING_TOKEN_LIMIT: int = 8192
+    EMBEDDING_BASE_URL: str | None = None
 
+    # LightRAG Configuration
+    LIGHTRAG_WORKING_DIR: str = "./data/lightrag"
+    LIGHTRAG_LLM_MODEL: str = "gpt-4o-mini"
+    LIGHTRAG_MAX_ASYNC_LLM: int = 4
+    LIGHTRAG_MAX_PARALLEL_INSERT: int = 3
+    LIGHTRAG_MAX_CONTEXT_TOKENS: int = 4096
+    CHUNK_SIZE: int = 1000
+    CHUNK_OVERLAP_SIZE: int = 100
+    SUMMARY_LANGUAGE: str = "English"
+
+    @property
+    def embedding_dim(self) -> int:
+        return self.EMBEDDING_DIMENSIONS
+
+    @property
+    def embedding_model(self) -> str:
+        return self.EMBEDDING_MODEL
+
+    @property
+    def embedding_token_limit(self) -> int:
+        return self.EMBEDDING_TOKEN_LIMIT
+
+    @property
+    def embedding_base_url(self) -> str | None:
+        return self.EMBEDDING_BASE_URL
+
+    @property
+    def lightrag_working_dir(self) -> str:
+        return self.LIGHTRAG_WORKING_DIR
+
+    @property
+    def lightrag_llm_model(self) -> str:
+        return self.LIGHTRAG_LLM_MODEL
+
+    @property
+    def lightrag_max_async_llm(self) -> int:
+        return self.LIGHTRAG_MAX_ASYNC_LLM
+
+    @property
+    def lightrag_max_parallel_insert(self) -> int:
+        return self.LIGHTRAG_MAX_PARALLEL_INSERT
+
+    @property
+    def lightrag_max_context_tokens(self) -> int:
+        return self.LIGHTRAG_MAX_CONTEXT_TOKENS
+
+    @property
+    def chunk_size(self) -> int:
+        return self.CHUNK_SIZE
+
+    @property
+    def chunk_overlap_size(self) -> int:
+        return self.CHUNK_OVERLAP_SIZE
+
+    @property
+    def summary_language(self) -> str:
+        return self.SUMMARY_LANGUAGE
+
+    @property
+    def llm_api_key(self) -> str | None:
+        return self.effective_llm_api_key
 
     model_config = SettingsConfigDict(
         env_file=".env",
