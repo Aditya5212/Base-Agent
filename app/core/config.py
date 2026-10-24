@@ -94,11 +94,52 @@ class Settings(BaseSettings):
         """Returns DEEPSEEK_API_KEY if present, falling back to OPENAI_API_KEY."""
         return self.DEEPSEEK_API_KEY or self.OPENAI_API_KEY
 
-    # Object Storage (Cloudflare R2 - Phase 2)
+    # Object Storage (Cloudflare R2 - S3-compatible)
+    R2_ACCOUNT_ID: str | None = None
+    R2_ACCESS_KEY_ID: str | None = None
+    R2_SECRET_ACCESS_KEY: str | None = None
+    R2_BUCKET_NAME: str | None = None
+    R2_REGION: str = "auto"
+    R2_ENDPOINT: str | None = None
+    R2_PUBLIC_BASE_URL: str | None = None
+
+    # Backward compatibility aliases
     CLOUDFLARE_R2_ACCESS_KEY: str | None = None
     CLOUDFLARE_R2_SECRET_KEY: str | None = None
     CLOUDFLARE_R2_BUCKET_NAME: str | None = None
     CLOUDFLARE_R2_ENDPOINT_URL: str | None = None
+
+    @property
+    def r2_effective_access_key(self) -> str | None:
+        """Returns R2_ACCESS_KEY_ID or fallback CLOUDFLARE_R2_ACCESS_KEY."""
+        return self.R2_ACCESS_KEY_ID or self.CLOUDFLARE_R2_ACCESS_KEY
+
+    @property
+    def r2_effective_secret_key(self) -> str | None:
+        """Returns R2_SECRET_ACCESS_KEY or fallback CLOUDFLARE_R2_SECRET_KEY."""
+        return self.R2_SECRET_ACCESS_KEY or self.CLOUDFLARE_R2_SECRET_KEY
+
+    @property
+    def r2_effective_bucket_name(self) -> str | None:
+        """Returns R2_BUCKET_NAME or fallback CLOUDFLARE_R2_BUCKET_NAME."""
+        return self.R2_BUCKET_NAME or self.CLOUDFLARE_R2_BUCKET_NAME
+
+    @property
+    def r2_effective_endpoint_url(self) -> str | None:
+        """Returns custom endpoint, or derives from R2_ACCOUNT_ID."""
+        if self.R2_ENDPOINT:
+            return self.R2_ENDPOINT
+        if self.CLOUDFLARE_R2_ENDPOINT_URL:
+            return self.CLOUDFLARE_R2_ENDPOINT_URL
+        if self.R2_ACCOUNT_ID:
+            return f"https://{self.R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+        return None
+
+    # Embeddings & Vector Search (OpenAI text-embedding-3-small)
+    EMBEDDING_MODEL: str = "text-embedding-3-small"
+    EMBEDDING_DIMENSIONS: int = 1536
+    RAG_COLLECTION_NAME: str = "base_agent_rag"
+
 
     model_config = SettingsConfigDict(
         env_file=".env",

@@ -21,8 +21,10 @@ from langgraph.graph.state import CompiledStateGraph
 
 from app.core.config import settings
 from app.core.llm import DEFAULT_MODEL, get_llm
+from app.core.rag_config import RAGPreset, get_rag_config
 from app.schemas.chat import StreamEvent
 from app.services.memory import get_checkpointer
+from app.services.retriever import hybrid_search
 
 
 logger = logging.getLogger(__name__)
@@ -33,19 +35,77 @@ DEFAULT_SYSTEM_PROMPT = (
 )
 
 
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
     """LangGraph agent state schema matching AGENTS.md."""
 
     messages: Annotated[Sequence[BaseMessage], add_messages]
     user_id: str
     thread_id: str
+    rag_context: str | None
+    rag_sources: list[dict[str, Any]]
+
+
+async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
+    """Retrieves relevant document passages via hybrid search when RAG is enabled."""
+    configurable = config.get("configurable", {})
+    use_rag = configurable.get("use_rag", False)
+    if not use_rag:
+        return {"rag_context": None, "rag_sources": []}
+
+    user_id = state.get("user_id") or configurable.get("user_id", "default_user")
+    messages = state.get("messages", [])
+    last_human = next(
+        (m.content for m in reversed(messages) if isinstance(m, HumanMessage)),
+        None,
+    )
+    if not last_human or not isinstance(last_human, str):
+        return {"rag_context": None, "rag_sources": []}
+
+    preset = configurable.get("rag_preset") or RAGPreset.BALANCED
+    rag_cfg = get_rag_config(preset)
+
+    try:
+        # Search documents indexed under this user's user_id
+        fused_docs = await hybrid_search(
+            query=last_human,
+            config=rag_cfg,
+            filter_dict={"user_id": user_id},
+        )
+    except Exception as exc:
+        logger.error("Error during RAG retrieval in retrieve_node: %s", exc, exc_info=True)
+        return {"rag_context": None, "rag_sources": []}
+
+    if not fused_docs:
+        return {"rag_context": None, "rag_sources": []}
+
+    context_blocks = []
+    sources = []
+    for idx, doc in enumerate(fused_docs, 1):
+        filename = doc.metadata.get("filename") or doc.metadata.get("source") or "Document"
+        headers = [v for k, v in doc.metadata.items() if k.startswith("header_")]
+        section_str = f" | Section: {' > '.join(headers)}" if headers else ""
+        context_blocks.append(f"[Source {idx}: {filename}{section_str}]\n{doc.page_content}")
+        sources.append({
+            "source_id": idx,
+            "filename": filename,
+            "section": " > ".join(headers) if headers else None,
+            "preview": doc.page_content[:150],
+            "metadata": doc.metadata,
+        })
+
+    formatted_context = "\n\n---\n\n".join(context_blocks)
+    return {
+        "rag_context": formatted_context,
+        "rag_sources": sources,
+    }
 
 
 async def chat_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
-    """Chat node: receives message history, invokes DeepSeek LLM, appends response."""
+    """Chat node: receives message history and optional RAG context, invokes DeepSeek LLM."""
     messages = list(state.get("messages", []))
     configurable = config.get("configurable", {})
     model_name = configurable.get("model") or settings.LLM_MODEL or DEFAULT_MODEL
+    rag_context = state.get("rag_context")
 
     llm = get_llm(model_name=model_name)
 
@@ -55,27 +115,48 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]
             "Hello",
         )
         # Mock / development fallback when DEEPSEEK_API_KEY is not configured
+        rag_note = f"\n[RAG Context Applied: {len(state.get('rag_sources', []))} sources]" if rag_context else ""
         mock_response = (
             f"[Development Mode - No DEEPSEEK_API_KEY configured (Model: {model_name})]: "
-            f"I received your message: '{last_human}'. Conversation history has been saved to PostgreSQL."
+            f"I received your message: '{last_human}'.{rag_note} Conversation history has been saved to PostgreSQL."
         )
         return {"messages": [AIMessage(content=mock_response)]}
 
-    # Prepend system prompt if not present
+    # Prepend system prompt
+    system_prompt = DEFAULT_SYSTEM_PROMPT
+    if rag_context:
+        system_prompt += (
+            "\n\n=== Retrieved Document Context ===\n"
+            f"{rag_context}\n"
+            "===================================\n"
+            "Use the retrieved document context above to answer the user's inquiry accurately. "
+            "Cite relevant sources (e.g. [Source 1]) when referencing facts from the context."
+        )
+
     input_messages: list[BaseMessage] = []
     if not messages or not isinstance(messages[0], SystemMessage):
-        input_messages.append(SystemMessage(content=DEFAULT_SYSTEM_PROMPT))
-    input_messages.extend(messages)
+        input_messages.append(SystemMessage(content=system_prompt))
+    else:
+        existing_sys = messages[0].content
+        if rag_context and "Retrieved Document Context" not in str(existing_sys):
+            input_messages.append(SystemMessage(content=f"{existing_sys}\n\n=== Retrieved Document Context ===\n{rag_context}\n==================================="))
+        else:
+            input_messages.append(messages[0])
+
+    start_idx = 1 if messages and isinstance(messages[0], SystemMessage) else 0
+    input_messages.extend(messages[start_idx:])
 
     response = await llm.ainvoke(input_messages, config=config)
     return {"messages": [response]}
 
 
 def build_agent_graph() -> StateGraph:
-    """Constructs the single-node StateGraph topology (START -> chat_node -> END)."""
+    """Constructs the StateGraph topology (START -> retrieve_node -> chat_node -> END)."""
     builder = StateGraph(AgentState)
+    builder.add_node("retrieve_node", retrieve_node)
     builder.add_node("chat_node", chat_node)
-    builder.add_edge(START, "chat_node")
+    builder.add_edge(START, "retrieve_node")
+    builder.add_edge("retrieve_node", "chat_node")
     builder.add_edge("chat_node", END)
     return builder
 
@@ -91,6 +172,8 @@ async def execute_agent(
     thread_id: str,
     user_id: str = "default_user",
     model: str | None = None,
+    use_rag: bool = False,
+    rag_preset: str | RAGPreset | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> tuple[dict[str, Any], str]:
     """Executes a single conversational turn with persistent memory in PostgreSQL.
@@ -100,6 +183,8 @@ async def execute_agent(
         thread_id: Unique thread identifier for conversation isolation.
         user_id: Unique user identifier.
         model: Optional model override (e.g. DeepSeek-V4.1-Flash-1017 or DeepSeek-V4-Pro-0813).
+        use_rag: Whether to execute hybrid retrieval across user documents.
+        rag_preset: Preset tuning chunk size and fusion weights.
         checkpointer: Optional explicit checkpointer (defaults to global AsyncPostgresSaver).
 
     Returns:
@@ -116,6 +201,8 @@ async def execute_agent(
             "thread_id": thread_id,
             "user_id": user_id,
             "model": resolved_model,
+            "use_rag": use_rag,
+            "rag_preset": rag_preset or RAGPreset.BALANCED,
         }
     }
 
@@ -134,6 +221,8 @@ async def stream_agent_events(
     thread_id: str,
     user_id: str = "default_user",
     model: str | None = None,
+    use_rag: bool = False,
+    rag_preset: str | RAGPreset | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> AsyncGenerator[StreamEvent, None]:
     """Streams a conversational turn using LangGraph v3 event streaming with persistent memory.
@@ -146,6 +235,8 @@ async def stream_agent_events(
         thread_id: Unique thread identifier for conversation memory isolation.
         user_id: Unique user identifier.
         model: Optional model override (e.g. 'DeepSeek-V4.1-Flash-1017' or 'DeepSeek-V4-Pro-0813').
+        use_rag: Whether to execute hybrid retrieval across user documents.
+        rag_preset: Preset tuning chunk size and fusion weights.
         checkpointer: Optional checkpointer override (defaults to global AsyncPostgresSaver).
 
     Yields:
@@ -162,6 +253,8 @@ async def stream_agent_events(
             "thread_id": thread_id,
             "user_id": user_id,
             "model": resolved_model,
+            "use_rag": use_rag,
+            "rag_preset": rag_preset or RAGPreset.BALANCED,
         }
     }
 
@@ -216,6 +309,7 @@ async def stream_agent_events(
                 yield StreamEvent.reasoning(delta=val, node=node)
             elif kind == "final":
                 messages = val.get("messages", []) if val else []
+                sources = val.get("rag_sources") if val else None
                 last_msg = messages[-1] if messages else None
                 response_text = ""
                 if last_msg:
@@ -226,6 +320,7 @@ async def stream_agent_events(
                     response=response_text,
                     model=resolved_model,
                     history_length=len(messages),
+                    sources=sources,
                 )
             elif kind == "error":
                 yield StreamEvent.error(error=val)

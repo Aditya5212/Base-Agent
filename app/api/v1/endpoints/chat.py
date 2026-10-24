@@ -57,6 +57,8 @@ async def chat(request: ChatRequest) -> ChatResponse:
             thread_id=request.thread_id,
             user_id=request.user_id,
             model=request.model,
+            use_rag=request.use_rag,
+            rag_preset=request.rag_preset,
         )
 
         messages = result.get("messages", [])
@@ -75,6 +77,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
             response=response_text,
             model=resolved_model,
             history_length=len(messages),
+            sources=result.get("rag_sources"),
         )
     except Exception as exc:
         logger.error("Chat turn failed for thread_id=%s: %s", request.thread_id, exc, exc_info=True)
@@ -102,6 +105,8 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                 thread_id=request.thread_id,
                 user_id=request.user_id,
                 model=request.model,
+                use_rag=request.use_rag,
+                rag_preset=request.rag_preset,
             ):
                 yield event.to_sse()
         except Exception as exc:

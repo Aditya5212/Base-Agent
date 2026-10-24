@@ -39,8 +39,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.info("PostgreSQL checkpointer initialized successfully.")
         except Exception as checkpointer_err:
             logger.warning("Failed to initialize checkpointer tables: %s", checkpointer_err)
+
+        try:
+            from app.services.vector_store import setup_vector_store
+            await setup_vector_store()
+            logger.info("PostgreSQL vector store and FTS indexes initialized successfully.")
+        except Exception as vs_err:
+            logger.warning("Failed to initialize vector store indexes: %s", vs_err)
     else:
         logger.warning("Database connection failed during startup: %s", err)
+
 
     yield
 

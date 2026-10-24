@@ -17,6 +17,7 @@ Base-Agent/
 ├── .env                        # Local secret configurations (git-ignored)
 ├── README.md                   # Project overview, getting started, roadmap
 ├── AGENTS.md                   # System architecture and agent design specifications
+├── TODO.md                     # Roadmap enhancements (ParadeDB BM25 migration)
 ├── main.py                     # Root development runner (python main.py / uvicorn)
 ├── app/
 │   ├── __init__.py             # Package init & WindowsSelectorEventLoopPolicy setup
@@ -25,7 +26,9 @@ Base-Agent/
 │   │   ├── __init__.py         # Core exports
 │   │   ├── config.py           # Pydantic-settings environment configuration
 │   │   ├── database.py         # Async SQLAlchemy engine & session dependency
-│   │   └── llm.py              # DeepSeek LLM configuration, model registry & client factory
+│   │   ├── llm.py              # DeepSeek LLM configuration, model registry & client factory
+│   │   ├── embedding.py        # Decoupled OpenAI embedding factory (1536 dims)
+│   │   └── rag_config.py       # Precision vs Recall presets & RRF configuration
 │   ├── api/                    # HTTP presentation layer
 │   │   ├── __init__.py
 │   │   └── v1/
@@ -34,19 +37,28 @@ Base-Agent/
 │   │       └── endpoints/
 │   │           ├── __init__.py
 │   │           ├── health.py   # Health & liveness probes (/health, /ping)
-│   │           └── chat.py     # Conversation turns, thread history & memory deletion
+│   │           ├── chat.py     # Conversation turns, streaming (SSE), & memory deletion
+│   │           └── documents.py# Document upload, search, and cascade delete
 │   ├── models/                 # Database persistence models
 │   │   ├── __init__.py
-│   │   └── base.py             # Declarative Base & UTC TimestampMixin
+│   │   ├── base.py             # Declarative Base & UTC TimestampMixin
+│   │   └── document.py         # Document & DocumentChunk persistence models
 │   ├── schemas/                # Request & response Pydantic contracts
 │   │   ├── __init__.py
 │   │   ├── health.py           # Health response models
-│   │   └── chat.py             # ChatRequest, ChatResponse, ThreadHistoryResponse
+│   │   ├── chat.py             # ChatRequest, ChatResponse, StreamEvent
+│   │   └── document.py         # DocumentUploadResponse, RAGSearchRequest/Response
 │   └── services/               # Business logic & agent workflows
 │       ├── __init__.py
-│       ├── agent.py            # LangGraph agent topology, state schema & execution
-│       └── memory.py           # PostgreSQL checkpointer service (AsyncPostgresSaver)
+│       ├── agent.py            # LangGraph agent topology (retrieve -> chat) & state schema
+│       ├── memory.py           # PostgreSQL checkpointer service (AsyncPostgresSaver)
+│       ├── document_loader.py  # Canonical Microsoft MarkItDown parser
+│       ├── text_splitter.py    # Structure-aware token chunking (tiktoken cl100k_base)
+│       ├── vector_store.py     # PGVector HNSW vector store service
+│       ├── retriever.py        # Hybrid Search (Dense + FTS + RRF)
+│       └── r2_storage.py       # Cloudflare R2 / S3 object storage service
 ├── scripts/
+│   ├── test_rag_live.py             # Interactive script testing live RAG + PGVector + FTS + RRF
 │   ├── test_deepseek_live.py        # Interactive script testing live DeepSeek + PostgreSQL turns
 │   └── test_deepseek_stream_live.py # Interactive script testing live DeepSeek SSE streaming
 └── tests/
@@ -54,45 +66,55 @@ Base-Agent/
     ├── test_api.py             # API route tests (health, ping, chat endpoints)
     ├── test_config.py          # Settings validation & URL normalization tests
     ├── test_agent.py           # Multi-turn memory & thread isolation tests
-    └── test_llm.py             # DeepSeek model registry & alias resolution tests
+    ├── test_llm.py             # DeepSeek model registry & alias resolution tests
+    ├── test_document_loader.py # MarkItDown parser tests
+    ├── test_text_splitter.py   # Token chunking & header tracking tests
+    ├── test_embedding.py       # Embedding factory tests
+    ├── test_retriever.py       # RRF fusion logic tests
+    ├── test_documents_api.py   # Document upload, search, and delete endpoint tests
+    └── test_rag_agent.py       # RAG-augmented agent execution and streaming tests
 ```
 
 ---
 
-## 2. Current Agent: Single-Node Conversational Agent
+## 2. Conversational Agent & RAG Topology
 
 ### Overview
-The initial agent is a single-node **LangGraph** workflow that processes conversational turns with persistent short-term memory. State is automatically committed to PostgreSQL after each graph execution.
+The agent is a stateful **LangGraph** workflow that combines conversation turn processing, persistent short-term PostgreSQL checkpointing, and dynamic knowledge retrieval from uploaded user documents.
 
 ### State Schema
 
 ```python
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
     messages: Annotated[Sequence[BaseMessage], add_messages]
     user_id: str
     thread_id: str
-    # Future Phase 2 additions:
-    # rag_context: str
-    # tool_calls: list
-    # agent_config: dict
+    rag_context: str | None
+    rag_sources: list[dict[str, Any]]
 ```
 
-- **`messages`**: Chronological sequence of messages (`HumanMessage`, `AIMessage`, `SystemMessage`). The `add_messages` reducer handles appending new messages and processing removals.
-- **`user_id`**: Identifier of the current authenticated user (prepares for Clerk auth).
+- **`messages`**: Chronological sequence of messages (`HumanMessage`, `AIMessage`, `SystemMessage`).
+- **`user_id`**: Identifier of the current user (scopes document retrieval and memory).
 - **`thread_id`**: Unique conversation session identifier ensuring memory isolation.
+- **`rag_context`**: Formatted passage text retrieved from PostgreSQL for the current turn.
+- **`rag_sources`**: Structured metadata for retrieved document chunks (filenames, sections, citations).
 
 ### Graph Topology
 
 ```
-START ──► [chat_node] ──► END
+START ──► [retrieve_node] ──► [chat_node] ──► END
 ```
 
+- **`retrieve_node`**:
+  1. Checks `configurable.use_rag`. When false, passes through immediately.
+  2. Extracts the user's latest message text.
+  3. Executes hybrid retrieval (dense + sparse + RRF) scoped to the user's documents.
+  4. Returns `rag_context` and structured `rag_sources`.
 - **`chat_node`**:
   1. Reads conversation history from the checkpointer.
-  2. Ensures a system instruction prompt is prepended.
-  3. Resolves the requested LLM model (`deepseek-flash` or `deepseek-v4-pro`).
-  4. Invokes the model asynchronously.
-  5. Appends the model response to the state message list.
+  2. If `rag_context` is present, injects a knowledge-grounding system prompt with source citation instructions.
+  3. Invokes the DeepSeek model asynchronously.
+  4. Appends the model response to state.
 
 ---
 
@@ -107,7 +129,7 @@ To avoid running duplicate connection pools and mismatched database drivers, bot
 - **Tables**: `checkpoints`, `checkpoint_blobs`, `checkpoint_writes` (auto-created at startup via `setup_checkpointer()`).
 - **Isolation**: Each conversation turn is isolated by `configurable = {"thread_id": "...", "user_id": "..."}`.
 - **Operations Supported**:
-  - `execute_agent()`: Resumes state, executes node, writes new checkpoint.
+  - `execute_agent()`: Resumes state, executes nodes, writes new checkpoint.
   - `get_thread_messages()`: Fetches full message history directly from storage.
   - `delete_thread_memory()`: Drops all checkpoints for a thread upon user request.
 
@@ -127,111 +149,90 @@ The application connects to **DeepSeek** via its OpenAI-compatible endpoint:
 | **`deepseek-flash`** (Default) | `DeepSeek-V4.1-Flash-1017` | 1M | 384K | Yes | 2500 | Fast, high-throughput conversational chatbot |
 | **`deepseek-v4-pro`** | `DeepSeek-V4-Pro-0813` | 1M | 384K | No | 500 | Advanced reasoning & complex multi-step tasks |
 
-### Model Resolution
-The [resolve_model_name](file:///c:/Users/Aditya/Desktop/Base-Agent/app/core/llm.py) function transparently accepts:
-- `deepseek-flash`, `DeepSeek-V4.1-Flash-1017`, `flash` &rarr; `deepseek-flash`
-- `deepseek-v4-pro`, `DeepSeek-V4-Pro-0813`, `pro` &rarr; `deepseek-v4-pro`
+---
+
+## 5. Hybrid Search & Knowledge Retrieval (RAG)
+
+Base Agent implements a production-grade **Hybrid Retrieval** architecture combining dense semantic vector search and sparse keyword search:
+
+### 1. Dense Semantic Search (PGVector + HNSW)
+- **Model**: OpenAI `text-embedding-3-small` (1536-dimensional embeddings), decoupled strictly from conversational chat models.
+- **Index**: PostgreSQL HNSW cosine distance index (`vector_cosine_ops`) providing sub-millisecond approximate nearest-neighbor retrieval.
+
+### 2. Sparse Keyword Search (PostgreSQL Full-Text Search)
+- **Index**: GIN index on `to_tsvector('english', document)`.
+- **Query**: Executed via `plainto_tsquery` and ranked with `ts_rank_cd`.
+- **Roadmap**: ParadeDB `pg_search` BM25 migration path documented in `TODO.md`.
+
+### 3. Reciprocal Rank Fusion (RRF)
+Combines dense and sparse ranked result lists into an optimal fused ranking:
+$$\text{RRF}(d) = \frac{w_{\text{dense}}}{k + \text{rank}_{\text{dense}}} + \frac{w_{\text{sparse}}}{k + \text{rank}_{\text{sparse}}}$$
+
+### 4. Precision vs Recall Presets
+
+| Preset | Target Chunk Size | Overlap | Top-K Dense | Top-K Sparse | Use Case |
+| ------ | ----------------- | ------- | ----------- | ------------ | -------- |
+| `high_precision` | 200 tokens | 40 tokens | 5 | 5 | Exact fact lookup, specific definitions, Q&A |
+| `balanced` (Default) | 500 tokens | 100 tokens | 10 | 10 | General question answering and thematic analysis |
+| `high_recall` | 1000 tokens | 200 tokens | 20 | 20 | Broad summaries, cross-document synthesis |
 
 ---
 
-## 5. Event Streaming Architecture (SSE & LangChain v3 Protocol)
+## 6. Cloudflare R2 & Document Lifecycle Pipeline
 
-### Overview
-In addition to synchronous request-response execution, Base Agent supports real-time token and reasoning event streaming over HTTP via **Server-Sent Events (SSE)**.
-
-The streaming engine is built on LangGraph's native `astream_events(..., version="v3")` protocol, providing typed projections (`stream.messages`, `message.text`, `message.reasoning`, `stream.output`).
-
-### Event Pipeline
-
-```
-Client (SSE) ◄── [POST /api/v1/chat/stream]
-                      ▲
-                      │ (yields StreamEvent.to_sse())
-               [stream_agent_events()]
-                      ▲
-                      │ (asyncio.Queue pump)
-         [graph.astream_events(..., version="v3")]
-             ├── stream.messages.reasoning  ──► "event: reasoning"
-             ├── stream.messages.text       ──► "event: token"
-             └── stream.output()            ──► "event: end" + PostgreSQL Checkpoint
-```
-
-### Server-Sent Events (SSE) Wire Format
-
-| Event Type | Field | Description | Example Data Payload |
-| ---------- | ----- | ----------- | -------------------- |
-| `token` | Text Delta | Incremental response text chunk | `{"type": "token", "delta": "Hello", "node": "chat_node"}` |
-| `reasoning` | Thinking Delta | Incremental reasoning token (DeepSeek thinking mode) | `{"type": "reasoning", "delta": "Analyzing query...", "node": "chat_node"}` |
-| `end` | Completion | Final turn completion with thread snapshot | `{"type": "end", "thread_id": "...", "user_id": "...", "response": "...", "model": "deepseek-flash", "history_length": 4}` |
-| `error` | Failure | Safe execution error description | `{"type": "error", "error": "Execution timeout"}` |
-
-### PostgreSQL Persistence During Streaming
-State persistence remains atomic: as the stream is driven to completion, the LangGraph checkpointer commits the new checkpoint to PostgreSQL with the full conversation state, ensuring that subsequent turns (streaming or non-streaming) have identical access to conversation context.
+### Ingestion Flow
+1. **Upload**: User uploads document (`PDF`, `DOCX`, `TXT`, `MD`) via `POST /api/v1/documents/upload`.
+2. **Object Storage**: Stored in Cloudflare R2 (S3-compatible) via async `aioboto3`.
+3. **Parsing**: Converted to structured markdown via Microsoft **MarkItDown** (`markitdown`).
+4. **Chunking**: Structure-aware splitting using `MarkdownHeaderTextSplitter` + `RecursiveCharacterTextSplitter.from_tiktoken_encoder` (`cl100k_base`), preserving section hierarchy.
+5. **Embedding & Indexing**: Vectors indexed into `langchain_pg_embedding` in PostgreSQL.
+6. **Cascade Delete**: When a document is deleted via `DELETE /api/v1/documents/{document_id}`, both R2 storage and all PostgreSQL chunks are purged atomically.
 
 ---
 
-## 6. API Endpoints
+## 7. Event Streaming Architecture (SSE & LangChain v3 Protocol)
+
+Real-time token and reasoning event streaming over HTTP via **Server-Sent Events (SSE)** using LangGraph's native `astream_events(..., version="v3")`.
+
+### Wire Format
+- `token`: Incremental response text chunk.
+- `reasoning`: Incremental reasoning delta (DeepSeek thinking mode).
+- `end`: Final turn snapshot containing `response`, `history_length`, and retrieved `sources`.
+- `error`: Error payload.
+
+---
+
+## 8. API Endpoints
 
 | Method | Path | Summary | Description |
 | ------ | ---- | ------- | ----------- |
 | `GET` | `/` | Root | Service info and API status |
 | `GET` | `/api/v1/health` | Readiness Probe | Verifies PostgreSQL connectivity |
 | `GET` | `/api/v1/ping` | Liveness Probe | Lightweight health check |
-| `POST` | `/api/v1/chat` | Send Message | Executes a conversation turn with memory persistence |
-| `POST` | `/api/v1/chat/stream` | Stream Message | Streams real-time tokens & reasoning via SSE with memory persistence |
-| `GET` | `/api/v1/chat/{thread_id}/history` | Get History | Retrieves full conversation history from PostgreSQL |
+| `POST` | `/api/v1/chat` | Send Message | Executes a conversation turn (optional RAG) |
+| `POST` | `/api/v1/chat/stream` | Stream Message | Streams real-time tokens & reasoning via SSE |
+| `GET` | `/api/v1/chat/{thread_id}/history` | Get History | Retrieves full conversation history |
 | `DELETE` | `/api/v1/chat/{thread_id}` | Clear Memory | Deletes stored checkpoints for a thread |
+| `POST` | `/api/v1/documents/upload` | Upload Document | Uploads to R2, parses with MarkItDown, chunks & indexes |
+| `GET` | `/api/v1/documents` | List Documents | Lists user's uploaded documents with statuses |
+| `DELETE` | `/api/v1/documents/{document_id}` | Delete Document | Cascade delete from R2 and PostgreSQL vector store |
+| `POST` | `/api/v1/documents/search` | Search Documents | Direct hybrid search with precision/recall tuning |
 
 ---
 
-## 7. Future Agent Builder Architecture (Phase 2)
+## 9. Future Agent Builder Architecture (Phase 2)
 
-### Concept
-The Agent Builder will allow users to define custom agent workflows dynamically through a configuration API. Each user-defined agent becomes a configurable LangGraph instantiated at runtime.
-
-### Agent Configuration Schema (Draft)
-
-```python
-class AgentConfig(BaseModel):
-    agent_id: str
-    name: str
-    description: str
-    model: str = "deepseek-flash"        # "deepseek-flash" or "deepseek-v4-pro"
-    temperature: float = 0.0
-    system_prompt: str
-    tools: list[str] = []               # Registered tool names
-    rag_enabled: bool = False
-    rag_config: RAGConfig | None = None
-    max_iterations: int = 10
-    graph_type: str = "linear"          # "linear", "cyclic", "multi_agent"
-```
-
-### Graph Types
-
-| Type | Description | Use Case |
-| ---- | ----------- | -------- |
-| `linear` | Input &rarr; LLM &rarr; Output | Conversational chatbot |
-| `cyclic` | Input &rarr; LLM &rarr; Tool &rarr; LLM loop | ReAct-style agents with function execution |
-| `multi_agent` | Supervisor orchestrating multiple sub-agents | Complex multi-stage business workflows |
-
-### Planned Node Registry
-
-```python
-NODE_REGISTRY = {
-    "chat": ChatNode,
-    "rag_retriever": RAGRetrieverNode,
-    "tool_executor": ToolExecutorNode,
-    "human_approval": HumanApprovalNode,
-    "summarizer": SummarizerNode,
-}
-```
+Dynamic agent workflows defined through configuration API:
+- Graph types: `linear`, `cyclic` (ReAct), `multi_agent`.
+- Custom node registry: `chat`, `rag_retriever`, `tool_executor`, `human_approval`.
 
 ---
 
-## 7. Design Principles
+## 10. Design Principles
 
 1. **Stateless API, Stateful Graph**: FastAPI endpoints remain stateless; conversation state is persisted across turns via the checkpointer.
-2. **Unified Driver Ecosystem**: Single `psycopg3` engine and pool for both ORM and LangGraph.
-3. **Cross-Platform Compatibility**: Automatic selector loop policy for Windows (`WindowsSelectorEventLoopPolicy`) and standard selector on POSIX.
-4. **Configuration over Hardcoding**: Dynamic model switching, base URLs, and parameters driven by environment and request payloads.
-5. **Async First**: Fully async database queries, network calls, and agent invocations for maximum throughput.
+2. **Unified Driver Ecosystem**: Single `psycopg3` engine and pool for ORM, LangGraph, and PGVector.
+3. **Decoupled Embedding and LLM Providers**: Independent OpenAI embeddings and DeepSeek conversational reasoning.
+4. **No In-Memory Production Traps**: Multi-worker persistence via PostgreSQL native FTS and PGVector.
+5. **Cross-Platform Compatibility**: Automatic selector loop policy for Windows and standard selector on POSIX.
+6. **Async First**: Fully async database queries, network calls, and agent invocations for maximum throughput.

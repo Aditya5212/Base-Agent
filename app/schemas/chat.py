@@ -17,6 +17,14 @@ class ChatRequest(BaseModel):
         default=None,
         description="Optional model override (e.g. 'DeepSeek-V4.1-Flash-1017' or 'DeepSeek-V4-Pro-0813')",
     )
+    use_rag: bool = Field(
+        default=False,
+        description="Whether to retrieve relevant passages from user documents via hybrid search",
+    )
+    rag_preset: str = Field(
+        default="balanced",
+        description="RAG precision/recall preset: high_precision, balanced, high_recall",
+    )
 
 
 class ChatMessage(BaseModel):
@@ -35,6 +43,10 @@ class ChatResponse(BaseModel):
     response: str = Field(..., description="Agent response message")
     model: str = Field(..., description="Model version used for generating the response")
     history_length: int = Field(..., description="Total number of messages currently stored in thread state")
+    sources: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Retrieved document sources when RAG is enabled",
+    )
 
 
 class ThreadHistoryResponse(BaseModel):
@@ -98,19 +110,20 @@ class StreamEvent(BaseModel):
         response: str,
         model: str,
         history_length: int,
+        sources: list[dict[str, Any]] | None = None,
     ) -> "StreamEvent":
         """Factory for final turn completion event."""
-        return cls(
-            event=StreamEventType.END,
-            data={
-                "type": StreamEventType.END,
-                "thread_id": thread_id,
-                "user_id": user_id,
-                "response": response,
-                "model": model,
-                "history_length": history_length,
-            },
-        )
+        data: dict[str, Any] = {
+            "type": StreamEventType.END,
+            "thread_id": thread_id,
+            "user_id": user_id,
+            "response": response,
+            "model": model,
+            "history_length": history_length,
+        }
+        if sources is not None:
+            data["sources"] = sources
+        return cls(event=StreamEventType.END, data=data)
 
     @classmethod
     def error(cls, error: str) -> "StreamEvent":

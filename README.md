@@ -15,38 +15,64 @@ A production-grade, extensible AI chatbot built with FastAPI and LangGraph. Star
 | Backend        | Python 3.12+, FastAPI               |
 | Package Manager| `uv`                                |
 | Agent Framework| LangGraph + LangChain               |
-| Database / ORM | PostgreSQL + SQLAlchemy (async)     |
-| Auth           | Clerk                               |
-| Object Storage | Cloudflare R2 (future)              |
-| RAG / Search   | BM25 + LightRAG (future)            |
-| Frontend       | Next.js (future)                    |
+| Database / ORM | PostgreSQL + SQLAlchemy (async, psycopg3) |
+| Vector Store   | `pgvector` (HNSW Cosine Index) via `langchain-postgres` |
+| Sparse Search  | PostgreSQL Native Full-Text Search (GIN `to_tsvector`) |
+| Hybrid Ranking | Reciprocal Rank Fusion (RRF)        |
+| Embeddings     | OpenAI `text-embedding-3-small` (1536-dim) |
+| LLM Chat Model | DeepSeek (`deepseek-flash` & `deepseek-v4-pro`) |
+| Parser         | Microsoft MarkItDown (`markitdown`) |
+| Chunking       | Structure-aware token splitter (`tiktoken` `cl100k_base`) |
+| Object Storage | Cloudflare R2 (S3-compatible via `aioboto3`) |
+| Auth           | Clerk (Phase 2)                     |
+| Frontend       | Next.js (Phase 3)                   |
 
 ## 📁 Project Structure
 
 ```
-base-agent/
-├── pyproject.toml
-├── .env
-├── README.md
-├── agents.md
-└── app/
-    ├── __init__.py
-    ├── main.py              # FastAPI entry point
-    ├── core/
-    │   ├── __init__.py
-    │   ├── config.py        # Environment settings
-    │   ├── database.py      # Async SQLAlchemy engine
-    │   └── auth.py          # Clerk JWT verification
-    ├── api/
-    │   ├── __init__.py
-    │   └── routes.py        # API endpoints
-    ├── models/              # SQLAlchemy ORM models
-    │   └── __init__.py
-    └── services/            # Business logic
-        ├── __init__.py
-        ├── agent.py         # LangGraph agent definition
-        ├── memory.py        # Postgres checkpointer
-        └── rag.py           # BM25 / LightRAG (future)
+Base-Agent/
+├── pyproject.toml              # Dependencies & pytest configuration
+├── uv.lock                     # Deterministic dependency lockfile
+├── .env.example                # Documented configuration template
+├── README.md                   # Project overview and getting started
+├── AGENTS.md                   # Agent and architecture specifications
+├── TODO.md                     # Future enhancements (ParadeDB BM25)
+├── main.py                     # Development runner
+├── app/
+│   ├── main.py                 # FastAPI factory & lifespan setup
+│   ├── core/                   # Infrastructure configuration
+│   │   ├── config.py           # Pydantic settings
+│   │   ├── database.py         # Async SQLAlchemy engine & session dependency
+│   │   ├── llm.py              # DeepSeek model registry & client factory
+│   │   ├── embedding.py        # Decoupled OpenAI embedding factory
+│   │   └── rag_config.py       # Precision vs Recall presets & RRF config
+│   ├── api/                    # HTTP presentation layer
+│   │   └── v1/
+│   │       ├── router.py       # API v1 aggregator
+│   │       └── endpoints/
+│   │           ├── health.py   # Health & liveness probes
+│   │           ├── chat.py     # Persistent chat, streaming (SSE), & history
+│   │           └── documents.py# Document upload, search, and cascade delete
+│   ├── models/                 # SQLAlchemy ORM models
+│   │   ├── base.py             # Declarative base & timestamps
+│   │   └── document.py         # Document & DocumentChunk models
+│   ├── schemas/                # Pydantic request & response contracts
+│   │   ├── chat.py             # ChatRequest, ChatResponse, StreamEvent
+│   │   ├── document.py         # Upload, list, and RAG search contracts
+│   │   └── health.py           # Health response schemas
+│   └── services/               # Core business logic
+│       ├── agent.py            # LangGraph agent topology (retrieve -> chat)
+│       ├── memory.py           # PostgreSQL checkpointer (AsyncPostgresSaver)
+│       ├── document_loader.py  # Canonical Microsoft MarkItDown parser
+│       ├── text_splitter.py    # Structure-aware token chunking
+│       ├── vector_store.py     # PGVector HNSW vector store service
+│       ├── retriever.py        # Hybrid Search (Dense + FTS + RRF)
+│       └── r2_storage.py       # Cloudflare R2 / S3 object storage service
+├── scripts/
+│   ├── test_rag_live.py             # Live RAG ingestion and hybrid search verification
+│   ├── test_deepseek_live.py        # Live DeepSeek multi-turn chat test
+│   └── test_deepseek_stream_live.py # Live DeepSeek SSE streaming test
+└── tests/                           # Complete pytest suite (39 tests)
 ```
 
 ## 🚀 Getting Started
@@ -54,38 +80,44 @@ base-agent/
 ### Prerequisites
 - Python 3.12+
 - [`uv`](https://github.com/astral-sh/uv) package manager
-- PostgreSQL database (local or hosted)
+- PostgreSQL with `vector` extension (e.g. [Neon](https://neon.tech))
+- OpenAI API key (for embeddings)
+- DeepSeek API key (for conversational agent)
 
 ### Installation
 
 ```bash
-# Clone and enter the project
-cd base-agent
+# Clone and enter the repository
+cd Base-Agent
 
-# Install dependencies
+# Install locked dependencies
 uv sync
 
-# Copy and configure environment variables
+# Configure environment variables
 cp .env.example .env
 ```
 
 ### Environment Variables
 
+Configure `.env`:
 ```env
 # Database
-DATABASE_URL=postgresql+asyncpg://user:password@localhost:5432/base_agent
+DATABASE_URL=postgresql+psycopg://user:password@host/base_agent
 
-# Auth (Clerk)
-CLERK_SECRET_KEY=your_clerk_secret_key
-CLERK_FRONTEND_API_URL=your-clerk-domain.clerk.accounts.dev
+# DeepSeek Chat Models
+DEEPSEEK_API_KEY=your_deepseek_key
+DEEPSEEK_MODEL=deepseek-flash
 
-# LLM
+# OpenAI Embeddings (Decoupled from chat models)
 OPENAI_API_KEY=your_openai_key
+EMBEDDING_MODEL=text-embedding-3-small
+EMBEDDING_DIMENSIONS=1536
 
-# Cloudflare R2 (Phase 2)
-CLOUDFLARE_R2_ACCESS_KEY=
-CLOUDFLARE_R2_SECRET_KEY=
-CLOUDFLARE_R2_BUCKET_NAME=
+# Cloudflare R2 Storage (Optional for local development)
+CLOUDFLARE_R2_ACCESS_KEY=your_access_key
+CLOUDFLARE_R2_SECRET_KEY=your_secret_key
+CLOUDFLARE_R2_BUCKET_NAME=your_bucket
+CLOUDFLARE_R2_ENDPOINT_URL=https://<account-id>.r2.cloudflarestorage.com
 ```
 
 ### Running the Server
@@ -94,19 +126,43 @@ CLOUDFLARE_R2_BUCKET_NAME=
 uv run uvicorn app.main:app --reload
 ```
 
-API docs will be available at `http://localhost:8000/docs`.
+Interactive Swagger API documentation is available at:
+`http://localhost:8000/docs`
+
+### Running the Automated Tests
+
+```bash
+uv run pytest
+```
+
+### Running Live Interactive Scripts
+
+```bash
+# Test live RAG ingestion, PGVector HNSW, PostgreSQL FTS, and RRF
+uv run python -m scripts.test_rag_live
+
+# Test live multi-turn DeepSeek conversation with PostgreSQL memory
+uv run python -m scripts.test_deepseek_live
+
+# Test live DeepSeek SSE token and reasoning streaming
+uv run python -m scripts.test_deepseek_stream_live
+```
 
 ## 🗺️ Roadmap
 
 - [x] Project scaffolding with `uv` and FastAPI
-- [x] LangGraph agent skeleton
-- [x] Persistent conversation memory (Postgres checkpointer)
-- [x] Conversation CRUD endpoints (chat turn, get history, delete thread)
+- [x] LangGraph conversational agent with persistent PostgreSQL memory
 - [x] Real-time Server-Sent Events (SSE) streaming (`POST /api/v1/chat/stream`)
 - [x] DeepSeek integration (`deepseek-flash` & `deepseek-v4-pro`)
+- [x] Cloudflare R2 object storage service (`aioboto3`)
+- [x] Canonical document ingestion with Microsoft MarkItDown (`markitdown`)
+- [x] Structure-aware token chunking (`tiktoken` `cl100k_base`)
+- [x] PGVector HNSW + PostgreSQL FTS Hybrid Search with Reciprocal Rank Fusion (RRF)
+- [x] RAG Precision vs Recall presets (`high_precision`, `balanced`, `high_recall`)
+- [x] Document lifecycle endpoints (`POST /upload`, `GET /`, `DELETE /{id}`, `POST /search`)
+- [x] RAG-augmented LangGraph conversational agent with source citations (`use_rag=True`)
 - [ ] Clerk authentication middleware
-- [ ] Cloudflare R2 file upload service
-- [ ] BM25 + LightRAG retrieval pipeline
-- [ ] Agent Builder configuration API
+- [ ] ParadeDB `pg_search` BM25 extension migration (see `TODO.md`)
+- [ ] Agent Builder dynamic configuration API
 - [ ] Next.js frontend
 

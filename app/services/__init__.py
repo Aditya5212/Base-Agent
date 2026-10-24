@@ -8,6 +8,7 @@ from app.services.memory import (
     get_thread_messages,
     setup_checkpointer,
 )
+from app.services.r2_storage import R2StorageService, r2_storage_service
 
 __all__ = [
     "AgentState",
@@ -18,4 +19,6 @@ __all__ = [
     "close_checkpointer_pool",
     "get_thread_messages",
     "delete_thread_memory",
+    "R2StorageService",
+    "r2_storage_service",
 ]
