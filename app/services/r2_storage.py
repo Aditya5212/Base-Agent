@@ -124,7 +124,7 @@ class R2StorageService:
     async def generate_presigned_url(self, file_key: str, expires_in: int = 3600) -> str:
         """Generates a presigned GET URL for downloading private R2 files."""
         if not self.is_configured:
-            return f"/api/v1/documents/dev-download/{file_key}"
+            return f"/api/v1/storage/dev-download/{file_key}"
 
         async with self.get_client() as s3:
             url = await s3.generate_presigned_url(
@@ -133,6 +133,155 @@ class R2StorageService:
                 ExpiresIn=expires_in,
             )
             return url
+
+    async def generate_presigned_upload_url(
+        self,
+        file_key: str,
+        content_type: str = "application/octet-stream",
+        expires_in: int = 3600,
+    ) -> str:
+        """Generates a presigned PUT URL allowing clients to upload directly to R2."""
+        if not self.is_configured:
+            return f"/api/v1/storage/dev-upload/{file_key}"
+
+        async with self.get_client() as s3:
+            url = await s3.generate_presigned_url(
+                "put_object",
+                Params={"Bucket": self.bucket_name, "Key": file_key, "ContentType": content_type},
+                ExpiresIn=expires_in,
+            )
+            return url
+
+    async def list_objects(
+        self,
+        prefix: str = "",
+        max_keys: int = 100,
+        continuation_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Lists objects stored in Cloudflare R2 matching a prefix."""
+        if not self.is_configured:
+            matched = [
+                {
+                    "key": k,
+                    "size": len(v[0]),
+                    "content_type": v[1],
+                    "last_modified": None,
+                    "etag": None,
+                    "presigned_url": f"/api/v1/storage/dev-download/{k}",
+                    "public_url": self.get_public_url(k),
+                }
+                for k, v in self._dev_storage.items()
+                if k.startswith(prefix)
+            ]
+            return {
+                "objects": matched[:max_keys],
+                "total_count": len(matched),
+                "is_truncated": len(matched) > max_keys,
+                "next_continuation_token": None,
+            }
+
+        params: dict[str, Any] = {
+            "Bucket": self.bucket_name,
+            "MaxKeys": min(max(1, max_keys), 1000),
+        }
+        if prefix:
+            params["Prefix"] = prefix
+        if continuation_token:
+            params["ContinuationToken"] = continuation_token
+
+        async with self.get_client() as s3:
+            res = await s3.list_objects_v2(**params)
+            items = []
+            for item in res.get("Contents", []):
+                key = item["Key"]
+                items.append({
+                    "key": key,
+                    "size": item["Size"],
+                    "last_modified": item.get("LastModified"),
+                    "etag": item.get("ETag", "").strip('"'),
+                    "presigned_url": await self.generate_presigned_url(key),
+                    "public_url": self.get_public_url(key),
+                })
+
+            return {
+                "objects": items,
+                "total_count": len(items),
+                "is_truncated": res.get("IsTruncated", False),
+                "next_continuation_token": res.get("NextContinuationToken"),
+            }
+
+    async def get_object_metadata(self, file_key: str) -> dict[str, Any]:
+        """Retrieves metadata headers for a specific object."""
+        if not self.is_configured:
+            if file_key not in self._dev_storage:
+                raise FileNotFoundError(f"File key '{file_key}' not found in development storage.")
+            data, content_type = self._dev_storage[file_key]
+            return {
+                "key": file_key,
+                "size": len(data),
+                "content_type": content_type,
+                "last_modified": None,
+                "etag": None,
+                "presigned_url": f"/api/v1/storage/dev-download/{file_key}",
+                "public_url": self.get_public_url(file_key),
+            }
+
+        async with self.get_client() as s3:
+            res = await s3.head_object(Bucket=self.bucket_name, Key=file_key)
+            return {
+                "key": file_key,
+                "size": res.get("ContentLength", 0),
+                "content_type": res.get("ContentType", "application/octet-stream"),
+                "last_modified": res.get("LastModified"),
+                "etag": res.get("ETag", "").strip('"'),
+                "presigned_url": await self.generate_presigned_url(file_key),
+                "public_url": self.get_public_url(file_key),
+            }
+
+    async def get_storage_stats(self, prefix: str = "") -> dict[str, Any]:
+        """Calculates aggregated storage metrics for the bucket or prefix."""
+        if not self.is_configured:
+            total_size = sum(len(v[0]) for k, v in self._dev_storage.items() if k.startswith(prefix))
+            total_files = len([k for k in self._dev_storage if k.startswith(prefix)])
+            return {
+                "configured": False,
+                "bucket_name": self.bucket_name or "in_memory_dev",
+                "total_files": total_files,
+                "total_bytes": total_size,
+                "endpoint_url": "in_memory",
+                "region": "dev",
+            }
+
+        total_files = 0
+        total_size = 0
+        continuation_token = None
+
+        async with self.get_client() as s3:
+            while True:
+                params: dict[str, Any] = {"Bucket": self.bucket_name, "MaxKeys": 1000}
+                if prefix:
+                    params["Prefix"] = prefix
+                if continuation_token:
+                    params["ContinuationToken"] = continuation_token
+
+                res = await s3.list_objects_v2(**params)
+                for item in res.get("Contents", []):
+                    total_files += 1
+                    total_size += item["Size"]
+
+                if res.get("IsTruncated"):
+                    continuation_token = res.get("NextContinuationToken")
+                else:
+                    break
+
+        return {
+            "configured": True,
+            "bucket_name": self.bucket_name,
+            "total_files": total_files,
+            "total_bytes": total_size,
+            "endpoint_url": self.endpoint_url,
+            "region": self.region_name,
+        }
 
     def get_public_url(self, file_key: str) -> str | None:
         """Returns the public CDN / custom domain URL if R2_PUBLIC_BASE_URL is configured."""

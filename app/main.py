@@ -35,6 +35,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     if db_connected:
         logger.info("Database connection successfully established.")
         try:
+            from app.core.database import init_db
+            await init_db()
+            logger.info("Application database tables verified/created successfully.")
+        except Exception as init_err:
+            logger.warning("Failed to initialize database tables: %s", init_err)
+
+        try:
             await setup_checkpointer()
             logger.info("PostgreSQL checkpointer initialized successfully.")
         except Exception as checkpointer_err:

@@ -42,3 +42,41 @@ def test_upload_empty_file_rejected():
     response = client.post("/api/v1/documents/upload", files=files, data={"user_id": "u1"})
     assert response.status_code == 400
     assert "empty" in response.json()["detail"].lower()
+
+
+def test_get_knowledge_base_stats():
+    response = client.get("/api/v1/documents/stats?user_id=test_stats_user")
+    assert response.status_code == 200
+    data = response.json()
+    assert "total_documents" in data
+    assert "total_chunks" in data
+    assert "formatted_storage" in data
+    assert data["active_preset_default"] == "balanced"
+
+
+def test_get_document_invalid_uuid():
+    response = client.get("/api/v1/documents/not-a-valid-uuid")
+    assert response.status_code == 400
+    assert "invalid uuid" in response.json()["detail"].lower()
+
+
+def test_get_document_not_found():
+    response = client.get("/api/v1/documents/00000000-0000-0000-0000-000000000000")
+    assert response.status_code == 404
+    assert "not found" in response.json()["detail"].lower()
+
+
+def test_get_document_chunks_not_found():
+    response = client.get("/api/v1/documents/00000000-0000-0000-0000-000000000000/chunks")
+    assert response.status_code == 404
+    assert "not found" in response.json()["detail"].lower()
+
+
+def test_reindex_document_not_found():
+    response = client.post(
+        "/api/v1/documents/00000000-0000-0000-0000-000000000000/reindex",
+        json={"preset": "high_precision"},
+    )
+    assert response.status_code == 404
+    assert "not found" in response.json()["detail"].lower()
+

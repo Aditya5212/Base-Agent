@@ -204,6 +204,7 @@ Real-time token and reasoning event streaming over HTTP via **Server-Sent Events
 
 ## 8. API Endpoints
 
+### Core & Conversation
 | Method | Path | Summary | Description |
 | ------ | ---- | ------- | ----------- |
 | `GET` | `/` | Root | Service info and API status |
@@ -213,10 +214,31 @@ Real-time token and reasoning event streaming over HTTP via **Server-Sent Events
 | `POST` | `/api/v1/chat/stream` | Stream Message | Streams real-time tokens & reasoning via SSE |
 | `GET` | `/api/v1/chat/{thread_id}/history` | Get History | Retrieves full conversation history |
 | `DELETE` | `/api/v1/chat/{thread_id}` | Clear Memory | Deletes stored checkpoints for a thread |
-| `POST` | `/api/v1/documents/upload` | Upload Document | Uploads to R2, parses with MarkItDown, chunks & indexes |
-| `GET` | `/api/v1/documents` | List Documents | Lists user's uploaded documents with statuses |
-| `DELETE` | `/api/v1/documents/{document_id}` | Delete Document | Cascade delete from R2 and PostgreSQL vector store |
-| `POST` | `/api/v1/documents/search` | Search Documents | Direct hybrid search with precision/recall tuning |
+
+### Knowledge Base Management (`/api/v1/documents`)
+| Method | Path | Summary | Description |
+| ------ | ---- | ------- | ----------- |
+| `GET` | `/api/v1/documents/stats` | KB Statistics | Aggregated document, chunk, and storage metrics |
+| `GET` | `/api/v1/documents` | List Documents | Lists user's documents with search filter and pagination |
+| `POST` | `/api/v1/documents/upload` | Upload & Index | Uploads to R2, parses with MarkItDown, chunks & indexes |
+| `GET` | `/api/v1/documents/{document_id}` | Document Details | Metadata, status, chunk count, and presigned download URL |
+| `GET` | `/api/v1/documents/{document_id}/chunks` | Inspect Chunks | Granular inspection of document text chunks & headers |
+| `POST` | `/api/v1/documents/{document_id}/reindex` | Re-index Document | Re-chunks/re-indexes from R2 source with new preset |
+| `GET` | `/api/v1/documents/{document_id}/download` | Download Document | Streams raw binary document directly from R2 storage |
+| `DELETE` | `/api/v1/documents/{document_id}` | Cascade Delete | Purges from R2, PGVector chunks, and database |
+| `POST` | `/api/v1/documents/search` | Direct Hybrid Search | Hybrid retrieval (Dense + FTS + RRF) with preset tuning |
+
+### Object Storage Management (`/api/v1/storage`)
+| Method | Path | Summary | Description |
+| ------ | ---- | ------- | ----------- |
+| `GET` | `/api/v1/storage/stats` | Storage Stats | Bucket metrics, total files, and bytes consumed |
+| `GET` | `/api/v1/storage/objects` | List Objects | Lists objects matching prefix with ETags and signed URLs |
+| `POST` | `/api/v1/storage/upload` | Direct Upload | Uploads any asset directly to Cloudflare R2 |
+| `GET` | `/api/v1/storage/objects/{key}` | Object Details | Metadata, size, content-type, and presigned URL |
+| `GET` | `/api/v1/storage/download/{key}` | Download Object | Streams binary file directly from Cloudflare R2 |
+| `DELETE` | `/api/v1/storage/objects/{key}` | Delete Object | Deletes object from Cloudflare R2 bucket |
+| `POST` | `/api/v1/storage/presigned-url` | Generate Presigned URL | Generates temporary PUT (direct client upload) or GET URL |
+
 
 ---
 

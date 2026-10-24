@@ -52,14 +52,16 @@ Base-Agent/
 │   │       └── endpoints/
 │   │           ├── health.py   # Health & liveness probes
 │   │           ├── chat.py     # Persistent chat, streaming (SSE), & history
-│   │           └── documents.py# Document upload, search, and cascade delete
+│   │           ├── documents.py# Knowledge Base management, chunks, reindex, search
+│   │           └── storage.py  # Object storage management (upload, presigned URLs, stats)
 │   ├── models/                 # SQLAlchemy ORM models
 │   │   ├── base.py             # Declarative base & timestamps
 │   │   └── document.py         # Document & DocumentChunk models
 │   ├── schemas/                # Pydantic request & response contracts
 │   │   ├── chat.py             # ChatRequest, ChatResponse, StreamEvent
-│   │   ├── document.py         # Upload, list, and RAG search contracts
-│   │   └── health.py           # Health response schemas
+│   │   ├── document.py         # Knowledge Base documents, chunks, reindex schemas
+│   │   ├── health.py           # Health response schemas
+│   │   └── storage.py          # Object storage items, presigned URLs, stats schemas
 │   └── services/               # Core business logic
 │       ├── agent.py            # LangGraph agent topology (retrieve -> chat)
 │       ├── memory.py           # PostgreSQL checkpointer (AsyncPostgresSaver)
@@ -72,8 +74,47 @@ Base-Agent/
 │   ├── test_rag_live.py             # Live RAG ingestion and hybrid search verification
 │   ├── test_deepseek_live.py        # Live DeepSeek multi-turn chat test
 │   └── test_deepseek_stream_live.py # Live DeepSeek SSE streaming test
-└── tests/                           # Complete pytest suite (39 tests)
+└── tests/                           # Complete pytest suite (49 tests)
 ```
+
+## 🔌 API Endpoints Summary
+
+Interactive Swagger UI is available at `http://localhost:8000/docs`.
+
+### Conversational Agent & Core
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/` | Service root and health check link |
+| `GET` | `/api/v1/health` | Readiness probe (validates PostgreSQL connectivity) |
+| `GET` | `/api/v1/ping` | Liveness probe |
+| `POST` | `/api/v1/chat` | Multi-turn agent conversation turn (optional RAG) |
+| `POST` | `/api/v1/chat/stream` | Server-Sent Events (SSE) streaming (tokens + reasoning) |
+| `GET` | `/api/v1/chat/{thread_id}/history` | Retrieve stored conversation history |
+| `DELETE` | `/api/v1/chat/{thread_id}` | Clear PostgreSQL memory checkpoints for thread |
+
+### Knowledge Base Management (`/api/v1/documents`)
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/v1/documents/stats` | Aggregated metrics: documents, chunks, bytes used, statuses |
+| `GET` | `/api/v1/documents` | List knowledge base documents with search filter and pagination |
+| `POST` | `/api/v1/documents/upload` | Upload raw document to R2, parse to Markdown, chunk & index |
+| `GET` | `/api/v1/documents/{id}` | Document details with chunk count, status, and download URL |
+| `GET` | `/api/v1/documents/{id}/chunks` | Inspect granular token chunks, section headers, and metadata |
+| `POST` | `/api/v1/documents/{id}/reindex` | Re-index document from R2 with a different chunking preset |
+| `GET` | `/api/v1/documents/{id}/download` | Stream original binary document directly from R2 |
+| `DELETE` | `/api/v1/documents/{id}` | Cascade delete: R2 storage, PGVector embeddings, chunks & record |
+| `POST` | `/api/v1/documents/search` | Direct Hybrid Search (Dense HNSW + FTS GIN + RRF fusion) |
+
+### Object Storage Management (`/api/v1/storage`)
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/v1/storage/stats` | Bucket statistics: total files, total bytes, formatted size |
+| `GET` | `/api/v1/storage/objects` | List objects matching prefix with ETags and download URLs |
+| `POST` | `/api/v1/storage/upload` | Direct file upload to Cloudflare R2 |
+| `GET` | `/api/v1/storage/objects/{key}` | Object metadata, size, MIME type, and download URL |
+| `GET` | `/api/v1/storage/download/{key}` | Stream binary object directly from Cloudflare R2 |
+| `DELETE` | `/api/v1/storage/objects/{key}` | Delete object from Cloudflare R2 |
+| `POST` | `/api/v1/storage/presigned-url` | Generate temporary PUT (upload) or GET (download) signed URL |
 
 ## 🚀 Getting Started
 
@@ -83,6 +124,7 @@ Base-Agent/
 - PostgreSQL with `vector` extension (e.g. [Neon](https://neon.tech))
 - OpenAI API key (for embeddings)
 - DeepSeek API key (for conversational agent)
+- Cloudflare R2 bucket & API token (for object storage)
 
 ### Installation
 
@@ -113,11 +155,14 @@ OPENAI_API_KEY=your_openai_key
 EMBEDDING_MODEL=text-embedding-3-small
 EMBEDDING_DIMENSIONS=1536
 
-# Cloudflare R2 Storage (Optional for local development)
-CLOUDFLARE_R2_ACCESS_KEY=your_access_key
-CLOUDFLARE_R2_SECRET_KEY=your_secret_key
-CLOUDFLARE_R2_BUCKET_NAME=your_bucket
-CLOUDFLARE_R2_ENDPOINT_URL=https://<account-id>.r2.cloudflarestorage.com
+# Cloudflare R2 Object Storage (S3-compatible)
+R2_ACCOUNT_ID=your_cloudflare_account_id
+R2_ACCESS_KEY_ID=your_r2_access_key_id
+R2_SECRET_ACCESS_KEY=your_r2_secret_access_key
+R2_BUCKET_NAME=base-agent
+R2_REGION=auto
+# Optional CDN URL:
+# R2_PUBLIC_BASE_URL=https://files.yourdomain.com
 ```
 
 ### Running the Server
@@ -154,12 +199,13 @@ uv run python -m scripts.test_deepseek_stream_live
 - [x] LangGraph conversational agent with persistent PostgreSQL memory
 - [x] Real-time Server-Sent Events (SSE) streaming (`POST /api/v1/chat/stream`)
 - [x] DeepSeek integration (`deepseek-flash` & `deepseek-v4-pro`)
-- [x] Cloudflare R2 object storage service (`aioboto3`)
+- [x] Cloudflare R2 object storage service (`aioboto3` with SigV4)
+- [x] Cloudflare R2 object storage management APIs (`/api/v1/storage`: list, upload, presigned URLs, stats)
 - [x] Canonical document ingestion with Microsoft MarkItDown (`markitdown`)
 - [x] Structure-aware token chunking (`tiktoken` `cl100k_base`)
 - [x] PGVector HNSW + PostgreSQL FTS Hybrid Search with Reciprocal Rank Fusion (RRF)
 - [x] RAG Precision vs Recall presets (`high_precision`, `balanced`, `high_recall`)
-- [x] Document lifecycle endpoints (`POST /upload`, `GET /`, `DELETE /{id}`, `POST /search`)
+- [x] Knowledge Base management APIs (`/api/v1/documents`: upload, list, chunk inspection, re-indexing, download, stats)
 - [x] RAG-augmented LangGraph conversational agent with source citations (`use_rag=True`)
 - [ ] Clerk authentication middleware
 - [ ] ParadeDB `pg_search` BM25 extension migration (see `TODO.md`)

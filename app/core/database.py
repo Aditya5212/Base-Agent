@@ -62,6 +62,15 @@ async def check_db_connection() -> tuple[bool, str | None]:
         return False, str(exc)
 
 
+async def init_db() -> None:
+    """Creates database tables defined in SQLAlchemy models if not already present."""
+    from app.models.base import Base
+    import app.models  # noqa: F401 - Ensure all models are registered
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+
 async def close_db_connection() -> None:
     """Closes all pooled database connections gracefully."""
     logger.info("Disposing database engine connection pool...")
