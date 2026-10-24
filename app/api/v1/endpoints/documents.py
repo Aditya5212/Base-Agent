@@ -3,7 +3,7 @@
 import io
 import logging
 import uuid
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -29,6 +29,7 @@ from app.schemas.document import (
 )
 from app.schemas.storage import format_bytes
 from app.services.document_loader import convert_to_markdown, load_document
+from app.services.document_processor import process_document_pipeline
 from app.services.r2_storage import r2_storage_service
 from app.services.retriever import hybrid_search
 from app.services.text_splitter import split_markdown_document
@@ -84,17 +85,18 @@ async def get_knowledge_base_stats(
 @router.post(
     "/upload",
     response_model=DocumentUploadResponse,
-    status_code=status.HTTP_201_CREATED,
-    summary="Upload and index a document",
-    description="Uploads a document to Cloudflare R2, parses to Markdown via MarkItDown, chunks with tiktoken, and indexes into pgvector and FTS.",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Upload and index a document in background",
+    description="Uploads raw document to Cloudflare R2, records status as PARSING, and dispatches background processing (MarkItDown, tiktoken chunking, PGVector + FTS indexing).",
 )
 async def upload_document(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="Document file (PDF, DOCX, XLSX, HTML, TXT, MD)"),
     user_id: str = Form(default="default_user", description="Owner user ID"),
     preset: str = Form(default="balanced", description="Chunking preset (high_precision, balanced, high_recall)"),
     db: AsyncSession = Depends(get_db),
 ) -> DocumentUploadResponse:
-    """Processes document upload, object storage, conversion, and dual-index insertion."""
+    """Processes document upload, object storage, and queues background parsing & dual-indexing."""
     file_name = file.filename or "uploaded_file"
     content_type = file.content_type or "application/octet-stream"
 
@@ -142,59 +144,27 @@ async def upload_document(
     db.add(doc_record)
     await db.commit()
 
-    # Step 3: Parse to Markdown with MarkItDown and chunk with tiktoken
-    try:
-        raw_doc = load_document(
-            source=contents,
-            filename=file_name,
-            extra_metadata={
-                "document_id": str(doc_id),
-                "user_id": user_id,
-                "file_name": file_name,
-            },
-        )
+    # Step 3: Dispatch asynchronous pipeline to background task
+    background_tasks.add_task(
+        process_document_pipeline,
+        document_id=str(doc_id),
+        r2_key=r2_key,
+        user_id=user_id,
+        file_name=file_name,
+        preset=preset,
+        file_bytes=contents,
+        is_reindex=False,
+    )
 
-        rag_cfg = get_rag_config(preset)
-        chunks = split_markdown_document(raw_doc, config=rag_cfg)
-
-        # Step 4: Index chunks into PGVector and PostgreSQL FTS
-        chunk_ids = await index_documents(chunks)
-
-        # Step 5: Store chunk records in PostgreSQL for granular inspection
-        for idx, chunk in enumerate(chunks):
-            chunk_rec = DocumentChunk(
-                id=uuid.uuid4(),
-                document_id=doc_id,
-                chunk_index=idx,
-                content=chunk.page_content,
-                token_count=chunk.metadata.get("token_count", 0),
-                metadata_json=chunk.metadata,
-            )
-            db.add(chunk_rec)
-
-        # Update document status to INDEXED
-        doc_record.status = DocumentStatus.INDEXED
-        await db.commit()
-
-        return DocumentUploadResponse(
-            id=str(doc_id),
-            file_name=file_name,
-            file_size=file_size,
-            status=doc_record.status.value,
-            chunks_count=len(chunk_ids),
-            r2_key=r2_key,
-            message=f"Document '{file_name}' successfully parsed and indexed into {len(chunk_ids)} chunks.",
-        )
-
-    except Exception as exc:
-        logger.error("Document ingestion pipeline failed for %s: %s", doc_id, exc, exc_info=True)
-        doc_record.status = DocumentStatus.FAILED
-        doc_record.error_message = str(exc)
-        await db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Document parsing/indexing failed: {exc}",
-        )
+    return DocumentUploadResponse(
+        id=str(doc_id),
+        file_name=file_name,
+        file_size=file_size,
+        status=doc_record.status.value,
+        chunks_count=0,
+        r2_key=r2_key,
+        message=f"Document '{file_name}' uploaded successfully. Background ingestion and indexing pipeline started.",
+    )
 
 
 @router.get(
@@ -359,16 +329,18 @@ async def get_document_chunks(
 @router.post(
     "/{document_id}/reindex",
     response_model=ReindexDocumentResponse,
-    summary="Re-index an existing document",
-    description="Re-downloads the raw document from Cloudflare R2, purges old chunks, and re-chunks/re-indexes with the specified preset.",
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Re-index an existing document in background",
+    description="Dispatches background re-indexing: purges previous chunks and re-splits/re-indexes from Cloudflare R2.",
 )
 async def reindex_document(
     document_id: str,
     request: ReindexDocumentRequest,
+    background_tasks: BackgroundTasks,
     user_id: str = "default_user",
     db: AsyncSession = Depends(get_db),
 ) -> ReindexDocumentResponse:
-    """Re-chunks and re-indexes an existing document from its R2 stored raw content."""
+    """Re-chunks and re-indexes an existing document from its R2 stored raw content in the background."""
     try:
         parsed_id = uuid.UUID(document_id)
     except ValueError:
@@ -380,76 +352,34 @@ async def reindex_document(
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
 
-    # 1. Download raw file from Cloudflare R2
-    try:
-        raw_bytes = await r2_storage_service.download_file(doc.r2_key)
-    except Exception as exc:
-        logger.error("Failed to download '%s' from R2: %s", doc.r2_key, exc)
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve original document from storage: {exc}",
-        )
-
-    # 2. Count and purge previous chunks
     count_stmt = select(func.count(DocumentChunk.id)).where(DocumentChunk.document_id == parsed_id)
     prev_count = (await db.execute(count_stmt)).scalar_one_or_none() or 0
 
-    await delete_documents_by_metadata("document_id", str(doc.id))
-    del_stmt = delete(DocumentChunk).where(DocumentChunk.document_id == parsed_id)
-    await db.execute(del_stmt)
+    # Mark document as PARSING during re-indexing
+    doc.status = DocumentStatus.PARSING
+    doc.error_message = None
+    await db.commit()
 
-    # 3. Parse and chunk with new preset
-    try:
-        raw_doc = load_document(
-            source=raw_bytes,
-            filename=doc.file_name,
-            extra_metadata={
-                "document_id": str(doc.id),
-                "user_id": user_id,
-                "file_name": doc.file_name,
-            },
-        )
-        rag_cfg = get_rag_config(request.preset)
-        new_chunks = split_markdown_document(raw_doc, config=rag_cfg)
+    background_tasks.add_task(
+        process_document_pipeline,
+        document_id=str(doc.id),
+        r2_key=doc.r2_key,
+        user_id=user_id,
+        file_name=doc.file_name,
+        preset=request.preset,
+        file_bytes=None,
+        is_reindex=True,
+    )
 
-        # 4. Index into PGVector
-        await index_documents(new_chunks)
-
-        # 5. Insert new chunk records
-        for idx, c in enumerate(new_chunks):
-            db.add(
-                DocumentChunk(
-                    id=uuid.uuid4(),
-                    document_id=doc.id,
-                    chunk_index=idx,
-                    content=c.page_content,
-                    token_count=c.metadata.get("token_count", 0),
-                    metadata_json=c.metadata,
-                )
-            )
-
-        doc.status = DocumentStatus.INDEXED
-        doc.error_message = None
-        await db.commit()
-
-        return ReindexDocumentResponse(
-            document_id=str(doc.id),
-            file_name=doc.file_name,
-            previous_chunks=prev_count,
-            new_chunks=len(new_chunks),
-            preset=request.preset,
-            status=doc.status.value,
-            message=f"Document '{doc.file_name}' re-indexed successfully into {len(new_chunks)} chunks using '{request.preset}' preset.",
-        )
-    except Exception as exc:
-        logger.error("Re-indexing failed for %s: %s", doc.id, exc, exc_info=True)
-        doc.status = DocumentStatus.FAILED
-        doc.error_message = str(exc)
-        await db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Re-indexing failed: {exc}",
-        )
+    return ReindexDocumentResponse(
+        document_id=str(doc.id),
+        file_name=doc.file_name,
+        previous_chunks=prev_count,
+        new_chunks=0,
+        preset=request.preset,
+        status=doc.status.value,
+        message=f"Document '{doc.file_name}' re-indexing pipeline started in background using '{request.preset}' preset.",
+    )
 
 
 @router.get(

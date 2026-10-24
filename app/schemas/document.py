@@ -11,8 +11,8 @@ class DocumentUploadResponse(BaseModel):
     id: str = Field(..., description="Unique document UUID")
     file_name: str = Field(..., description="Original file name")
     file_size: int = Field(..., description="File size in bytes")
-    status: str = Field(..., description="Current lifecycle status (PENDING, INDEXED, FAILED)")
-    chunks_count: int = Field(..., description="Number of chunks extracted and indexed")
+    status: str = Field(..., description="Current lifecycle status (PENDING, PARSING, INDEXED, FAILED)")
+    chunks_count: int = Field(default=0, description="Number of chunks extracted and indexed (0 while processing in background)")
     r2_key: str = Field(..., description="Object key in Cloudflare R2")
     message: str = Field(..., description="Status summary message")
 
@@ -127,8 +127,8 @@ class ReindexDocumentResponse(BaseModel):
 
     document_id: str = Field(..., description="Document UUID")
     file_name: str = Field(..., description="Document file name")
-    previous_chunks: int = Field(..., description="Number of previous chunks before re-indexing")
-    new_chunks: int = Field(..., description="Number of new chunks indexed")
+    previous_chunks: int = Field(default=0, description="Number of previous chunks before re-indexing")
+    new_chunks: int = Field(default=0, description="Number of new chunks indexed (0 while processing in background)")
     preset: str = Field(..., description="Applied RAG preset profile")
     status: str = Field(..., description="Document status")
     message: str = Field(..., description="Status summary")

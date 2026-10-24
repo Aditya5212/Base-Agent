@@ -66,6 +66,7 @@ Base-Agent/
 │       ├── agent.py            # LangGraph agent topology (retrieve -> chat)
 │       ├── memory.py           # PostgreSQL checkpointer (AsyncPostgresSaver)
 │       ├── document_loader.py  # Canonical Microsoft MarkItDown parser
+│       ├── document_processor.py # Asynchronous RAG ingestion pipeline (BackgroundTasks / Taskiq)
 │       ├── text_splitter.py    # Structure-aware token chunking
 │       ├── vector_store.py     # PGVector HNSW vector store service
 │       ├── retriever.py        # Hybrid Search (Dense + FTS + RRF)
@@ -74,7 +75,7 @@ Base-Agent/
 │   ├── test_rag_live.py             # Live RAG ingestion and hybrid search verification
 │   ├── test_deepseek_live.py        # Live DeepSeek multi-turn chat test
 │   └── test_deepseek_stream_live.py # Live DeepSeek SSE streaming test
-└── tests/                           # Complete pytest suite (49 tests)
+└── tests/                           # Complete pytest suite (51 tests)
 ```
 
 ## 🔌 API Endpoints Summary

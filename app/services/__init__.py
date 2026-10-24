@@ -8,6 +8,7 @@ from app.services.memory import (
     get_thread_messages,
     setup_checkpointer,
 )
+from app.services.document_processor import process_document_pipeline
 from app.services.r2_storage import R2StorageService, r2_storage_service
 
 __all__ = [
@@ -21,4 +22,5 @@ __all__ = [
     "delete_thread_memory",
     "R2StorageService",
     "r2_storage_service",
+    "process_document_pipeline",
 ]

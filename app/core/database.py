@@ -29,6 +29,9 @@ AsyncSessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
     autoflush=False,
 )
 
+# Alias for generic factory naming conventions
+async_session_factory = AsyncSessionLocal
+
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     """Dependency that provides an async SQLAlchemy session.

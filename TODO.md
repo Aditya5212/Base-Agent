@@ -49,9 +49,25 @@ This document tracks planned architectural enhancements, future infrastructure u
 
 ## 📦 Storage & File Processing
 
-### 3. Asynchronous Background Ingestion Worker
-- Current ingestion processes upload, MarkItDown conversion, chunking, and embedding in the FastAPI request context.
-- Future: Offload large file parsing and embedding to a background task queue (e.g., Celery / ARQ / FastAPI `BackgroundTasks`) with status polling or WebSocket/SSE progress events.
+### 3. Asynchronous Background Ingestion Pipeline & Distributed Scaling
+- **Current State (FastAPI `BackgroundTasks`)**:
+  - Implemented via [`app/services/document_processor.py`](file:///c:/Users/Aditya/Desktop/Base-Agent/app/services/document_processor.py) (`process_document_pipeline`).
+  - Raw files are uploaded and committed to Cloudflare R2 immediately (<400ms HTTP response with `202 Accepted`).
+  - Heavy parsing (`markitdown`), structure-aware token chunking (`tiktoken`), embedding generation (OpenAI `text-embedding-3-small`), and dual-indexing (`PGVector` + PostgreSQL FTS) run asynchronously in the background via FastAPI `BackgroundTasks`.
+  - Zero new infrastructure required (no Redis or Celery cluster to manage), completely eliminating HTTP reverse proxy gateway timeouts and UI freezes.
+  - Document status updates automatically in PostgreSQL from `PARSING` -> `INDEXED` (or `FAILED` with diagnostics).
+- **Future Scaling Upgrade (Taskiq with PostgreSQL/Redis Backend)**:
+  - When deploying to production and scaling out to multiple stateless API server containers and dedicated background worker processes:
+  - Simply replace:
+    ```python
+    background_tasks.add_task(process_document_pipeline, ...)
+    ```
+    with:
+    ```python
+    await broker.kick(process_document_pipeline, ...)
+    ```
+    using **Taskiq** with a PostgreSQL or Redis broker backend.
+  - The core logic in `process_document_pipeline` remains **exactly the same**! It is already completely modular, runs pure async/await, and manages its own isolated database sessions (`async_session_factory`).
 
 ### 4. Advanced Multimodal Parsing
 - Enable MarkItDown's optional LLM-assisted image description / OCR pipeline for scanned PDFs or images containing complex diagrams.
