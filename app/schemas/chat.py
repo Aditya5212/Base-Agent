@@ -12,7 +12,11 @@ class ChatRequest(BaseModel):
         default_factory=lambda: str(uuid.uuid4()),
         description="Thread ID organizing conversation memory. Provide existing ID to continue conversation.",
     )
-    user_id: str = Field(default="default_user", description="Identifier of the user")
+    user_id: str = Field(default="root", description="Identifier of the user (defaults to 'root')")
+    images: list[str] = Field(
+        default_factory=list,
+        description="Optional image URLs, presigned URLs, base64 strings, or R2 keys for multimodal vision input",
+    )
     model: str | None = Field(
         default=None,
         description="Optional model override (e.g. 'DeepSeek-V4.1-Flash-1017' or 'DeepSeek-V4-Pro-0813')",
@@ -47,6 +51,48 @@ class ChatResponse(BaseModel):
         default=None,
         description="Retrieved document sources when RAG is enabled",
     )
+    thread_assets: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="Uploaded assets (images, documents) associated with this thread with fresh signed URLs",
+    )
+
+
+class ThreadAssetItem(BaseModel):
+    """Uploaded asset (image or document) associated with a conversation thread."""
+
+    id: str = Field(..., description="Unique asset UUID")
+    thread_id: str = Field(..., description="Associated thread ID")
+    asset_type: str = Field(..., description="Type of asset ('image' or 'document')")
+    file_name: str = Field(..., description="Original file name")
+    mime_type: str = Field(..., description="MIME content type")
+    file_size: int = Field(..., description="File size in bytes")
+    presigned_url: str | None = Field(default=None, description="Active presigned download/view URL")
+    created_at: str | None = Field(default=None, description="Creation timestamp")
+    metadata: dict[str, Any] = Field(default_factory=dict, description="Metadata dictionary")
+
+
+class ThreadAssetUploadResponse(BaseModel):
+    """Response returned upon uploading an asset to a thread."""
+
+    id: str = Field(..., description="Unique asset UUID")
+    thread_id: str = Field(..., description="Associated thread ID")
+    file_name: str = Field(..., description="Original file name")
+    asset_type: str = Field(..., description="Detected asset type ('image' or 'document')")
+    r2_key: str = Field(..., description="Cloudflare R2 storage key")
+    presigned_url: str = Field(..., description="Presigned URL for immediate client viewing/downloading")
+    message: str = Field(..., description="Status summary")
+
+
+class ThreadDetailsResponse(BaseModel):
+    """Detailed representation of a conversation thread including its uploaded assets."""
+
+    id: str = Field(..., description="Thread ID")
+    user_id: str = Field(..., description="Owner user ID")
+    title: str = Field(..., description="Conversation title")
+    metadata: dict[str, Any] = Field(default_factory=dict, description="Thread metadata dictionary")
+    is_pinned: bool = Field(default=False, description="Whether thread is pinned")
+    is_archived: bool = Field(default=False, description="Whether thread is archived")
+    assets: list[ThreadAssetItem] = Field(default_factory=list, description="Uploaded images and documents in this thread")
 
 
 class ThreadHistoryResponse(BaseModel):

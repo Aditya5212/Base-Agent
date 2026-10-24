@@ -24,8 +24,9 @@ from app.core.llm import DEFAULT_MODEL, get_llm
 from app.core.rag_config import RAGPreset, get_rag_config
 from app.schemas.chat import StreamEvent
 from app.services.memory import get_checkpointer
+from app.services.r2_storage import r2_storage_service
 from app.services.retriever import hybrid_search
-
+from app.services.thread_service import format_thread_assets_context, get_thread_assets_with_signed_urls
 
 logger = logging.getLogger(__name__)
 
@@ -36,30 +37,66 @@ DEFAULT_SYSTEM_PROMPT = (
 
 
 class AgentState(TypedDict, total=False):
-    """LangGraph agent state schema matching AGENTS.md."""
+    """LangGraph agent state schema matching AGENTS.md with thread asset context."""
 
     messages: Annotated[Sequence[BaseMessage], add_messages]
     user_id: str
     thread_id: str
     rag_context: str | None
     rag_sources: list[dict[str, Any]]
+    thread_assets: list[dict[str, Any]]
+    thread_assets_context: str | None
 
 
 async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
-    """Retrieves relevant document passages via hybrid search when RAG is enabled."""
+    """Retrieves relevant document passages via hybrid search and fetches uploaded thread assets."""
     configurable = config.get("configurable", {})
+    thread_id = state.get("thread_id") or configurable.get("thread_id")
+    user_id = state.get("user_id") or configurable.get("user_id", "root")
+
+    # 1. Fetch thread assets (uploaded images, documents) with signed URLs
+    thread_assets = []
+    thread_assets_context = ""
+    if thread_id:
+        try:
+            thread_assets = await get_thread_assets_with_signed_urls(thread_id)
+            thread_assets_context = format_thread_assets_context(thread_assets)
+        except Exception as exc:
+            logger.warning("Could not fetch thread assets for thread %s: %s", thread_id, exc)
+
     use_rag = configurable.get("use_rag", False)
     if not use_rag:
-        return {"rag_context": None, "rag_sources": []}
+        return {
+            "rag_context": None,
+            "rag_sources": [],
+            "thread_assets": thread_assets,
+            "thread_assets_context": thread_assets_context,
+        }
 
-    user_id = state.get("user_id") or configurable.get("user_id", "default_user")
     messages = state.get("messages", [])
-    last_human = next(
-        (m.content for m in reversed(messages) if isinstance(m, HumanMessage)),
+    last_human_msg = next(
+        (m for m in reversed(messages) if isinstance(m, HumanMessage)),
         None,
     )
-    if not last_human or not isinstance(last_human, str):
-        return {"rag_context": None, "rag_sources": []}
+    if not last_human_msg:
+        return {
+            "rag_context": None,
+            "rag_sources": [],
+            "thread_assets": thread_assets,
+            "thread_assets_context": thread_assets_context,
+        }
+
+    # Extract text from content (handling plain string or multimodal list of blocks)
+    if isinstance(last_human_msg.content, str):
+        query_text = last_human_msg.content
+    elif isinstance(last_human_msg.content, list):
+        query_text = " ".join(
+            item.get("text", "")
+            for item in last_human_msg.content
+            if isinstance(item, dict) and item.get("type") == "text"
+        )
+    else:
+        query_text = str(last_human_msg.content)
 
     preset = configurable.get("rag_preset") or RAGPreset.BALANCED
     rag_cfg = get_rag_config(preset)
@@ -67,16 +104,26 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
     try:
         # Search documents indexed under this user's user_id
         fused_docs = await hybrid_search(
-            query=last_human,
+            query=query_text,
             config=rag_cfg,
             filter_dict={"user_id": user_id},
         )
     except Exception as exc:
         logger.error("Error during RAG retrieval in retrieve_node: %s", exc, exc_info=True)
-        return {"rag_context": None, "rag_sources": []}
+        return {
+            "rag_context": None,
+            "rag_sources": [],
+            "thread_assets": thread_assets,
+            "thread_assets_context": thread_assets_context,
+        }
 
     if not fused_docs:
-        return {"rag_context": None, "rag_sources": []}
+        return {
+            "rag_context": None,
+            "rag_sources": [],
+            "thread_assets": thread_assets,
+            "thread_assets_context": thread_assets_context,
+        }
 
     context_blocks = []
     sources = []
@@ -97,33 +144,49 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
     return {
         "rag_context": formatted_context,
         "rag_sources": sources,
+        "thread_assets": thread_assets,
+        "thread_assets_context": thread_assets_context,
     }
 
 
 async def chat_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
-    """Chat node: receives message history and optional RAG context, invokes DeepSeek LLM."""
+    """Chat node: receives message history, thread assets, and RAG context, invokes DeepSeek LLM."""
     messages = list(state.get("messages", []))
     configurable = config.get("configurable", {})
     model_name = configurable.get("model") or settings.LLM_MODEL or DEFAULT_MODEL
     rag_context = state.get("rag_context")
+    thread_assets_context = state.get("thread_assets_context")
 
     llm = get_llm(model_name=model_name)
 
     if llm is None:
-        last_human = next(
-            (m.content for m in reversed(messages) if isinstance(m, HumanMessage)),
-            "Hello",
-        )
+        last_human = "Hello"
+        for m in reversed(messages):
+            if isinstance(m, HumanMessage):
+                if isinstance(m.content, str):
+                    last_human = m.content
+                elif isinstance(m.content, list):
+                    last_human = " ".join(
+                        item.get("text", "")
+                        for item in m.content
+                        if isinstance(item, dict) and item.get("type") == "text"
+                    )
+                break
+
         # Mock / development fallback when DEEPSEEK_API_KEY is not configured
         rag_note = f"\n[RAG Context Applied: {len(state.get('rag_sources', []))} sources]" if rag_context else ""
+        assets_note = f"\n[Thread Assets Active: {len(state.get('thread_assets', []))} assets]" if thread_assets_context else ""
         mock_response = (
             f"[Development Mode - No DEEPSEEK_API_KEY configured (Model: {model_name})]: "
-            f"I received your message: '{last_human}'.{rag_note} Conversation history has been saved to PostgreSQL."
+            f"I received your message: '{last_human}'.{rag_note}{assets_note} Conversation history has been saved to PostgreSQL."
         )
         return {"messages": [AIMessage(content=mock_response)]}
 
     # Prepend system prompt
     system_prompt = DEFAULT_SYSTEM_PROMPT
+    if thread_assets_context:
+        system_prompt += f"\n\n{thread_assets_context}"
+
     if rag_context:
         system_prompt += (
             "\n\n=== Retrieved Document Context ===\n"
@@ -138,10 +201,12 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]
         input_messages.append(SystemMessage(content=system_prompt))
     else:
         existing_sys = messages[0].content
-        if rag_context and "Retrieved Document Context" not in str(existing_sys):
-            input_messages.append(SystemMessage(content=f"{existing_sys}\n\n=== Retrieved Document Context ===\n{rag_context}\n==================================="))
-        else:
-            input_messages.append(messages[0])
+        combined_sys = str(existing_sys)
+        if thread_assets_context and "Uploaded Thread Assets" not in combined_sys:
+            combined_sys += f"\n\n{thread_assets_context}"
+        if rag_context and "Retrieved Document Context" not in combined_sys:
+            combined_sys += f"\n\n=== Retrieved Document Context ===\n{rag_context}\n==================================="
+        input_messages.append(SystemMessage(content=combined_sys))
 
     start_idx = 1 if messages and isinstance(messages[0], SystemMessage) else 0
     input_messages.extend(messages[start_idx:])
@@ -167,10 +232,29 @@ def get_agent_graph(checkpointer: BaseCheckpointSaver | None = None) -> Compiled
     return builder.compile(checkpointer=checkpointer)
 
 
+async def _build_human_message(message: str, images: list[str] | None = None) -> HumanMessage:
+    """Constructs a text or multimodal HumanMessage supporting vision input for DeepSeek."""
+    if not images:
+        return HumanMessage(content=message)
+
+    content: list[dict[str, Any]] = [{"type": "text", "text": message}]
+    for img in images:
+        url = img
+        if not img.startswith(("http://", "https://", "data:")):
+            try:
+                url = await r2_storage_service.generate_presigned_url(img)
+            except Exception:
+                url = r2_storage_service.get_public_url(img) or img
+        content.append({"type": "image_url", "image_url": {"url": url}})
+
+    return HumanMessage(content=content)
+
+
 async def execute_agent(
     message: str,
     thread_id: str,
-    user_id: str = "default_user",
+    user_id: str = "root",
+    images: list[str] | None = None,
     model: str | None = None,
     use_rag: bool = False,
     rag_preset: str | RAGPreset | None = None,
@@ -181,7 +265,8 @@ async def execute_agent(
     Args:
         message: The user's input text.
         thread_id: Unique thread identifier for conversation isolation.
-        user_id: Unique user identifier.
+        user_id: Unique user identifier (defaults to 'root').
+        images: Optional list of image URLs, presigned URLs, or R2 keys for multimodal vision input.
         model: Optional model override (e.g. DeepSeek-V4.1-Flash-1017 or DeepSeek-V4-Pro-0813).
         use_rag: Whether to execute hybrid retrieval across user documents.
         rag_preset: Preset tuning chunk size and fusion weights.
@@ -206,8 +291,10 @@ async def execute_agent(
         }
     }
 
+    human_msg = await _build_human_message(message=message, images=images)
+
     input_payload = {
-        "messages": [HumanMessage(content=message)],
+        "messages": [human_msg],
         "user_id": user_id,
         "thread_id": thread_id,
     }
@@ -219,7 +306,8 @@ async def execute_agent(
 async def stream_agent_events(
     message: str,
     thread_id: str,
-    user_id: str = "default_user",
+    user_id: str = "root",
+    images: list[str] | None = None,
     model: str | None = None,
     use_rag: bool = False,
     rag_preset: str | RAGPreset | None = None,
@@ -233,9 +321,7 @@ async def stream_agent_events(
     Args:
         message: The user's input text.
         thread_id: Unique thread identifier for conversation memory isolation.
-        user_id: Unique user identifier.
-        model: Optional model override (e.g. 'DeepSeek-V4.1-Flash-1017' or 'DeepSeek-V4-Pro-0813').
-        use_rag: Whether to execute hybrid retrieval across user documents.
+        user_id: Unique user identifier (defaults to 'root').
         rag_preset: Preset tuning chunk size and fusion weights.
         checkpointer: Optional checkpointer override (defaults to global AsyncPostgresSaver).
 
@@ -258,8 +344,10 @@ async def stream_agent_events(
         }
     }
 
+    human_msg = await _build_human_message(message=message, images=images)
+
     input_payload = {
-        "messages": [HumanMessage(content=message)],
+        "messages": [human_msg],
         "user_id": user_id,
         "thread_id": thread_id,
     }

@@ -66,12 +66,31 @@ async def check_db_connection() -> tuple[bool, str | None]:
 
 
 async def init_db() -> None:
-    """Creates database tables defined in SQLAlchemy models if not already present."""
+    """Creates database tables defined in SQLAlchemy models if not already present, and seeds the root user."""
     from app.models.base import Base
     import app.models  # noqa: F401 - Ensure all models are registered
+    from app.models.user import User
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    # Seed default root user for production readiness if not exists
+    try:
+        async with AsyncSessionLocal() as session:
+            root_user = await session.get(User, "root")
+            if not root_user:
+                root_user = User(
+                    id="root",
+                    email="root@baseagent.ai",
+                    name="Root Administrator",
+                    role="root",
+                    metadata_json={"description": "Default root user for Base Agent"},
+                )
+                session.add(root_user)
+                await session.commit()
+                logger.info("Default root user seeded in database.")
+    except Exception as exc:
+        logger.warning("Could not auto-seed root user (may already exist or DB not ready): %s", exc)
 
 
 async def close_db_connection() -> None:

@@ -1,20 +1,32 @@
-"""Chat endpoints with persistent PostgreSQL short-term memory."""
+"""Chat endpoints with persistent PostgreSQL short-term memory, multimodal image support, and thread assets."""
 
 import logging
-from fastapi import APIRouter, HTTPException, status
+import uuid
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import BaseMessage
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.database import get_db
 from app.schemas.chat import (
     ChatMessage,
     ChatRequest,
     ChatResponse,
     DeleteThreadResponse,
     StreamEvent,
+    ThreadAssetItem,
+    ThreadAssetUploadResponse,
+    ThreadDetailsResponse,
     ThreadHistoryResponse,
 )
 from app.services.agent import execute_agent, stream_agent_events
 from app.services.memory import delete_thread_memory, get_thread_messages
+from app.services.r2_storage import r2_storage_service
+from app.services.thread_service import (
+    add_thread_asset,
+    get_or_create_thread,
+    get_thread_assets_with_signed_urls,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -47,15 +59,22 @@ def _map_message_to_schema(msg: BaseMessage) -> ChatMessage:
     response_model=ChatResponse,
     status_code=status.HTTP_200_OK,
     summary="Send a message to the agent",
-    description="Invokes the agent with persistent short-term conversation memory backed by PostgreSQL.",
+    description="Invokes the agent with persistent conversation memory, multimodal images, and thread assets context.",
 )
-async def chat(request: ChatRequest) -> ChatResponse:
+async def chat(
+    request: ChatRequest,
+    db: AsyncSession = Depends(get_db),
+) -> ChatResponse:
     """Executes a conversation turn and returns the agent response with updated thread context."""
     try:
+        # Ensure thread entity exists in PostgreSQL
+        await get_or_create_thread(db, thread_id=request.thread_id, user_id=request.user_id)
+
         result, resolved_model = await execute_agent(
             message=request.message,
             thread_id=request.thread_id,
             user_id=request.user_id,
+            images=request.images,
             model=request.model,
             use_rag=request.use_rag,
             rag_preset=request.rag_preset,
@@ -78,6 +97,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
             model=resolved_model,
             history_length=len(messages),
             sources=result.get("rag_sources"),
+            thread_assets=result.get("thread_assets"),
         )
     except Exception as exc:
         logger.error("Chat turn failed for thread_id=%s: %s", request.thread_id, exc, exc_info=True)
@@ -92,11 +112,16 @@ async def chat(request: ChatRequest) -> ChatResponse:
     summary="Stream agent response via Server-Sent Events (SSE)",
     description=(
         "Streams real-time token and reasoning updates from LangGraph event streaming (v3) "
-        "with persistent PostgreSQL short-term memory."
+        "with persistent PostgreSQL short-term memory, multimodal image support, and thread assets."
     ),
 )
-async def chat_stream(request: ChatRequest) -> StreamingResponse:
+async def chat_stream(
+    request: ChatRequest,
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
     """Streams conversation turn tokens and completion metadata using Server-Sent Events (SSE)."""
+    # Ensure thread entity exists in PostgreSQL before streaming begins
+    await get_or_create_thread(db, thread_id=request.thread_id, user_id=request.user_id)
 
     async def sse_event_generator():
         try:
@@ -104,6 +129,7 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
                 message=request.message,
                 thread_id=request.thread_id,
                 user_id=request.user_id,
+                images=request.images,
                 model=request.model,
                 use_rag=request.use_rag,
                 rag_preset=request.rag_preset,
@@ -128,6 +154,106 @@ async def chat_stream(request: ChatRequest) -> StreamingResponse:
         },
     )
 
+
+@router.post(
+    "/{thread_id}/assets",
+    response_model=ThreadAssetUploadResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Upload an image or document to a conversation thread",
+    description="Uploads an asset to Cloudflare R2, associates it with the conversation thread, and returns a signed URL.",
+)
+async def upload_thread_asset(
+    thread_id: str,
+    file: UploadFile = File(..., description="Image or document attachment"),
+    user_id: str = Form(default="root", description="User ID associated with the thread"),
+    db: AsyncSession = Depends(get_db),
+) -> ThreadAssetUploadResponse:
+    """Uploads an image or document asset scoped directly to a conversation session."""
+    contents = await file.read()
+    if not contents:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty.")
+
+    file_name = file.filename or "attachment"
+    content_type = file.content_type or "application/octet-stream"
+    asset_id = uuid.uuid4()
+    r2_key = f"threads/{thread_id}/{asset_id}_{file_name}"
+
+    try:
+        await r2_storage_service.upload_file(
+            file_data=contents,
+            file_key=r2_key,
+            content_type=content_type,
+        )
+    except Exception as exc:
+        logger.error("Failed to upload thread asset to R2: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Storage upload failed: {exc}",
+        )
+
+    asset = await add_thread_asset(
+        db=db,
+        thread_id=thread_id,
+        user_id=user_id,
+        file_name=file_name,
+        r2_key=r2_key,
+        mime_type=content_type,
+        file_size=len(contents),
+    )
+
+    presigned_url = await r2_storage_service.generate_presigned_url(r2_key)
+
+    return ThreadAssetUploadResponse(
+        id=str(asset.id),
+        thread_id=thread_id,
+        file_name=file_name,
+        asset_type=asset.asset_type,
+        r2_key=r2_key,
+        presigned_url=presigned_url,
+        message=f"Asset '{file_name}' uploaded and bound to thread {thread_id}.",
+    )
+
+
+@router.get(
+    "/{thread_id}/assets",
+    response_model=list[ThreadAssetItem],
+    summary="List uploaded assets for a conversation thread",
+    description="Retrieves all uploaded images and documents attached to this thread with active presigned URLs.",
+)
+async def list_thread_assets(
+    thread_id: str,
+    db: AsyncSession = Depends(get_db),
+) -> list[ThreadAssetItem]:
+    """Returns all assets attached to the specified thread with active presigned URLs."""
+    raw_assets = await get_thread_assets_with_signed_urls(thread_id, db=db)
+    return [ThreadAssetItem(**a) for a in raw_assets]
+
+
+@router.get(
+    "/{thread_id}/details",
+    response_model=ThreadDetailsResponse,
+    summary="Get conversation thread details and metadata",
+    description="Returns thread metadata, title, and all active uploaded assets.",
+)
+async def get_thread_details(
+    thread_id: str,
+    user_id: str = "root",
+    db: AsyncSession = Depends(get_db),
+) -> ThreadDetailsResponse:
+    """Returns thread metadata, ownership, and current assets."""
+    thread = await get_or_create_thread(db, thread_id=thread_id, user_id=user_id)
+    raw_assets = await get_thread_assets_with_signed_urls(thread_id, db=db)
+    asset_items = [ThreadAssetItem(**a) for a in raw_assets]
+
+    return ThreadDetailsResponse(
+        id=thread.id,
+        user_id=thread.user_id,
+        title=thread.title,
+        metadata=thread.metadata_json or {},
+        is_pinned=thread.is_pinned,
+        is_archived=thread.is_archived,
+        assets=asset_items,
+    )
 
 
 @router.get(

@@ -56,6 +56,8 @@ Base-Agent/
 │   │           └── storage.py  # Object storage management (upload, presigned URLs, stats)
 │   ├── models/                 # SQLAlchemy ORM models
 │   │   ├── base.py             # Declarative base & timestamps
+│   │   ├── user.py             # User model (root user auto-seeded)
+│   │   ├── thread.py           # Thread & ThreadAsset persistence models
 │   │   └── document.py         # Document & DocumentChunk models
 │   ├── schemas/                # Pydantic request & response contracts
 │   │   ├── chat.py             # ChatRequest, ChatResponse, StreamEvent
@@ -65,6 +67,8 @@ Base-Agent/
 │   └── services/               # Core business logic
 │       ├── agent.py            # LangGraph agent topology (retrieve -> chat)
 │       ├── memory.py           # PostgreSQL checkpointer (AsyncPostgresSaver)
+│       ├── thread_service.py   # Thread metadata, root user, and asset management
+│       ├── tools.py            # LangChain agent tools (hybrid_document_search)
 │       ├── document_loader.py  # Canonical Microsoft MarkItDown parser
 │       ├── document_processor.py # Asynchronous RAG ingestion pipeline (BackgroundTasks / Taskiq)
 │       ├── text_splitter.py    # Structure-aware token chunking
@@ -75,21 +79,24 @@ Base-Agent/
 │   ├── test_rag_live.py             # Live RAG ingestion and hybrid search verification
 │   ├── test_deepseek_live.py        # Live DeepSeek multi-turn chat test
 │   └── test_deepseek_stream_live.py # Live DeepSeek SSE streaming test
-└── tests/                           # Complete pytest suite (51 tests)
+└── tests/                           # Complete pytest suite (54 tests)
 ```
 
 ## 🔌 API Endpoints Summary
 
 Interactive Swagger UI is available at `http://localhost:8000/docs`.
 
-### Conversational Agent & Core
+### Conversational Agent & Thread Management (`/api/v1/chat`)
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/` | Service root and health check link |
 | `GET` | `/api/v1/health` | Readiness probe (validates PostgreSQL connectivity) |
 | `GET` | `/api/v1/ping` | Liveness probe |
-| `POST` | `/api/v1/chat` | Multi-turn agent conversation turn (optional RAG) |
+| `POST` | `/api/v1/chat` | Multi-turn agent conversation turn (optional RAG, multimodal images) |
 | `POST` | `/api/v1/chat/stream` | Server-Sent Events (SSE) streaming (tokens + reasoning) |
+| `POST` | `/api/v1/chat/{thread_id}/assets` | Upload an image or document attachment to thread |
+| `GET` | `/api/v1/chat/{thread_id}/assets` | List uploaded images & documents in thread with signed URLs |
+| `GET` | `/api/v1/chat/{thread_id}/details` | Get thread metadata, ownership, and active assets |
 | `GET` | `/api/v1/chat/{thread_id}/history` | Retrieve stored conversation history |
 | `DELETE` | `/api/v1/chat/{thread_id}` | Clear PostgreSQL memory checkpoints for thread |
 
@@ -207,6 +214,11 @@ uv run python -m scripts.test_deepseek_stream_live
 - [x] PGVector HNSW + PostgreSQL FTS Hybrid Search with Reciprocal Rank Fusion (RRF)
 - [x] RAG Precision vs Recall presets (`high_precision`, `balanced`, `high_recall`)
 - [x] Knowledge Base management APIs (`/api/v1/documents`: upload, list, chunk inspection, re-indexing, download, stats)
+- [x] Asynchronous RAG document ingestion via FastAPI `BackgroundTasks` (with Taskiq migration roadmap in `TODO.md`)
+- [x] Multimodal conversational agent with image uploads & vision handling (`images` / `thread_assets`)
+- [x] LangChain hybrid search agent tool (`hybrid_document_search`)
+- [x] Thread asset tracking with signed URLs and dynamic prompt context injection
+- [x] Production DB tables (`users` with auto-seeded root user, `threads`, and `thread_assets`)
 - [x] RAG-augmented LangGraph conversational agent with source citations (`use_rag=True`)
 - [ ] Clerk authentication middleware
 - [ ] ParadeDB `pg_search` BM25 extension migration (see `TODO.md`)

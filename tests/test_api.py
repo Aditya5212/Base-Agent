@@ -135,3 +135,73 @@ def test_chat_stream_endpoint_error_handling():
         assert "event: error" in body
         assert "LLM connection timeout" in body
 
+
+def test_chat_endpoint_with_images():
+    mock_messages = [
+        HumanMessage(content="Describe this image"),
+        AIMessage(content="This is a diagram of the LangGraph architecture."),
+    ]
+    with patch("app.api.v1.endpoints.chat.execute_agent", new_callable=AsyncMock) as mock_exec:
+        mock_exec.return_value = (
+            {
+                "messages": mock_messages,
+                "thread_id": "test-img-thread",
+                "user_id": "root",
+                "thread_assets": [{"file_name": "diag.png", "presigned_url": "https://r2/diag.png"}],
+            },
+            "deepseek-flash",
+        )
+
+        payload = {
+            "message": "Describe this image",
+            "thread_id": "test-img-thread",
+            "user_id": "root",
+            "images": ["https://r2/diag.png"],
+        }
+        response = client.post("/api/v1/chat", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["thread_id"] == "test-img-thread"
+        assert "diagram of the LangGraph" in data["response"]
+        assert len(data["thread_assets"]) == 1
+        assert data["thread_assets"][0]["file_name"] == "diag.png"
+
+
+def test_upload_and_list_thread_assets():
+    with patch("app.api.v1.endpoints.chat.r2_storage_service.upload_file", new_callable=AsyncMock) as mock_upload, \
+         patch("app.api.v1.endpoints.chat.r2_storage_service.generate_presigned_url", new_callable=AsyncMock) as mock_url:
+        mock_upload.return_value = "threads/test-asset-t1/mock_image.png"
+        mock_url.return_value = "https://r2.storage/signed/mock_image.png"
+
+        files = {"file": ("mock_image.png", b"\x89PNG\r\n\x1a\nfakeimage", "image/png")}
+        response = client.post(
+            "/api/v1/chat/test-asset-t1/assets",
+            files=files,
+            data={"user_id": "root"},
+        )
+        assert response.status_code == 201
+        data = response.json()
+        assert data["thread_id"] == "test-asset-t1"
+        assert data["file_name"] == "mock_image.png"
+        assert data["asset_type"] == "image"
+        assert data["presigned_url"] == "https://r2.storage/signed/mock_image.png"
+
+        # List assets
+        list_res = client.get("/api/v1/chat/test-asset-t1/assets")
+        assert list_res.status_code == 200
+        assets = list_res.json()
+        assert len(assets) >= 1
+        assert assets[0]["file_name"] == "mock_image.png"
+
+
+import pytest
+from app.services.tools import hybrid_document_search
+
+
+@pytest.mark.asyncio
+async def test_hybrid_document_search_tool():
+    with patch("app.services.tools.hybrid_search", new_callable=AsyncMock) as mock_search:
+        mock_search.return_value = []
+        result = await hybrid_document_search.ainvoke({"query": "What is LangGraph?"})
+        assert "No relevant documents found" in result
+
