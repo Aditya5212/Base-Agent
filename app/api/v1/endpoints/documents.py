@@ -3,14 +3,16 @@
 import io
 import logging
 import uuid
-from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.auth import UserContext, get_current_user
 from app.core.database import get_db
 from app.core.rag_config import get_rag_config
+from app.core.rate_limit import limiter
 from app.models.document import Document, DocumentChunk, DocumentStatus
 from app.schemas.document import (
     DeleteDocumentResponse,
@@ -50,11 +52,13 @@ MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024
     description="Returns aggregated metrics for user's knowledge base including document counts, chunk counts, and storage usage.",
 )
 async def get_knowledge_base_stats(
-    user_id: str = "root",
+    user_id: str | None = None,
+    current_user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> KnowledgeBaseStatsResponse:
     """Calculates overall knowledge base metrics for the specified user."""
-    doc_stmt = select(Document).where(Document.user_id == user_id)
+    effective_user_id = user_id if (current_user.is_admin and user_id and user_id != "root") else current_user.user_id
+    doc_stmt = select(Document).where(Document.user_id == effective_user_id)
     doc_res = await db.execute(doc_stmt)
     docs = doc_res.scalars().all()
 
@@ -67,7 +71,7 @@ async def get_knowledge_base_stats(
     chunk_stmt = (
         select(func.count(DocumentChunk.id))
         .join(Document, Document.id == DocumentChunk.document_id)
-        .where(Document.user_id == user_id)
+        .where(Document.user_id == effective_user_id)
     )
     chunk_res = await db.execute(chunk_stmt)
     total_chunks = chunk_res.scalar_one_or_none() or 0
@@ -89,14 +93,18 @@ async def get_knowledge_base_stats(
     summary="Upload and index a document in background",
     description="Uploads raw document to Cloudflare R2, records status as PARSING, and dispatches background processing (MarkItDown, tiktoken chunking, PGVector + FTS indexing).",
 )
+@limiter.limit("10/minute")
 async def upload_document(
+    request: Request,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="Document file (PDF, DOCX, XLSX, HTML, TXT, MD)"),
-    user_id: str = Form(default="root", description="Owner user ID"),
+    user_id: str | None = Form(default=None, description="Owner user ID (admin only)"),
     preset: str = Form(default="balanced", description="Chunking preset (high_precision, balanced, high_recall)"),
+    current_user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> DocumentUploadResponse:
     """Processes document upload, object storage, and queues background parsing & dual-indexing."""
+    effective_user_id = user_id if (current_user.is_admin and user_id and user_id != "root") else current_user.user_id
     file_name = file.filename or "uploaded_file"
     content_type = file.content_type or "application/octet-stream"
 
@@ -115,7 +123,7 @@ async def upload_document(
         )
 
     doc_id = uuid.uuid4()
-    r2_key = f"documents/{user_id}/{doc_id}_{file_name}"
+    r2_key = f"documents/{effective_user_id}/{doc_id}_{file_name}"
 
     # Step 1: Upload raw file to Cloudflare R2
     try:
@@ -134,7 +142,7 @@ async def upload_document(
     # Step 2: Record document in PostgreSQL with PARSING status
     doc_record = Document(
         id=doc_id,
-        user_id=user_id,
+        user_id=effective_user_id,
         file_name=file_name,
         r2_key=r2_key,
         mime_type=content_type,
@@ -160,17 +168,37 @@ async def upload_document(
             detail="Failed to persist document metadata in database.",
         )
 
-    # Step 3: Dispatch asynchronous pipeline to background task
-    background_tasks.add_task(
-        process_document_pipeline,
-        document_id=str(doc_id),
-        r2_key=r2_key,
-        user_id=user_id,
-        file_name=file_name,
-        preset=preset,
-        file_bytes=contents,
-        is_reindex=False,
-    )
+    # Step 3: Dispatch asynchronous pipeline via Taskiq (with BackgroundTasks fallback)
+    dispatched = False
+    try:
+        from app.tasks.document_tasks import process_document_task
+        await process_document_task.kiq(
+            document_id=str(doc_id),
+            r2_key=r2_key,
+            user_id=effective_user_id,
+            file_name=file_name,
+            preset=preset,
+            is_reindex=False,
+        )
+        dispatched = True
+        logger.info("Dispatched document %s to Taskiq worker queue.", doc_id)
+    except Exception as tq_exc:
+        logger.debug(
+            "Taskiq task dispatch unavailable (%s); using in-process BackgroundTasks fallback.",
+            tq_exc,
+        )
+
+    if not dispatched:
+        background_tasks.add_task(
+            process_document_pipeline,
+            document_id=str(doc_id),
+            r2_key=r2_key,
+            user_id=effective_user_id,
+            file_name=file_name,
+            preset=preset,
+            file_bytes=contents,
+            is_reindex=False,
+        )
 
     return DocumentUploadResponse(
         id=str(doc_id),
@@ -190,16 +218,18 @@ async def upload_document(
     description="Retrieves documents uploaded by a user with status, search filter, and presigned download links.",
 )
 async def list_documents(
-    user_id: str = "root",
+    user_id: str | None = None,
     search: str | None = Query(default=None, description="Optional filename filter"),
     status_filter: str | None = Query(default=None, description="Filter by status (INDEXED, FAILED, PARSING)"),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
+    current_user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> DocumentListResponse:
     """Returns document records for a given user with optional search and status filters."""
+    effective_user_id = user_id if (current_user.is_admin and user_id and user_id != "root") else current_user.user_id
     # Build base filter predicate (reused for COUNT and paginated fetch)
-    base_stmt = select(Document).where(Document.user_id == user_id)
+    base_stmt = select(Document).where(Document.user_id == effective_user_id)
     if search:
         base_stmt = base_stmt.where(Document.file_name.ilike(f"%{search}%"))
     if status_filter:
@@ -244,24 +274,28 @@ async def list_documents(
 )
 async def get_document_details(
     document_id: str,
-    user_id: str = "root",
+    user_id: str | None = None,
+    current_user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> DocumentDetailResponse:
     """Fetches details for a single document."""
+    effective_user_id = user_id if (current_user.is_admin and user_id and user_id != "root") else current_user.user_id
     try:
         parsed_id = uuid.UUID(document_id)
     except ValueError:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid UUID format.")
 
-    stmt = (
-        select(Document)
-        .where(Document.id == parsed_id, Document.user_id == user_id)
-        .options(selectinload(Document.chunks))
-    )
+    stmt = select(Document).where(Document.id == parsed_id).options(selectinload(Document.chunks))
     result = await db.execute(stmt)
     doc = result.scalar_one_or_none()
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+
+    if doc.user_id != effective_user_id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: You do not have permission to view this document.",
+        )
 
     try:
         download_url = await r2_storage_service.generate_presigned_url(doc.r2_key)
@@ -292,22 +326,30 @@ async def get_document_details(
 )
 async def get_document_chunks(
     document_id: str,
-    user_id: str = "root",
+    user_id: str | None = None,
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
+    current_user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> DocumentChunksListResponse:
     """Lists granular chunks for inspection."""
+    effective_user_id = user_id if (current_user.is_admin and user_id and user_id != "root") else current_user.user_id
     try:
         parsed_id = uuid.UUID(document_id)
     except ValueError:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid UUID format.")
 
-    doc_stmt = select(Document).where(Document.id == parsed_id, Document.user_id == user_id)
+    doc_stmt = select(Document).where(Document.id == parsed_id)
     doc_res = await db.execute(doc_stmt)
     doc = doc_res.scalar_one_or_none()
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+
+    if doc.user_id != effective_user_id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: You do not have permission to inspect this document's chunks.",
+        )
 
     chunk_stmt = (
         select(DocumentChunk)
@@ -358,20 +400,28 @@ async def reindex_document(
     document_id: str,
     request: ReindexDocumentRequest,
     background_tasks: BackgroundTasks,
-    user_id: str = "root",
+    user_id: str | None = None,
+    current_user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> ReindexDocumentResponse:
     """Re-chunks and re-indexes an existing document from its R2 stored raw content in the background."""
+    effective_user_id = user_id if (current_user.is_admin and user_id and user_id != "root") else current_user.user_id
     try:
         parsed_id = uuid.UUID(document_id)
     except ValueError:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid UUID format.")
 
-    stmt = select(Document).where(Document.id == parsed_id, Document.user_id == user_id)
+    stmt = select(Document).where(Document.id == parsed_id)
     res = await db.execute(stmt)
     doc = res.scalar_one_or_none()
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+
+    if doc.user_id != effective_user_id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: You do not have permission to re-index this document.",
+        )
 
     count_stmt = select(func.count(DocumentChunk.id)).where(DocumentChunk.document_id == parsed_id)
     prev_count = (await db.execute(count_stmt)).scalar_one_or_none() or 0
@@ -381,16 +431,37 @@ async def reindex_document(
     doc.error_message = None
     await db.commit()
 
-    background_tasks.add_task(
-        process_document_pipeline,
-        document_id=str(doc.id),
-        r2_key=doc.r2_key,
-        user_id=user_id,
-        file_name=doc.file_name,
-        preset=request.preset,
-        file_bytes=None,
-        is_reindex=True,
-    )
+    # Dispatch asynchronous re-indexing pipeline via Taskiq (with BackgroundTasks fallback)
+    dispatched = False
+    try:
+        from app.tasks.document_tasks import process_document_task
+        await process_document_task.kiq(
+            document_id=str(doc.id),
+            r2_key=doc.r2_key,
+            user_id=doc.user_id,
+            file_name=doc.file_name,
+            preset=request.preset,
+            is_reindex=True,
+        )
+        dispatched = True
+        logger.info("Dispatched document %s re-indexing to Taskiq worker queue.", doc.id)
+    except Exception as tq_exc:
+        logger.debug(
+            "Taskiq task dispatch unavailable (%s); using in-process BackgroundTasks fallback.",
+            tq_exc,
+        )
+
+    if not dispatched:
+        background_tasks.add_task(
+            process_document_pipeline,
+            document_id=str(doc.id),
+            r2_key=doc.r2_key,
+            user_id=doc.user_id,
+            file_name=doc.file_name,
+            preset=request.preset,
+            file_bytes=None,
+            is_reindex=True,
+        )
 
     return ReindexDocumentResponse(
         document_id=str(doc.id),
@@ -410,11 +481,13 @@ async def reindex_document(
 )
 async def download_document(
     document_id: str,
-    user_id: str = "root",
+    user_id: str | None = None,
     inline: bool = Query(default=False, description="Display inline in browser if true, otherwise trigger download"),
+    current_user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
     """Streams the raw original document file directly from Cloudflare R2."""
+    effective_user_id = user_id if (current_user.is_admin and user_id and user_id != "root") else current_user.user_id
     try:
         parsed_id = uuid.UUID(document_id)
     except ValueError:
@@ -426,7 +499,7 @@ async def download_document(
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
 
-    if doc.user_id != user_id and user_id != "root":
+    if doc.user_id != effective_user_id and not current_user.is_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied: You do not have permission to view or download this document.",
@@ -462,17 +535,12 @@ async def download_document(
 )
 async def delete_document(
     document_id: str,
-    user_id: str = "root",
+    user_id: str | None = None,
+    current_user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> DeleteDocumentResponse:
-    """Cascade deletes document from storage and database.
-
-    Deletion order (atomic-safe):
-      1. Purge vector-store chunks (reversible via re-index).
-      2. Purge LightRAG knowledge-graph entries (best-effort, logged).
-      3. Delete raw file from Cloudflare R2 — raises 500 on failure to prevent orphan rows.
-      4. Delete database record inside the same transaction (cascades to document_chunks).
-    """
+    """Cascade deletes document from storage and database."""
+    effective_user_id = user_id if (current_user.is_admin and user_id and user_id != "root") else current_user.user_id
     try:
         parsed_id = uuid.UUID(document_id)
     except ValueError:
@@ -485,7 +553,7 @@ async def delete_document(
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
 
-    if doc.user_id != user_id and user_id != "root":
+    if doc.user_id != effective_user_id and not current_user.is_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied: You do not have permission to delete this document.",
@@ -541,21 +609,25 @@ async def delete_document(
     summary="Hybrid RAG Search with Reciprocal Rank Fusion",
     description="Executes hybrid search across pgvector (dense) and PostgreSQL FTS (sparse), fused via RRF.",
 )
+@limiter.limit("60/minute")
 async def search_documents(
-    request: RAGSearchRequest,
+    request: Request,
+    search_request: RAGSearchRequest,
+    current_user: UserContext = Depends(get_current_user),
 ) -> RAGSearchResponse:
     """Performs hybrid retrieval combining semantic and exact-match search."""
+    effective_user_id = search_request.user_id if (current_user.is_admin and search_request.user_id and search_request.user_id != "root") else current_user.user_id
     rag_cfg = get_rag_config(
-        preset=request.preset,
-        top_k_final=request.top_k or 5,
+        preset=search_request.preset,
+        top_k_final=search_request.top_k or 5,
     )
 
     filter_dict = {}
-    if request.user_id:
-        filter_dict["user_id"] = request.user_id
+    if effective_user_id:
+        filter_dict["user_id"] = effective_user_id
 
     fused_docs = await hybrid_search(
-        query=request.query,
+        query=search_request.query,
         config=rag_cfg,
         filter_dict=filter_dict if filter_dict else None,
     )
@@ -575,7 +647,7 @@ async def search_documents(
         )
 
     return RAGSearchResponse(
-        query=request.query,
+        query=search_request.query,
         preset=rag_cfg.preset.value,
         total_results=len(results),
         results=results,

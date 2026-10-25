@@ -1,6 +1,6 @@
 # Base Agent — Future Enhancements & TODO
 
-This document tracks planned architectural enhancements, future infrastructure upgrades, and optimizations for Base Agent.
+This document tracks planned architectural enhancements, future infrastructure upgrades, and optimizations for Base Agent across upcoming development phases.
 
 ---
 
@@ -25,7 +25,6 @@ This document tracks planned architectural enhancements, future infrastructure u
   ```
 - **Query Pattern in Python / SQLAlchemy**:
   ```python
-  # Swap FTS @@ query for ParadeDB's @@@ BM25 operator
   stmt = (
       select(DocumentChunk)
       .where(text("document_chunks @@@ :query"))
@@ -33,9 +32,6 @@ This document tracks planned architectural enhancements, future infrastructure u
       .limit(10)
   )
   ```
-- **Tradeoffs**:
-  - *Pros*: True BM25 term saturation and length normalization scoring curve natively in Postgres.
-  - *Cons*: Additional extension dependency to manage instead of standard ANSI SQL `tsvector`.
 
 ---
 
@@ -47,39 +43,35 @@ This document tracks planned architectural enhancements, future infrastructure u
 
 ---
 
-## 📦 Storage & File Processing
-
-### 3. Asynchronous Background Ingestion Pipeline & Distributed Scaling
-- **Current State (FastAPI `BackgroundTasks`)**:
-  - Implemented via [`app/services/document_processor.py`](file:///c:/Users/Aditya/Desktop/Base-Agent/app/services/document_processor.py) (`process_document_pipeline`).
-  - Raw files are uploaded and committed to Cloudflare R2 immediately (<400ms HTTP response with `202 Accepted`).
-  - Heavy parsing (`markitdown`), structure-aware token chunking (`tiktoken`), embedding generation (OpenAI `text-embedding-3-small`), and dual-indexing (`PGVector` + PostgreSQL FTS) run asynchronously in the background via FastAPI `BackgroundTasks`.
-  - Zero new infrastructure required (no Redis or Celery cluster to manage), completely eliminating HTTP reverse proxy gateway timeouts and UI freezes.
-  - Document status updates automatically in PostgreSQL from `PARSING` -> `INDEXED` (or `FAILED` with diagnostics).
-- **Future Scaling Upgrade (Taskiq with PostgreSQL/Redis Backend)**:
-  - When deploying to production and scaling out to multiple stateless API server containers and dedicated background worker processes:
-  - Simply replace:
-    ```python
-    background_tasks.add_task(process_document_pipeline, ...)
-    ```
-    with:
-    ```python
-    await broker.kick(process_document_pipeline, ...)
-    ```
-    using **Taskiq** with a PostgreSQL or Redis broker backend.
-  - The core logic in `process_document_pipeline` remains **exactly the same**! It is already completely modular, runs pure async/await, and manages its own isolated database sessions (`async_session_factory`).
-
-### 4. Advanced Multimodal Parsing
+### 3. Advanced Multimodal Parsing
 - Enable MarkItDown's optional LLM-assisted image description / OCR pipeline for scanned PDFs or images containing complex diagrams.
 
 ---
 
-## 🔐 Auth & Platform Features (Phase 2 Roadmap)
+## 📊 Observability & Monitoring (Phase 7 Roadmap)
 
-### 5. Clerk Authentication Middleware
-- Integrate Clerk JWT verification on protected endpoints (`/api/v1/chat`, `/api/v1/documents`).
-- Multi-tenant isolation at the database row level (`user_id` / `org_id`).
+### 4. LangSmith Tracing & Evaluators
+- Fine-grained run tracing for LangGraph nodes (`retrieve_node`, `chat_node`).
+- Token cost tracking, latency attribution, and automated LLM output evaluation datasets.
 
-### 6. Dynamic Agent Builder Platform
+### 5. OpenTelemetry & Prometheus Metrics
+- Standard OTel ASGI middleware exposing metrics (`/metrics`) for Prometheus scraping.
+- Histograms for LLM generation latency, retrieval timing, and embedding batch durations.
+
+### 6. Structured JSON Logging with Trace Correlation IDs
+- Standardized logging format with request trace IDs linking FastAPI HTTP requests, Taskiq background jobs, and LangGraph checkpoints.
+
+### 7. Sentry Error Tracking
+- Production exception tracking with unhandled error alerting and stack trace capture.
+
+---
+
+## 🔐 Auth & Platform Features (Upcoming Phases)
+
+### 8. Production Clerk / OIDC Authentication (Phase 1)
+- Swap the header-based mock implementation in `app/core/auth.py` (`get_current_user`) for Clerk SDK JWT validation.
+- All downstream route signatures (`UserContext = Depends(get_current_user)`) remain 100% stable with zero endpoint refactoring required.
+
+### 9. Dynamic Agent Builder Platform (Phase 2)
 - Dynamic graph topology compilation from user-submitted JSON / Pydantic specs.
 - Pluggable node registry: `ChatNode`, `RAGRetrieverNode`, `ToolExecutorNode`, `HumanApprovalNode`.

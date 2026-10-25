@@ -2,11 +2,13 @@
 
 import logging
 import uuid
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
 from langchain_core.messages import BaseMessage
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.auth import UserContext, get_current_user
+from app.core.rate_limit import limiter
 from app.core.database import get_db
 from app.schemas.chat import (
     ChatMessage,
@@ -26,6 +28,7 @@ from app.services.thread_service import (
     add_thread_asset,
     get_or_create_thread,
     get_thread_assets_with_signed_urls,
+    verify_thread_ownership,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,23 +67,33 @@ def _map_message_to_schema(msg: BaseMessage) -> ChatMessage:
     summary="Send a message to the agent",
     description="Invokes the agent with persistent conversation memory, multimodal images, and thread assets context.",
 )
+@limiter.limit("30/minute")
 async def chat(
-    request: ChatRequest,
+    request: Request,
+    chat_request: ChatRequest,
+    current_user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> ChatResponse:
     """Executes a conversation turn and returns the agent response with updated thread context."""
+    # Enforce authenticated tenant isolation (admin can override user_id if explicitly specified)
+    effective_user_id = chat_request.user_id if (current_user.is_admin and chat_request.user_id != "root") else current_user.user_id
     try:
-        # Ensure thread entity exists in PostgreSQL
-        await get_or_create_thread(db, thread_id=request.thread_id, user_id=request.user_id)
+        # Ensure thread entity exists in PostgreSQL and user has access
+        await get_or_create_thread(
+            db,
+            thread_id=chat_request.thread_id,
+            user_id=effective_user_id,
+            is_admin=current_user.is_admin,
+        )
 
         result, resolved_model = await execute_agent(
-            message=request.message,
-            thread_id=request.thread_id,
-            user_id=request.user_id,
-            images=request.images,
-            model=request.model,
-            use_rag=request.use_rag,
-            rag_preset=request.rag_preset,
+            message=chat_request.message,
+            thread_id=chat_request.thread_id,
+            user_id=effective_user_id,
+            images=chat_request.images,
+            model=chat_request.model,
+            use_rag=chat_request.use_rag,
+            rag_preset=chat_request.rag_preset,
         )
 
         messages = result.get("messages", [])
@@ -94,8 +107,8 @@ async def chat(
         response_text = getattr(last_message, "text", None) or str(last_message.content)
 
         return ChatResponse(
-            thread_id=request.thread_id,
-            user_id=request.user_id,
+            thread_id=chat_request.thread_id,
+            user_id=effective_user_id,
             response=response_text,
             model=resolved_model,
             history_length=len(messages),
@@ -103,13 +116,13 @@ async def chat(
             thread_assets=result.get("thread_assets"),
         )
     except ValueError as val_err:
-        logger.warning("Invalid chat request parameters for thread_id=%s: %s", request.thread_id, val_err)
+        logger.warning("Invalid chat request parameters for thread_id=%s: %s", chat_request.thread_id, val_err)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(val_err),
         )
     except Exception as exc:
-        logger.error("Chat turn failed for thread_id=%s: %s", request.thread_id, exc, exc_info=True)
+        logger.error("Chat turn failed for thread_id=%s: %s", chat_request.thread_id, exc, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Chat execution failed. Please try again.",
@@ -124,30 +137,40 @@ async def chat(
         "with persistent PostgreSQL short-term memory, multimodal image support, and thread assets."
     ),
 )
+@limiter.limit("20/minute")
 async def chat_stream(
-    request: ChatRequest,
+    request: Request,
+    chat_request: ChatRequest,
+    current_user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> StreamingResponse:
     """Streams conversation turn tokens and completion metadata using Server-Sent Events (SSE)."""
+    # Enforce authenticated tenant isolation
+    effective_user_id = chat_request.user_id if (current_user.is_admin and chat_request.user_id != "root") else current_user.user_id
     # Ensure thread entity exists in PostgreSQL before streaming begins
-    await get_or_create_thread(db, thread_id=request.thread_id, user_id=request.user_id)
+    await get_or_create_thread(
+        db,
+        thread_id=chat_request.thread_id,
+        user_id=effective_user_id,
+        is_admin=current_user.is_admin,
+    )
 
     async def sse_event_generator():
         try:
             async for event in stream_agent_events(
-                message=request.message,
-                thread_id=request.thread_id,
-                user_id=request.user_id,
-                images=request.images,
-                model=request.model,
-                use_rag=request.use_rag,
-                rag_preset=request.rag_preset,
+                message=chat_request.message,
+                thread_id=chat_request.thread_id,
+                user_id=effective_user_id,
+                images=chat_request.images,
+                model=chat_request.model,
+                use_rag=chat_request.use_rag,
+                rag_preset=chat_request.rag_preset,
             ):
                 yield event.to_sse()
         except Exception as exc:
             logger.error(
                 "Streaming endpoint error for thread_id=%s: %s",
-                request.thread_id,
+                chat_request.thread_id,
                 exc,
                 exc_info=True,
             )
@@ -171,13 +194,25 @@ async def chat_stream(
     summary="Upload an image or document to a conversation thread",
     description="Uploads an asset to Cloudflare R2, associates it with the conversation thread, and returns a signed URL.",
 )
+@limiter.limit("20/minute")
 async def upload_thread_asset(
+    request: Request,
     thread_id: str,
     file: UploadFile = File(..., description="Image or document attachment"),
     user_id: str = Form(default="root", description="User ID associated with the thread"),
+    current_user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> ThreadAssetUploadResponse:
     """Uploads an image or document asset scoped directly to a conversation session."""
+    effective_user_id = user_id if (current_user.is_admin and user_id != "root") else current_user.user_id
+    # Verify thread ownership
+    await verify_thread_ownership(
+        db,
+        thread_id=thread_id,
+        user_id=effective_user_id,
+        is_admin=current_user.is_admin,
+        allow_missing=True,
+    )
     # Stream the upload in chunks and enforce size limit before sending to R2,
     # avoiding reading an arbitrarily large file into memory all at once.
     chunks: list[bytes] = []
@@ -221,7 +256,7 @@ async def upload_thread_asset(
     asset = await add_thread_asset(
         db=db,
         thread_id=thread_id,
-        user_id=user_id,
+        user_id=effective_user_id,
         file_name=file_name,
         r2_key=r2_key,
         mime_type=content_type,
@@ -249,9 +284,17 @@ async def upload_thread_asset(
 )
 async def list_thread_assets(
     thread_id: str,
+    current_user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> list[ThreadAssetItem]:
     """Returns all assets attached to the specified thread with active presigned URLs."""
+    await verify_thread_ownership(
+        db,
+        thread_id=thread_id,
+        user_id=current_user.user_id,
+        is_admin=current_user.is_admin,
+        allow_missing=True,
+    )
     raw_assets = await get_thread_assets_with_signed_urls(thread_id, db=db)
     return [ThreadAssetItem(**a) for a in raw_assets]
 
@@ -265,10 +308,17 @@ async def list_thread_assets(
 async def get_thread_details(
     thread_id: str,
     user_id: str = "root",
+    current_user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> ThreadDetailsResponse:
     """Returns thread metadata, ownership, and current assets."""
-    thread = await get_or_create_thread(db, thread_id=thread_id, user_id=user_id)
+    effective_user_id = user_id if (current_user.is_admin and user_id != "root") else current_user.user_id
+    thread = await get_or_create_thread(
+        db,
+        thread_id=thread_id,
+        user_id=effective_user_id,
+        is_admin=current_user.is_admin,
+    )
     raw_assets = await get_thread_assets_with_signed_urls(thread_id, db=db)
     asset_items = [ThreadAssetItem(**a) for a in raw_assets]
 
@@ -289,8 +339,19 @@ async def get_thread_details(
     summary="Retrieve thread conversation history",
     description="Fetches all stored short-term memory messages for a given thread from PostgreSQL.",
 )
-async def get_history(thread_id: str) -> ThreadHistoryResponse:
+async def get_history(
+    thread_id: str,
+    current_user: UserContext = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> ThreadHistoryResponse:
     """Returns the full chronological message history stored in PostgreSQL for the thread."""
+    await verify_thread_ownership(
+        db,
+        thread_id=thread_id,
+        user_id=current_user.user_id,
+        is_admin=current_user.is_admin,
+        allow_missing=True,
+    )
     try:
         raw_messages = await get_thread_messages(thread_id)
         chat_messages = [_map_message_to_schema(m) for m in raw_messages]
@@ -314,8 +375,19 @@ async def get_history(thread_id: str) -> ThreadHistoryResponse:
     summary="Clear thread memory",
     description="Deletes all persisted checkpoint memory records for a given thread from PostgreSQL.",
 )
-async def clear_memory(thread_id: str) -> DeleteThreadResponse:
+async def clear_memory(
+    thread_id: str,
+    current_user: UserContext = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> DeleteThreadResponse:
     """Removes all checkpoint data for the specified thread."""
+    await verify_thread_ownership(
+        db,
+        thread_id=thread_id,
+        user_id=current_user.user_id,
+        is_admin=current_user.is_admin,
+        allow_missing=True,
+    )
     success = await delete_thread_memory(thread_id)
     if not success:
         raise HTTPException(

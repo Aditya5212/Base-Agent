@@ -9,9 +9,10 @@ import logging
 import re
 import uuid
 from typing import Annotated
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import StreamingResponse
 
+from app.core.auth import UserContext, require_admin
 from app.schemas.storage import (
     PresignedUrlRequest,
     PresignedUrlResponse,
@@ -33,8 +34,16 @@ router = APIRouter(prefix="/storage", tags=["Object Storage Management (R2 / S3)
 MAX_STORAGE_UPLOAD_SIZE = 50 * 1024 * 1024
 
 
-def verify_admin_access(user_id: str = "root") -> None:
+def verify_admin_access(user_id: str = "root", current_user: UserContext | None = None) -> None:
     """Restricts raw bucket storage operations to root administrator users."""
+    if current_user is not None and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Access denied: Raw storage bucket operations are restricted to root administrator. "
+                "Regular users must upload and manage assets via /api/v1/documents or /api/v1/chat/{thread_id}/assets."
+            ),
+        )
     if user_id != "root":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -84,9 +93,10 @@ def sanitize_filename(filename: str) -> str:
 async def get_storage_stats(
     prefix: str = Query(default="", description="Optional prefix to filter storage calculations"),
     user_id: str = Query(default="root", description="Admin user identifier"),
+    admin_user: UserContext = Depends(require_admin),
 ) -> StorageStatsResponse:
     """Calculates and returns aggregated storage metrics from Cloudflare R2."""
-    verify_admin_access(user_id)
+    verify_admin_access(user_id, admin_user)
     clean_prefix = sanitize_and_validate_key(prefix) if prefix else ""
     try:
         raw_stats = await r2_storage_service.get_storage_stats(prefix=clean_prefix)
@@ -118,9 +128,10 @@ async def list_storage_objects(
     user_id: str = Query(default="root", description="Admin user identifier"),
     max_keys: int = Query(default=100, ge=1, le=1000, description="Maximum number of items per page"),
     continuation_token: str | None = Query(default=None, description="Token for fetching next page of results"),
+    admin_user: UserContext = Depends(require_admin),
 ) -> StorageObjectListResponse:
     """Lists objects in the Cloudflare R2 bucket for admin inspection."""
-    verify_admin_access(user_id)
+    verify_admin_access(user_id, admin_user)
     clean_prefix = sanitize_and_validate_key(prefix) if prefix else ""
     try:
         data = await r2_storage_service.list_objects(
@@ -168,9 +179,10 @@ async def upload_storage_object(
     file: UploadFile = File(..., description="File payload to upload"),
     prefix: str = Form(default="uploads", description="Folder/prefix in bucket (e.g. 'uploads', 'assets')"),
     user_id: str = Form(default="root", description="Admin user identifier"),
+    admin_user: UserContext = Depends(require_admin),
 ) -> StorageUploadResponse:
     """Uploads a file directly to Cloudflare R2 under the administrator namespace."""
-    verify_admin_access(user_id)
+    verify_admin_access(user_id, admin_user)
 
     contents = await file.read()
     file_size = len(contents)
@@ -228,9 +240,10 @@ async def upload_storage_object(
 async def get_storage_object_metadata(
     file_key: str,
     user_id: str = Query(default="root", description="Admin user identifier"),
+    admin_user: UserContext = Depends(require_admin),
 ) -> StorageObjectDetailsResponse:
     """Fetches metadata for an object in Cloudflare R2."""
-    verify_admin_access(user_id)
+    verify_admin_access(user_id, admin_user)
     clean_key = sanitize_and_validate_key(file_key)
     try:
         meta = await r2_storage_service.get_object_metadata(clean_key)
@@ -263,9 +276,10 @@ async def download_storage_object(
     file_key: str,
     user_id: str = Query(default="root", description="Admin user identifier"),
     inline: bool = Query(default=False, description="Preview inline in browser instead of attachment download"),
+    admin_user: UserContext = Depends(require_admin),
 ):
     """Streams the stored file directly to the admin client."""
-    verify_admin_access(user_id)
+    verify_admin_access(user_id, admin_user)
     clean_key = sanitize_and_validate_key(file_key)
     try:
         data = await r2_storage_service.download_file(clean_key)
@@ -303,9 +317,10 @@ async def download_storage_object(
 async def delete_storage_object(
     file_key: str,
     user_id: str = Query(default="root", description="Admin user identifier"),
+    admin_user: UserContext = Depends(require_admin),
 ) -> StorageDeleteResponse:
     """Deletes an object from Cloudflare R2."""
-    verify_admin_access(user_id)
+    verify_admin_access(user_id, admin_user)
     clean_key = sanitize_and_validate_key(file_key)
     try:
         deleted = await r2_storage_service.delete_file(clean_key)
@@ -331,9 +346,10 @@ async def delete_storage_object(
 async def create_presigned_url(
     request: PresignedUrlRequest,
     user_id: str = Query(default="root", description="Admin user identifier"),
+    admin_user: UserContext = Depends(require_admin),
 ) -> PresignedUrlResponse:
     """Generates direct presigned S3/R2 URLs for admin operations."""
-    verify_admin_access(user_id)
+    verify_admin_access(user_id, admin_user)
     clean_key = sanitize_and_validate_key(request.file_key)
     try:
         if request.operation == "put_object":

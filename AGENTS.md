@@ -15,17 +15,30 @@ Base-Agent/
 ├── .python-version             # Python version pin (3.12)
 ├── .env.example                # Documented environment variables template
 ├── .env                        # Local secret configurations (git-ignored)
+├── Dockerfile                  # Production multi-stage Docker build
+├── docker-compose.yml          # Multi-container orchestration (api + taskiq worker)
+├── docker-compose.override.yml # Local development overrides (hot-reloading & mounts)
+├── .dockerignore               # Docker build exclusions
+├── alembic.ini                 # Alembic migration configuration
 ├── README.md                   # Project overview, getting started, roadmap
 ├── AGENTS.md                   # System architecture and agent design specifications
-├── TODO.md                     # Roadmap enhancements (ParadeDB BM25 migration)
+├── TODO.md                     # Roadmap enhancements & observability items
+├── Vision_and_Roadmap.md       # Long-term vision and phased milestone specification
 ├── main.py                     # Root development runner (python main.py / uvicorn)
+├── alembic/                    # Alembic async migration environment
+│   ├── env.py                  # Async migration runner with psycopg3 & model inclusion filters
+│   ├── script.py.mako          # Migration template with pgvector support
+│   └── versions/               # Versioned migration revision scripts
 ├── app/
 │   ├── __init__.py             # Package init & WindowsSelectorEventLoopPolicy setup
-│   ├── main.py                 # FastAPI application factory, lifespan, CORS & root route
+│   ├── main.py                 # FastAPI application factory, lifespan, CORS, rate limiting & root route
 │   ├── core/                   # Infrastructure & singleton configurations
 │   │   ├── __init__.py         # Core exports
 │   │   ├── config.py           # Pydantic-settings & postgres environment sync
-│   │   ├── database.py         # Async SQLAlchemy engine & session dependency
+│   │   ├── database.py         # Async SQLAlchemy engine, session dependency & programmatic migrations
+│   │   ├── auth.py             # Swappable UserContext, get_current_user & require_admin
+│   │   ├── rate_limit.py       # slowapi Limiter configuration
+│   │   ├── taskiq.py           # Taskiq PostgreSQL broker & lifecycle hooks
 │   │   ├── llm.py              # DeepSeek LLM configuration, model registry & client factory
 │   │   ├── embedding.py        # Decoupled OpenAI embedding factory (1536 dims)
 │   │   ├── rag_config.py       # Precision vs Recall presets & RRF configuration
@@ -46,7 +59,8 @@ Base-Agent/
 │   │           ├── __init__.py
 │   │           ├── health.py   # Health & liveness probes (/health, /ping)
 │   │           ├── chat.py     # Conversation turns, streaming (SSE), & memory deletion
-│   │           └── documents.py# Document upload, search, and cascade delete
+│   │           ├── documents.py# Document upload, search, and cascade delete
+│   │           └── storage.py  # Admin-only raw Cloudflare R2 object storage operations
 │   ├── models/                 # Database persistence models
 │   │   ├── __init__.py
 │   │   ├── base.py             # Declarative Base & UTC TimestampMixin
@@ -59,27 +73,32 @@ Base-Agent/
 │   │   ├── chat.py             # ChatRequest, ChatResponse, StreamEvent, ThreadAssetItem
 │   │   ├── storage.py          # StorageObjectListResponse, PresignedUrlRequest
 │   │   └── document.py         # DocumentUploadResponse, RAGSearchRequest/Response
-│   └── services/               # Business logic & agent workflows
+│   ├── services/               # Business logic & agent workflows
+│   │   ├── __init__.py
+│   │   ├── agent.py            # LangGraph agent topology (retrieve -> chat) & state schema
+│   │   ├── memory.py           # PostgreSQL checkpointer service (AsyncPostgresSaver)
+│   │   ├── thread_service.py   # Thread persistence, root user, and asset management
+│   │   ├── tools.py            # LangChain agent tool factory (make_search_tool, user-scoped hybrid search)
+│   │   ├── document_loader.py  # Canonical Microsoft MarkItDown parser
+│   │   ├── document_processor.py # Asynchronous RAG ingestion pipeline (BackgroundTasks / Taskiq)
+│   │   ├── text_splitter.py    # Structure-aware token chunking (tiktoken cl100k_base)
+│   │   ├── vector_store.py     # PGVector HNSW vector store service
+│   │   ├── retriever.py        # Hybrid Search (Dense + FTS + RRF)
+│   │   └── r2_storage.py       # Cloudflare R2 / S3 object storage service
+│   └── tasks/                  # Taskiq asynchronous distributed worker tasks
 │       ├── __init__.py
-│       ├── agent.py            # LangGraph agent topology (retrieve -> chat) & state schema
-│       ├── memory.py           # PostgreSQL checkpointer service (AsyncPostgresSaver)
-│       ├── thread_service.py   # Thread persistence, root user, and asset management
-│       ├── tools.py            # LangChain agent tool factory (make_search_tool, user-scoped hybrid search)
-│       ├── document_loader.py  # Canonical Microsoft MarkItDown parser
-│       ├── document_processor.py # Asynchronous RAG ingestion pipeline (BackgroundTasks / Taskiq)
-│       ├── text_splitter.py    # Structure-aware token chunking (tiktoken cl100k_base)
-│       ├── vector_store.py     # PGVector HNSW vector store service
-│       ├── retriever.py        # Hybrid Search (Dense + FTS + RRF)
-│       └── r2_storage.py       # Cloudflare R2 / S3 object storage service
+│       └── document_tasks.py   # process_document_task worker task
 ├── scripts/
 │   ├── test_rag_live.py             # Interactive script testing live RAG + PGVector + FTS + RRF
 │   ├── test_deepseek_live.py        # Interactive script testing live DeepSeek + PostgreSQL turns
 │   ├── test_deepseek_stream_live.py # Interactive script testing live DeepSeek SSE streaming
-│   └── test_lightrag_live.py        # Interactive script testing live LightRAG + PGTableGraphStorage
+│   ├── test_lightrag_live.py        # Interactive script testing live LightRAG + PGTableGraphStorage
+│   └── test_taskiq_live.py          # Interactive script testing live Taskiq dispatch and PG queue
 └── tests/
     ├── __init__.py
     ├── conftest.py             # Pytest session setup & database table auto-initialization
     ├── test_api.py             # API route tests (health, ping, chat, multimodal images)
+    ├── test_auth.py            # Authentication, UserContext, and tenant isolation tests
     ├── test_storage_api.py     # Object storage endpoint tests
     ├── test_config.py          # Settings validation & URL normalization tests
     ├── test_agent.py           # Multi-turn memory & thread isolation tests
@@ -87,10 +106,12 @@ Base-Agent/
     ├── test_document_loader.py # MarkItDown parser tests
     ├── test_text_splitter.py   # Token chunking & header tracking tests
     ├── test_embedding.py       # Embedding factory tests
+    ├── test_rate_limit.py      # slowapi rate limiter tests
     ├── test_retriever.py       # RRF fusion logic tests
     ├── test_documents_api.py   # Document upload, search, and delete endpoint tests
     ├── test_rag_agent.py       # RAG-augmented agent execution and streaming tests
-    └── test_rag_providers.py   # Pluggable RAG framework and provider tests
+    ├── test_rag_providers.py   # Pluggable RAG framework and provider tests
+    └── test_taskiq.py          # Taskiq task queue and broker lifecycle tests
 ```
 
 ---
@@ -289,7 +310,103 @@ Real-time token and reasoning event streaming over HTTP via **Server-Sent Events
 
 ---
 
-## 9. Future Agent Builder Architecture (Phase 2)
+## 9. Authentication & Tenant Isolation
+
+Base Agent implements a swappable authentication and multi-tenant isolation layer in [`app/core/auth.py`](file:///c:/Users/Aditya/Desktop/Base-Agent/app/core/auth.py):
+
+### Identity Model (`UserContext`)
+```python
+class UserContext(BaseModel):
+    user_id: str
+    role: str = "user"  # "user" | "admin"
+    email: str | None = None
+```
+
+### Dependency Injection Flow
+1. **`get_current_user`**: Inspects incoming request via FastAPI dependency injection:
+   - Header: `X-User-ID`
+   - Role Header: `X-User-Role` (defaults to `"user"`, or `"admin"` if `user_id == "root"`)
+   - Email Header: `X-User-Email`
+   - Authorization Header: `Authorization: Bearer mock_<user_id>`
+   - Query Parameter: `?user_id=<user_id>` (for convenient browser preview and testing)
+   - Fallback Default: `"root"` (ensures seamless backward compatibility for testing and local development)
+2. **`require_admin`**: Validates `current_user.is_admin`, rejecting non-admin callers with `HTTP 403 Forbidden`. Enforced on all direct R2 object storage administration routes (`/api/v1/storage/*`).
+3. **Thread Ownership Enforcement**: `verify_thread_ownership(thread, user_id)` verifies that conversation threads cannot be accessed, modified, listed, or deleted by any user other than the owner or a superadmin (`root`).
+4. **Document Scoping**: All document operations (`upload`, `list`, `chunks`, `reindex`, `download`, `delete`, `search`) scope queries by `document.user_id == current_user.user_id`.
+
+---
+
+## 10. Asynchronous Task Queue (Taskiq + PostgreSQL)
+
+For production background task execution (document parsing, chunking, and embedding generation), Base Agent integrates **Taskiq** (`0.12.6`) with a native PostgreSQL broker (`taskiq-pg` `0.2.0`):
+
+```
+API Request (upload/reindex)
+       │
+       ▼
+[Taskiq Broker] ──► Writes job to PostgreSQL `taskiq_messages` table
+       │
+       ▼ (Worker process polls)
+[Taskiq Worker] (app.tasks.document_tasks:process_document_task)
+       │
+       ├── 1. Fetches raw binary stream directly from Cloudflare R2
+       ├── 2. Parses to structured markdown via Microsoft MarkItDown
+       ├── 3. Splits into token-aware chunks with header preservation
+       ├── 4. Generates OpenAI 1536-dim embeddings
+       ├── 5. Inserts vectors into PGVector HNSW and PostgreSQL FTS
+       └── 6. Updates document status to INDEXED or FAILED
+```
+
+### Key Architectural Decisions:
+- **Taskiq 0.12.6 Pinning**: Pinned to the 0.12.6 stable release to maintain strict compatibility with `taskiq-pg`'s serialization layer.
+- **Worker Payload Optimization**: Large file payloads (up to 25 MB) are **never** passed across PostgreSQL message broker tables. Instead, tasks pass lightweight identifiers (`document_id`, `r2_key`, `user_id`, `filename`, `content_type`), and the background worker streams the raw file directly from Cloudflare R2.
+- **Dual-Dispatch Fallback**: Document upload and re-index endpoints attempt `process_document_task.kiq(...)`. If the broker is uninitialized (e.g. unit tests without background broker), it automatically falls back to in-process FastAPI `BackgroundTasks`.
+
+---
+
+## 11. Database Migrations (Alembic)
+
+Database schema evolution is managed via async **Alembic** (`alembic/`):
+
+### Architecture & Isolation:
+- **Unified Driver**: Uses `postgresql+psycopg://` with an async SQLAlchemy engine inside [`alembic/env.py`](file:///c:/Users/Aditya/Desktop/Base-Agent/alembic/env.py).
+- **Target Metadata Isolation (`include_name`)**: Only tables registered in application ORM `Base.metadata` (`users`, `threads`, `thread_assets`, `documents`, `document_chunks`) and `alembic_version` are managed by Alembic. External tables managed by other subsystems (`lightrag_*`, `checkpoint_*`, `langchain_pg_*`, `taskiq_*`) are strictly excluded from autogeneration diffs.
+- **Transaction Safety**: `run_async_migrations()` executes `await connection.commit()` to ensure DDL changes are persisted cleanly on serverless PostgreSQL (Neon).
+- **Programmatic Startup Migration**: [`app/core/database.py`](file:///c:/Users/Aditya/Desktop/Base-Agent/app/core/database.py) executes `run_migrations()` (`alembic upgrade head`) automatically inside the FastAPI `lifespan` handler before incoming requests are accepted.
+
+---
+
+## 12. Rate Limiting & Abuse Prevention
+
+Base Agent incorporates endpoint-level rate limiting using **slowapi** (`app/core/rate_limit.py`):
+
+| Endpoint | Limit | Purpose |
+| -------- | ----- | ------- |
+| `POST /api/v1/chat` | `30/minute` | Protects DeepSeek API quota and database checkpointer |
+| `POST /api/v1/chat/stream` | `20/minute` | Governs long-lived SSE connections and token generation |
+| `POST /api/v1/chat/{thread_id}/assets` | `20/minute` | Caps media uploads and R2 writes |
+| `POST /api/v1/documents/upload` | `10/minute` | Restricts CPU-intensive MarkItDown parsing & embedding compute |
+| `POST /api/v1/documents/search` | `60/minute` | Balances interactive search against vector index load |
+
+---
+
+## 13. Containerization & Production Deployment (Docker)
+
+The project includes production-hardened Docker and Docker Compose definitions:
+
+### Multi-Stage Dockerfile (`Dockerfile`):
+1. **Builder Stage**: Uses `ghcr.io/astral-sh/uv:python3.12-bookworm-slim` to compile and sync dependencies into a clean `.venv` using `uv sync --frozen --no-dev --no-install-project`.
+2. **Runtime Stage**: Uses lightweight `python:3.12-slim-bookworm`, copies the virtualenv, creates an unprivileged user `appuser` (UID 10001), and exposes port 8000.
+3. **Health Check**: Native `curl -f http://localhost:8000/api/v1/ping || exit 1` probe every 30s.
+
+### Orchestration (`docker-compose.yml`):
+- **`api` service**: Runs FastAPI web server (`uvicorn app.main:app --host 0.0.0.0 --port 8000`).
+- **`worker` service**: Runs distributed Taskiq worker (`taskiq worker app.core.taskiq:broker app.tasks.document_tasks`).
+- **`docker-compose.override.yml`**: Optional local development override mounting code into containers with hot-reload enabled.
+
+---
+
+## 14. Future Agent Builder Architecture (Phase 2)
 
 Dynamic agent workflows defined through configuration API:
 - Graph types: `linear`, `cyclic` (ReAct), `multi_agent`.
@@ -297,7 +414,7 @@ Dynamic agent workflows defined through configuration API:
 
 ---
 
-## 10. Design Principles
+## 15. Design Principles
 
 1. **Stateless API, Stateful Graph**: FastAPI endpoints remain stateless; conversation state is persisted across turns via the checkpointer.
 2. **Unified Driver Ecosystem**: Single `psycopg3` engine and pool for ORM, LangGraph, and PGVector.
@@ -307,3 +424,7 @@ Dynamic agent workflows defined through configuration API:
 6. **Async First**: Fully async database queries, network calls, and agent invocations for maximum throughput.
 7. **Singleton Caching**: PGVector instance and compiled StateGraph are cached per collection/checkpointer at module level; hybrid dense+sparse searches run in parallel via `asyncio.gather` to minimise RAG latency.
 8. **User-Scoped Tool Security**: Agent tools never expose `user_id` as an LLM-callable argument. `make_search_tool(user_id)` closes over the caller-supplied identity so the model cannot escalate to another tenant's documents.
+9. **Zero Cross-Tenant Data Leakage**: User context is enforced at dependency injection boundaries; thread assets, conversation history, and document embeddings are strictly tenant-isolated.
+10. **Worker-Decoupled Large Payloads**: High-volume binary files are stored in S3/R2 and referenced by key rather than transmitted across database task queues.
+11. **Explicit Schema Migrations**: All production schema changes are version-controlled via Alembic migrations, never ad-hoc DDL.
+

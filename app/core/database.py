@@ -1,5 +1,22 @@
-from collections.abc import AsyncGenerator
+"""Database engine, session factory, and startup initialization.
+
+Startup sequence
+────────────────
+1. `run_migrations()` — runs `alembic upgrade head` programmatically.
+   This is idempotent: if the schema is already at HEAD it's a no-op.
+   Tables managed by external libs (LightRAG, LangGraph checkpoints,
+   langchain_pg_embedding) are NOT touched by Alembic — they are still
+   created by their respective library initializers in the lifespan hook.
+2. `seed_root_user()` — inserts the default root user if it doesn't exist.
+"""
+from __future__ import annotations
+
+import asyncio
 import logging
+from collections.abc import AsyncGenerator
+
+from alembic import command as alembic_command
+from alembic.config import Config as AlembicConfig
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -12,6 +29,9 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Async engine & session factory
+# ---------------------------------------------------------------------------
 engine: AsyncEngine = create_async_engine(
     settings.DATABASE_URL,
     echo=settings.DATABASE_ECHO,
@@ -65,20 +85,45 @@ async def check_db_connection() -> tuple[bool, str | None]:
         return False, str(exc)
 
 
-async def init_db() -> None:
-    """Creates database tables defined in SQLAlchemy models if not already present, and seeds the root user."""
-    from app.models.base import Base
-    import app.models  # noqa: F401 - Ensure all models are registered
+# ---------------------------------------------------------------------------
+# Alembic migration runner
+# ---------------------------------------------------------------------------
+def _run_alembic_upgrade() -> None:
+    """Runs `alembic upgrade head` synchronously (called from asyncio.to_thread).
+
+    Uses a temporary sync engine with NullPool so it doesn't interfere with
+    the async engine's connection pool.
+    """
+    import pathlib
+
+    # Locate alembic.ini relative to this file's project root
+    project_root = pathlib.Path(__file__).resolve().parents[2]
+    alembic_cfg = AlembicConfig(str(project_root / "alembic.ini"))
+    alembic_cfg.attributes["configure_logger"] = False
+    # Override sqlalchemy.url so env.py doesn't need to re-read settings
+    alembic_cfg.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
+    alembic_command.upgrade(alembic_cfg, "head")
+
+
+
+async def run_migrations() -> None:
+    """Run Alembic migrations asynchronously (non-blocking)."""
+    logger.info("Running Alembic migrations (upgrade head)...")
+    try:
+        await asyncio.to_thread(_run_alembic_upgrade)
+        logger.info("Alembic migrations complete.")
+    except Exception as exc:
+        logger.error("Alembic migration failed: %s", exc)
+        raise
+
+
+# ---------------------------------------------------------------------------
+# Root user seeding
+# ---------------------------------------------------------------------------
+async def seed_root_user() -> None:
+    """Insert the default root user if it does not already exist."""
     from app.models.user import User
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        # Ensure migration safe columns
-        await conn.execute(
-            text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0;")
-        )
-
-    # Seed default root user for production readiness if not exists
     try:
         async with AsyncSessionLocal() as session:
             root_user = await session.get(User, "root")
@@ -94,7 +139,16 @@ async def init_db() -> None:
                 await session.commit()
                 logger.info("Default root user seeded in database.")
     except Exception as exc:
-        logger.warning("Could not auto-seed root user (may already exist or DB not ready): %s", exc)
+        logger.warning(
+            "Could not auto-seed root user (may already exist or DB not ready): %s",
+            exc,
+        )
+
+
+async def init_db() -> None:
+    """Full startup sequence: run migrations, then seed the root user."""
+    await run_migrations()
+    await seed_root_user()
 
 
 async def close_db_connection() -> None:

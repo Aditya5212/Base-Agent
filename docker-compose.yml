@@ -1,0 +1,30 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: base-agent-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: base-agent-worker
+    restart: unless-stopped
+    command: ["taskiq", "worker", "app.core.taskiq:broker", "app.tasks.document_tasks"]
+    env_file:
+      - .env
+    depends_on:
+      api:
+        condition: service_healthy

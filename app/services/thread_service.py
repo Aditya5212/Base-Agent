@@ -15,6 +15,9 @@ from app.services.r2_storage import r2_storage_service
 logger = logging.getLogger(__name__)
 
 
+from fastapi import HTTPException, status
+
+
 async def get_or_create_user(
     db: AsyncSession,
     user_id: str = "root",
@@ -42,8 +45,13 @@ async def get_or_create_thread(
     thread_id: str,
     user_id: str = "root",
     title: str | None = None,
+    is_admin: bool = False,
 ) -> Thread:
-    """Retrieves an existing conversation thread or creates a new one bound to user_id."""
+    """Retrieves an existing conversation thread or creates a new one bound to user_id.
+
+    If the thread already exists, verifies ownership so one tenant cannot post into
+    another tenant's thread.
+    """
     # Ensure user exists first to satisfy foreign key
     await get_or_create_user(db, user_id=user_id)
 
@@ -61,6 +69,40 @@ async def get_or_create_thread(
         db.add(thread)
         await db.commit()
         await db.refresh(thread)
+    elif thread.user_id != user_id and not is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Access denied: Conversation thread '{thread_id}' belongs to user '{thread.user_id}'.",
+        )
+    return thread
+
+
+async def verify_thread_ownership(
+    db: AsyncSession,
+    thread_id: str,
+    user_id: str,
+    is_admin: bool = False,
+    allow_missing: bool = False,
+) -> Thread | None:
+    """Verifies that the thread exists and is accessible by user_id.
+
+    Raises:
+        HTTPException(404) if the thread does not exist (unless is_admin or allow_missing is True).
+        HTTPException(403) if the thread belongs to another user.
+    """
+    thread = await db.get(Thread, thread_id)
+    if not thread:
+        if allow_missing or is_admin:
+            return None
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Conversation thread '{thread_id}' not found.",
+        )
+    if thread.user_id != user_id and not is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=f"Access denied: Conversation thread '{thread_id}' belongs to user '{thread.user_id}'.",
+        )
     return thread
 
 

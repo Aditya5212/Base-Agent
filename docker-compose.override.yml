@@ -1,0 +1,12 @@
+# Local development overrides for hot-reloading and direct directory mounts
+services:
+  api:
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    volumes:
+      - ./app:/app/app
+      - ./alembic:/app/alembic
+
+  worker:
+    volumes:
+      - ./app:/app/app
+      - ./alembic:/app/alembic

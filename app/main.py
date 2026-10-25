@@ -7,9 +7,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+
 from app.api.v1.router import api_router
 from app.core.config import settings
 from app.core.database import check_db_connection, close_db_connection
+from app.core.rate_limit import limiter
 from app.services.memory import close_checkpointer_pool, setup_checkpointer
 
 # Configure logging
@@ -66,6 +70,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.info("Stuck-document background sweeper started.")
         except Exception as rec_err:
             logger.warning("Failed to initialize document recovery/sweeper: %s", rec_err)
+
+        try:
+            from app.core.taskiq import init_taskiq_broker
+            await init_taskiq_broker()
+        except Exception as tq_err:
+            logger.warning("Failed to initialize Taskiq broker: %s", tq_err)
     else:
         logger.warning("Database connection failed during startup: %s", err)
 
@@ -81,6 +91,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             pass
         except Exception as sw_err:
             logger.debug("Error while cancelling sweeper: %s", sw_err)
+
+    try:
+        from app.core.taskiq import shutdown_taskiq_broker
+        await shutdown_taskiq_broker()
+    except Exception as tq_err:
+        logger.warning("Error shutting down Taskiq broker: %s", tq_err)
 
     try:
         from app.core.rag import shutdown_all_providers
@@ -104,6 +120,10 @@ def create_application() -> FastAPI:
         redoc_url="/redoc",
         lifespan=lifespan,
     )
+
+    # Attach slowapi rate limiter
+    app.state.limiter = limiter
+    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
     # Configure CORS
     if settings.CORS_ORIGINS:

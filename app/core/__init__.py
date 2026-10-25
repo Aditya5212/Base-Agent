@@ -1,5 +1,6 @@
 """Core modules: configuration, database, LLM provider, and authentication."""
 
+from app.core.auth import UserContext, get_current_user, require_admin
 from app.core.config import get_settings, settings
 from app.core.database import AsyncSessionLocal, engine, get_db
 from app.core.llm import (
@@ -23,4 +24,7 @@ __all__ = [
     "DEEPSEEK_PRO",
     "MODEL_DEEPSEEK_FLASH",
     "MODEL_DEEPSEEK_PRO",
+    "UserContext",
+    "get_current_user",
+    "require_admin",
 ]
