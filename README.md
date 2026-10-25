@@ -89,7 +89,7 @@ Base-Agent/
 │   ├── test_deepseek_live.py        # Live DeepSeek multi-turn chat test
 │   ├── test_deepseek_stream_live.py # Live DeepSeek SSE streaming test
 │   └── test_lightrag_live.py        # Live LightRAG + PGTableGraphStorage smoke test
-└── tests/                           # Complete pytest suite (61 tests)
+└── tests/                           # Complete pytest suite (70 tests)
 ```
 
 ## 🔌 API Endpoints Summary
@@ -102,7 +102,7 @@ Interactive Swagger UI is available at `http://localhost:8000/docs`.
 | `GET` | `/` | Service root and health check link |
 | `GET` | `/api/v1/health` | Readiness probe (validates PostgreSQL connectivity) |
 | `GET` | `/api/v1/ping` | Liveness probe |
-| `POST` | `/api/v1/chat` | Multi-turn agent conversation turn (optional RAG, multimodal images) |
+| `POST` | `/api/v1/chat` | Multi-turn agent conversation turn (optional RAG, multimodal vision with key authorization) |
 | `POST` | `/api/v1/chat/stream` | Server-Sent Events (SSE) streaming (tokens + reasoning) |
 | `POST` | `/api/v1/chat/{thread_id}/assets` | Upload an image or document attachment to thread |
 | `GET` | `/api/v1/chat/{thread_id}/assets` | List uploaded images & documents in thread with signed URLs |
@@ -115,24 +115,24 @@ Interactive Swagger UI is available at `http://localhost:8000/docs`.
 |---|---|---|
 | `GET` | `/api/v1/documents/stats` | Aggregated metrics: documents, chunks, bytes used, statuses |
 | `GET` | `/api/v1/documents` | List knowledge base documents with search filter and pagination |
-| `POST` | `/api/v1/documents/upload` | Upload raw document to R2, parse to Markdown, chunk & index |
-| `GET` | `/api/v1/documents/{id}` | Document details with chunk count, status, and download URL |
+| `POST` | `/api/v1/documents/upload` | Upload raw document to R2, parse to Markdown, chunk & index in background |
+| `GET` | `/api/v1/documents/{id}` | Document details with retry count, chunk count, status, and download URL |
 | `GET` | `/api/v1/documents/{id}/chunks` | Inspect granular token chunks, section headers, and metadata |
-| `POST` | `/api/v1/documents/{id}/reindex` | Re-index document from R2 with a different chunking preset |
-| `GET` | `/api/v1/documents/{id}/download` | Stream original binary document directly from R2 |
-| `DELETE` | `/api/v1/documents/{id}` | Cascade delete: R2 storage, PGVector embeddings, chunks & record |
+| `POST` | `/api/v1/documents/{id}/reindex` | Re-index document from R2 with preset (purges chunks & graph entities) |
+| `GET` | `/api/v1/documents/{id}/download` | Stream binary from R2 with `?inline=true` browser preview support |
+| `DELETE` | `/api/v1/documents/{id}` | Cascade delete: R2 storage, PGVector embeddings, LightRAG graph & record |
 | `POST` | `/api/v1/documents/search` | Direct Hybrid Search (Dense HNSW + FTS GIN + RRF fusion) |
 
-### Object Storage Management (`/api/v1/storage`)
+### Object Storage Management (`/api/v1/storage` — Admin Only)
 | Method | Endpoint | Description |
 |---|---|---|
-| `GET` | `/api/v1/storage/stats` | Bucket statistics: total files, total bytes, formatted size |
-| `GET` | `/api/v1/storage/objects` | List objects matching prefix with ETags and download URLs |
-| `POST` | `/api/v1/storage/upload` | Direct file upload to Cloudflare R2 |
-| `GET` | `/api/v1/storage/objects/{key}` | Object metadata, size, MIME type, and download URL |
-| `GET` | `/api/v1/storage/download/{key}` | Stream binary object directly from Cloudflare R2 |
-| `DELETE` | `/api/v1/storage/objects/{key}` | Delete object from Cloudflare R2 |
-| `POST` | `/api/v1/storage/presigned-url` | Generate temporary PUT (upload) or GET (download) signed URL |
+| `GET` | `/api/v1/storage/stats` | Bucket statistics: total files, total bytes, formatted size (Root only) |
+| `GET` | `/api/v1/storage/objects` | List objects matching prefix with ETags and download URLs (Root only) |
+| `POST` | `/api/v1/storage/upload` | Direct upload under deterministic user namespace (Root only) |
+| `GET` | `/api/v1/storage/objects/{key}` | Object metadata, size, MIME type, and download URL (Root only) |
+| `GET` | `/api/v1/storage/download/{key}` | Stream binary object directly from Cloudflare R2 (Root only) |
+| `DELETE` | `/api/v1/storage/objects/{key}` | Delete object from Cloudflare R2 bucket (Root only) |
+| `POST` | `/api/v1/storage/presigned-url` | Generate temporary PUT (upload) or GET (download) signed URL (Root only) |
 
 ## 🚀 Getting Started
 

@@ -142,7 +142,23 @@ async def upload_document(
         status=DocumentStatus.PARSING,
     )
     db.add(doc_record)
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception as db_exc:
+        logger.error(
+            "Database commit failed after R2 upload; rolling back and cleaning up orphaned R2 file: %s",
+            db_exc,
+            exc_info=True,
+        )
+        await db.rollback()
+        try:
+            await r2_storage_service.delete_file(r2_key)
+        except Exception as r2_cleanup_exc:
+            logger.warning("Failed to clean up orphaned R2 file '%s': %s", r2_key, r2_cleanup_exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to persist document metadata in database.",
+        )
 
     # Step 3: Dispatch asynchronous pipeline to background task
     background_tasks.add_task(
@@ -385,11 +401,12 @@ async def reindex_document(
 @router.get(
     "/{document_id}/download",
     summary="Download original document",
-    description="Streams or returns the original binary file from Cloudflare R2.",
+    description="Streams or returns the original binary file from Cloudflare R2 with optional browser inline preview.",
 )
 async def download_document(
     document_id: str,
     user_id: str = "default_user",
+    inline: bool = Query(default=False, description="Display inline in browser if true, otherwise trigger download"),
     db: AsyncSession = Depends(get_db),
 ):
     """Streams the raw original document file directly from Cloudflare R2."""
@@ -398,11 +415,19 @@ async def download_document(
     except ValueError:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid UUID format.")
 
-    stmt = select(Document).where(Document.id == parsed_id, Document.user_id == user_id)
+    stmt = select(Document).where(Document.id == parsed_id)
     res = await db.execute(stmt)
     doc = res.scalar_one_or_none()
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+
+    if doc.user_id != user_id and user_id != "root":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: You do not have permission to view or download this document.",
+        )
+
+    disposition_type = "inline" if inline else "attachment"
 
     try:
         raw_bytes = await r2_storage_service.download_file(doc.r2_key)
@@ -410,7 +435,7 @@ async def download_document(
             io.BytesIO(raw_bytes),
             media_type=doc.mime_type,
             headers={
-                "Content-Disposition": f'attachment; filename="{doc.file_name}"',
+                "Content-Disposition": f'{disposition_type}; filename="{doc.file_name}"',
                 "Content-Length": str(len(raw_bytes)),
             },
         )
@@ -439,15 +464,30 @@ async def delete_document(
     except ValueError:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid UUID format.")
 
-    stmt = select(Document).where(Document.id == parsed_id, Document.user_id == user_id)
+    stmt = select(Document).where(Document.id == parsed_id)
     result = await db.execute(stmt)
     doc = result.scalar_one_or_none()
 
     if not doc:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
 
+    if doc.user_id != user_id and user_id != "root":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: You do not have permission to delete this document.",
+        )
+
     # 1. Purge chunks from vector store
     chunks_removed = await delete_documents_by_metadata("document_id", str(doc.id))
+
+    # 1.5. Purge knowledge graph entries if LightRAG is active
+    try:
+        from app.core.rag.factory import get_provider
+        from app.core.rag.workspace import user_workspace
+        lightrag_provider = await get_provider("lightrag", user_workspace(doc.user_id))
+        await lightrag_provider.delete_document(str(doc.id))
+    except Exception as g_exc:
+        logger.debug("LightRAG knowledge graph purge skipped/failed for doc %s: %s", doc.id, g_exc)
 
     # 2. Delete raw object from Cloudflare R2
     try:

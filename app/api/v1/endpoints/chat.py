@@ -99,6 +99,12 @@ async def chat(
             sources=result.get("rag_sources"),
             thread_assets=result.get("thread_assets"),
         )
+    except ValueError as val_err:
+        logger.warning("Invalid chat request parameters for thread_id=%s: %s", request.thread_id, val_err)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(val_err),
+        )
     except Exception as exc:
         logger.error("Chat turn failed for thread_id=%s: %s", request.thread_id, exc, exc_info=True)
         raise HTTPException(

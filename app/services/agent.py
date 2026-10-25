@@ -129,14 +129,35 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
     sources = []
     for idx, doc in enumerate(fused_docs, 1):
         filename = doc.metadata.get("filename") or doc.metadata.get("source") or "Document"
+        doc_id = str(doc.metadata.get("document_id") or "")
+        chunk_id = str(doc.metadata.get("id") or doc.metadata.get("chunk_id") or f"c_{idx}")
+        r2_key = doc.metadata.get("r2_key") or doc.metadata.get("file_key")
         headers = [v for k, v in doc.metadata.items() if k.startswith("header_")]
         section_str = f" | Section: {' > '.join(headers)}" if headers else ""
         context_blocks.append(f"[Source {idx}: {filename}{section_str}]\n{doc.page_content}")
+
+        view_url = None
+        download_url = None
+        if doc_id:
+            view_url = f"/api/v1/documents/{doc_id}/download?inline=true"
+            download_url = f"/api/v1/documents/{doc_id}/download"
+        elif r2_key:
+            try:
+                view_url = await r2_storage_service.generate_presigned_url(r2_key, inline=True, filename=filename)
+                download_url = await r2_storage_service.generate_presigned_url(r2_key, inline=False, filename=filename)
+            except Exception:
+                pass
+
         sources.append({
             "source_id": idx,
+            "document_id": doc_id or None,
+            "chunk_id": chunk_id,
             "filename": filename,
             "section": " > ".join(headers) if headers else None,
             "preview": doc.page_content[:150],
+            "content": doc.page_content,
+            "view_url": view_url,
+            "download_url": download_url,
             "metadata": doc.metadata,
         })
 
@@ -232,19 +253,61 @@ def get_agent_graph(checkpointer: BaseCheckpointSaver | None = None) -> Compiled
     return builder.compile(checkpointer=checkpointer)
 
 
-async def _build_human_message(message: str, images: list[str] | None = None) -> HumanMessage:
-    """Constructs a text or multimodal HumanMessage supporting vision input for DeepSeek."""
+async def _build_human_message(
+    message: str,
+    images: list[str] | None = None,
+    user_id: str = "root",
+    thread_id: str | None = None,
+) -> HumanMessage:
+    """Constructs a text or multimodal HumanMessage supporting vision input for DeepSeek.
+
+    Validates that any raw R2 keys prevent path traversal and are strictly authorized for
+    the specified user_id or thread_id before minting presigned URLs for LLM multimodal ingestion.
+    """
     if not images:
         return HumanMessage(content=message)
 
     content: list[dict[str, Any]] = [{"type": "text", "text": message}]
     for img in images:
-        url = img
-        if not img.startswith(("http://", "https://", "data:")):
+        if img.startswith(("http://", "https://", "data:")):
+            content.append({"type": "image_url", "image_url": {"url": img}})
+            continue
+
+        # Prevent path traversal and malformed keys
+        if ".." in img or "\\" in img or img.startswith(("/", "\\")):
+            raise ValueError(f"Invalid image key: path traversal sequences are forbidden in '{img}'")
+
+        # Authorization check:
+        # 1. Admin/root user can access storage keys
+        # 2. Key is scoped to this user: users/{user_id}/...
+        # 3. Key is scoped to this thread: threads/{thread_id}/...
+        is_authorized = (
+            user_id == "root"
+            or img.startswith(f"users/{user_id}/")
+            or (bool(thread_id) and img.startswith(f"threads/{thread_id}/"))
+        )
+
+        # 4. If not matched by prefix, check if key is an active registered asset in this thread
+        if not is_authorized and thread_id:
             try:
-                url = await r2_storage_service.generate_presigned_url(img)
-            except Exception:
-                url = r2_storage_service.get_public_url(img) or img
+                from app.core.database import AsyncSessionLocal
+                from app.services.thread_service import get_thread_assets
+
+                async with AsyncSessionLocal() as session:
+                    assets = await get_thread_assets(session, thread_id)
+                    if any(a.r2_key == img for a in assets):
+                        is_authorized = True
+            except Exception as check_exc:
+                logger.warning("Failed checking thread assets for key '%s': %s", img, check_exc)
+
+        if not is_authorized:
+            raise ValueError(f"Access denied: storage key '{img}' is not authorized for user '{user_id}'")
+
+        try:
+            url = await r2_storage_service.generate_presigned_url(img)
+        except Exception:
+            url = r2_storage_service.get_public_url(img) or img
+
         content.append({"type": "image_url", "image_url": {"url": url}})
 
     return HumanMessage(content=content)
@@ -291,7 +354,12 @@ async def execute_agent(
         }
     }
 
-    human_msg = await _build_human_message(message=message, images=images)
+    human_msg = await _build_human_message(
+        message=message,
+        images=images,
+        user_id=user_id,
+        thread_id=thread_id,
+    )
 
     input_payload = {
         "messages": [human_msg],
@@ -344,7 +412,12 @@ async def stream_agent_events(
         }
     }
 
-    human_msg = await _build_human_message(message=message, images=images)
+    human_msg = await _build_human_message(
+        message=message,
+        images=images,
+        user_id=user_id,
+        thread_id=thread_id,
+    )
 
     input_payload = {
         "messages": [human_msg],

@@ -73,6 +73,10 @@ async def init_db() -> None:
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Ensure migration safe columns
+        await conn.execute(
+            text("ALTER TABLE documents ADD COLUMN IF NOT EXISTS retry_count INTEGER DEFAULT 0;")
+        )
 
     # Seed default root user for production readiness if not exists
     try:

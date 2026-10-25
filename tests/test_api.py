@@ -205,3 +205,95 @@ async def test_hybrid_document_search_tool():
         result = await hybrid_document_search.ainvoke({"query": "What is LangGraph?"})
         assert "No relevant documents found" in result
 
+
+def test_chat_endpoint_value_error_returns_400():
+    """ValueError from invalid image keys/traversal returns HTTP 400 Bad Request."""
+    with patch("app.api.v1.endpoints.chat.execute_agent", new_callable=AsyncMock) as mock_exec:
+        mock_exec.side_effect = ValueError("Invalid image key: path traversal sequences are forbidden in '../../etc/passwd'")
+
+        payload = {
+            "message": "Analyze this file",
+            "thread_id": "test-sec-thread",
+            "user_id": "user123",
+            "images": ["../../etc/passwd"],
+        }
+        response = client.post("/api/v1/chat", json=payload)
+        assert response.status_code == 400
+        assert "path traversal" in response.json()["detail"].lower()
+
+
+@pytest.mark.asyncio
+async def test_build_human_message_path_traversal_guard():
+    """_build_human_message raises ValueError on path traversal sequences."""
+    from app.services.agent import _build_human_message
+
+    with pytest.raises(ValueError, match="path traversal"):
+        await _build_human_message(
+            message="Test traversal",
+            images=["../../etc/shadow"],
+            user_id="user123",
+            thread_id="t1",
+        )
+
+    with pytest.raises(ValueError, match="path traversal"):
+        await _build_human_message(
+            message="Test leading slash",
+            images=["/root/private.key"],
+            user_id="user123",
+            thread_id="t1",
+        )
+
+
+@pytest.mark.asyncio
+async def test_build_human_message_unauthorized_key_guard():
+    """_build_human_message raises ValueError when accessing another user's key."""
+    from app.services.agent import _build_human_message
+
+    with pytest.raises(ValueError, match="Access denied"):
+        await _build_human_message(
+            message="Steal user image",
+            images=["users/victim_user/doc.png"],
+            user_id="attacker_user",
+            thread_id="t1",
+        )
+
+
+@pytest.mark.asyncio
+async def test_build_human_message_authorized_keys():
+    """_build_human_message accepts keys owned by user or thread."""
+    from app.services.agent import _build_human_message
+
+    with patch("app.services.agent.r2_storage_service.generate_presigned_url", new_callable=AsyncMock) as mock_url:
+        mock_url.return_value = "https://r2/signed/pic.png"
+
+        # 1. User-scoped key
+        msg = await _build_human_message(
+            message="Describe image",
+            images=["users/user123/pic.png"],
+            user_id="user123",
+            thread_id="t1",
+        )
+        assert isinstance(msg.content, list)
+        assert msg.content[0]["text"] == "Describe image"
+        assert msg.content[1]["image_url"]["url"] == "https://r2/signed/pic.png"
+
+        # 2. Thread-scoped key
+        msg_thread = await _build_human_message(
+            message="Describe thread image",
+            images=["threads/t1/pic.png"],
+            user_id="user123",
+            thread_id="t1",
+        )
+        assert isinstance(msg_thread.content, list)
+
+        # 3. Root admin user can access any valid key
+        msg_root = await _build_human_message(
+            message="Admin inspect",
+            images=["users/someone_else/pic.png"],
+            user_id="root",
+            thread_id="t1",
+        )
+        assert isinstance(msg_root.content, list)
+
+
+

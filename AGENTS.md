@@ -216,15 +216,17 @@ Tenant boundaries are enforced at the storage level using LightRAG's native `wor
 
 ## 6. Cloudflare R2 & Document Lifecycle Pipeline
 
-### Ingestion Flow
+### Ingestion Flow & Fault-Tolerant Recovery
 1. **Upload**: User uploads document (`PDF`, `DOCX`, `TXT`, `MD`) via `POST /api/v1/documents/upload`.
-2. **Object Storage**: Stored in Cloudflare R2 (S3-compatible) via async `aioboto3`.
-3. **Immediate 202 Response**: Document record is initialized with status `PARSING`, and an HTTP 202 Accepted response is returned immediately to prevent client timeouts.
-4. **Asynchronous Background Processing**: Dispatched to FastAPI `BackgroundTasks` executing `process_document_pipeline` in an isolated database session (roadmap for production scaling with Taskiq documented in `TODO.md`).
-5. **Parsing**: Converted to structured markdown via Microsoft **MarkItDown** (`markitdown`).
-6. **Chunking**: Structure-aware splitting using `MarkdownHeaderTextSplitter` + `RecursiveCharacterTextSplitter.from_tiktoken_encoder` (`cl100k_base`), preserving section hierarchy.
-7. **Embedding & Indexing**: Vectors indexed into `langchain_pg_embedding` in PostgreSQL with HNSW cosine index and PostgreSQL FTS GIN index. Status updated to `INDEXED` or `FAILED`.
-8. **Cascade Delete**: When a document is deleted via `DELETE /api/v1/documents/{document_id}`, both R2 storage and all PostgreSQL chunks are purged atomically.
+2. **Object Storage**: Stored in Cloudflare R2 (S3-compatible) via async `aioboto3` with `tenacity` exponential backoff retries on transient network/5xx errors.
+3. **Atomic Rollback**: If PostgreSQL metadata commitment fails after upload, the raw R2 object is automatically deleted to prevent orphaned files.
+4. **Immediate 202 Response**: Document record is initialized with status `PARSING`, and an HTTP 202 Accepted response is returned immediately to prevent client timeouts.
+5. **Asynchronous Background Processing**: Dispatched to FastAPI `BackgroundTasks` executing `process_document_pipeline` in an isolated database session.
+6. **Parsing**: Converted to structured markdown via Microsoft **MarkItDown** (`markitdown`).
+7. **Chunking**: Structure-aware splitting using `MarkdownHeaderTextSplitter` + `RecursiveCharacterTextSplitter.from_tiktoken_encoder` (`cl100k_base`), preserving section hierarchy.
+8. **Embedding & Indexing**: Vectors indexed into `langchain_pg_embedding` in PostgreSQL with HNSW cosine index and PostgreSQL FTS GIN index. Status updated to `INDEXED` or `FAILED`.
+9. **Stuck-Document Advisory Lock Sweeper**: Background sweeper running every 5 minutes and on startup uses a PostgreSQL advisory lock (`pg_try_advisory_lock(847291)`) to recover documents stuck in `PARSING`. Documents are retried up to 3 times before transitioning to `FAILED` with actionable guidance for 1-click re-indexing.
+10. **Cascade Delete & Re-index**: When a document is deleted via `DELETE /api/v1/documents/{document_id}` or re-indexed via `POST /api/v1/documents/{document_id}/reindex`, R2 storage, PGVector embeddings, and LightRAG knowledge graph entities are purged atomically.
 
 ---
 
@@ -235,7 +237,7 @@ Real-time token and reasoning event streaming over HTTP via **Server-Sent Events
 ### Wire Format
 - `token`: Incremental response text chunk.
 - `reasoning`: Incremental reasoning delta (DeepSeek thinking mode).
-- `end`: Final turn snapshot containing `response`, `history_length`, and retrieved `sources`.
+- `end`: Final turn snapshot containing `response`, `history_length`, and retrieved `sources` (including `view_url` and `download_url`).
 - `error`: Error payload.
 
 ---
@@ -248,7 +250,7 @@ Real-time token and reasoning event streaming over HTTP via **Server-Sent Events
 | `GET` | `/` | Root | Service info and API status |
 | `GET` | `/api/v1/health` | Readiness Probe | Verifies PostgreSQL connectivity |
 | `GET` | `/api/v1/ping` | Liveness Probe | Lightweight health check |
-| `POST` | `/api/v1/chat` | Send Message | Executes a conversation turn (optional RAG, multimodal images) |
+| `POST` | `/api/v1/chat` | Send Message | Executes a conversation turn (optional RAG, multimodal images with key authorization) |
 | `POST` | `/api/v1/chat/stream` | Stream Message | Streams real-time tokens & reasoning via SSE with multimodal images |
 | `POST` | `/api/v1/chat/{thread_id}/assets` | Upload Asset | Uploads an image or document attachment linked to thread |
 | `GET` | `/api/v1/chat/{thread_id}/assets` | List Assets | Lists uploaded images & documents in thread with fresh signed URLs |
@@ -261,24 +263,24 @@ Real-time token and reasoning event streaming over HTTP via **Server-Sent Events
 | ------ | ---- | ------- | ----------- |
 | `GET` | `/api/v1/documents/stats` | KB Statistics | Aggregated document, chunk, and storage metrics |
 | `GET` | `/api/v1/documents` | List Documents | Lists user's documents with search filter and pagination |
-| `POST` | `/api/v1/documents/upload` | Upload & Index | Uploads to R2, parses with MarkItDown, chunks & indexes |
-| `GET` | `/api/v1/documents/{document_id}` | Document Details | Metadata, status, chunk count, and presigned download URL |
+| `POST` | `/api/v1/documents/upload` | Upload & Index | Uploads to R2, parses with MarkItDown, chunks & indexes in background |
+| `GET` | `/api/v1/documents/{document_id}` | Document Details | Metadata, status, retry count, chunk count, and presigned download URL |
 | `GET` | `/api/v1/documents/{document_id}/chunks` | Inspect Chunks | Granular inspection of document text chunks & headers |
-| `POST` | `/api/v1/documents/{document_id}/reindex` | Re-index Document | Re-chunks/re-indexes from R2 source with new preset |
-| `GET` | `/api/v1/documents/{document_id}/download` | Download Document | Streams raw binary document directly from R2 storage |
-| `DELETE` | `/api/v1/documents/{document_id}` | Cascade Delete | Purges from R2, PGVector chunks, and database |
+| `POST` | `/api/v1/documents/{document_id}/reindex` | Re-index Document | Re-chunks/re-indexes from R2 source with new preset and purges graph |
+| `GET` | `/api/v1/documents/{document_id}/download` | View / Download Document | Streams binary from R2 with `?inline=true` browser preview support |
+| `DELETE` | `/api/v1/documents/{document_id}` | Cascade Delete | Purges from R2, PGVector chunks, LightRAG graph, and database |
 | `POST` | `/api/v1/documents/search` | Direct Hybrid Search | Hybrid retrieval (Dense + FTS + RRF) with preset tuning |
 
-### Object Storage Management (`/api/v1/storage`)
+### Object Storage Management (`/api/v1/storage` — Admin Only)
 | Method | Path | Summary | Description |
 | ------ | ---- | ------- | ----------- |
-| `GET` | `/api/v1/storage/stats` | Storage Stats | Bucket metrics, total files, and bytes consumed |
-| `GET` | `/api/v1/storage/objects` | List Objects | Lists objects matching prefix with ETags and signed URLs |
-| `POST` | `/api/v1/storage/upload` | Direct Upload | Uploads any asset directly to Cloudflare R2 |
-| `GET` | `/api/v1/storage/objects/{key}` | Object Details | Metadata, size, content-type, and presigned URL |
-| `GET` | `/api/v1/storage/download/{key}` | Download Object | Streams binary file directly from Cloudflare R2 |
-| `DELETE` | `/api/v1/storage/objects/{key}` | Delete Object | Deletes object from Cloudflare R2 bucket |
-| `POST` | `/api/v1/storage/presigned-url` | Generate Presigned URL | Generates temporary PUT (direct client upload) or GET URL |
+| `GET` | `/api/v1/storage/stats` | Storage Stats | Bucket metrics, total files, and bytes consumed (Root only) |
+| `GET` | `/api/v1/storage/objects` | List Objects | Lists objects matching prefix with ETags and signed URLs (Root only) |
+| `POST` | `/api/v1/storage/upload` | Direct Upload | Uploads asset under deterministic user namespace (Root only) |
+| `GET` | `/api/v1/storage/objects/{key}` | Object Details | Metadata, size, content-type, and presigned URL (Root only) |
+| `GET` | `/api/v1/storage/download/{key}` | Download Object | Streams binary file directly from Cloudflare R2 (Root only) |
+| `DELETE` | `/api/v1/storage/objects/{key}` | Delete Object | Deletes object from Cloudflare R2 bucket (Root only) |
+| `POST` | `/api/v1/storage/presigned-url` | Generate Presigned URL | Generates temporary PUT (direct client upload) or GET URL (Root only) |
 
 
 ---

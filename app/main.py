@@ -1,3 +1,4 @@
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import logging
@@ -30,6 +31,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         settings.DEBUG,
     )
 
+    sweeper_task = None
+
     # Check database connectivity during startup
     db_connected, err = await check_db_connection()
     if db_connected:
@@ -53,14 +56,32 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.info("PostgreSQL vector store and FTS indexes initialized successfully.")
         except Exception as vs_err:
             logger.warning("Failed to initialize vector store indexes: %s", vs_err)
+
+        try:
+            from app.services.document_processor import recover_stuck_documents, start_document_sweeper
+            recovered = await recover_stuck_documents()
+            if recovered:
+                logger.info("Startup recovery processed %d stuck document(s): %s", len(recovered), recovered)
+            sweeper_task = asyncio.create_task(start_document_sweeper(interval_seconds=300))
+            logger.info("Stuck-document background sweeper started.")
+        except Exception as rec_err:
+            logger.warning("Failed to initialize document recovery/sweeper: %s", rec_err)
     else:
         logger.warning("Database connection failed during startup: %s", err)
-
 
     yield
 
     # Graceful shutdown
     logger.info("Shutting down %s...", settings.PROJECT_NAME)
+    if sweeper_task:
+        sweeper_task.cancel()
+        try:
+            await sweeper_task
+        except asyncio.CancelledError:
+            pass
+        except Exception as sw_err:
+            logger.debug("Error while cancelling sweeper: %s", sw_err)
+
     try:
         from app.core.rag import shutdown_all_providers
         await shutdown_all_providers()

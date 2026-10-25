@@ -97,3 +97,47 @@ def test_delete_storage_object_endpoint():
         data = response.json()
         assert data["deleted"] is True
         assert data["key"] == "uploads/old_file.txt"
+
+
+def test_storage_admin_access_forbidden_for_regular_user():
+    """Non-root users must receive 403 Forbidden on admin storage endpoints."""
+    # Stats
+    res_stats = client.get("/api/v1/storage/stats?user_id=alice")
+    assert res_stats.status_code == 403
+    assert "Access denied" in res_stats.json()["detail"]
+
+    # Objects
+    res_objs = client.get("/api/v1/storage/objects?user_id=alice")
+    assert res_objs.status_code == 403
+
+    # Upload
+    files = {"file": ("doc.pdf", b"sample content", "application/pdf")}
+    res_upload = client.post("/api/v1/storage/upload", files=files, data={"user_id": "alice"})
+    assert res_upload.status_code == 403
+
+    # Delete
+    res_del = client.delete("/api/v1/storage/objects/uploads/old_file.txt?user_id=alice")
+    assert res_del.status_code == 403
+
+
+def test_storage_path_traversal_forbidden():
+    """Path traversal sequences (e.g. '../', leading slash, backslashes) must return 400."""
+    import pytest
+    from fastapi import HTTPException
+    from app.api.v1.endpoints.storage import sanitize_and_validate_key
+
+    # Query prefix traversal over HTTP
+    res_traversal = client.get("/api/v1/storage/objects?prefix=../../etc")
+    assert res_traversal.status_code == 400
+    assert "Path traversal sequences" in res_traversal.json()["detail"]
+
+    res_leading_slash = client.get("/api/v1/storage/objects?prefix=/secret")
+    assert res_leading_slash.status_code == 400
+
+    # Direct validation of dangerous keys
+    for dangerous in ["../secret.txt", "/etc/passwd", "..\\windows\\system32", "//bucket/key"]:
+        with pytest.raises(HTTPException) as exc_info:
+            sanitize_and_validate_key(dangerous)
+        assert exc_info.value.status_code == 400
+        assert "Path traversal sequences" in exc_info.value.detail
+

@@ -13,10 +13,38 @@ from typing import Any, BinaryIO
 
 import aioboto3
 from botocore.config import Config
+from tenacity import AsyncRetrying, retry_if_exception, stop_after_attempt, wait_exponential
 
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+def _is_transient_r2_error(exc: BaseException) -> bool:
+    """Returns True if the exception represents a transient network, timeout, or 5xx S3 error."""
+    exc_name = exc.__class__.__name__
+    if any(k in exc_name for k in ("Timeout", "Connection", "EndpointConnection", "IncompleteRead")):
+        return True
+    if hasattr(exc, "response") and isinstance(exc.response, dict):
+        status_code = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0)
+        if status_code in (429, 500, 502, 503, 504):
+            return True
+        code = exc.response.get("Error", {}).get("Code", "")
+        if code in ("RequestTimeout", "ThrottlingException", "SlowDown", "InternalError", "ServiceUnavailable"):
+            return True
+    return False
+
+
+async def _run_with_retry(coro_fn, *args: Any, **kwargs: Any) -> Any:
+    """Executes a coroutine with exponential backoff retries for transient S3/R2 errors."""
+    async for attempt in AsyncRetrying(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=0.5, min=0.5, max=4.0),
+        retry=retry_if_exception(_is_transient_r2_error),
+        reraise=True,
+    ):
+        with attempt:
+            return await coro_fn(*args, **kwargs)
 
 
 class R2StorageService:
@@ -51,13 +79,38 @@ class R2StorageService:
         ) as client:
             yield client
 
+    async def file_exists(self, file_key: str) -> bool:
+        """Checks if a file exists in the storage bucket."""
+        if not self.is_configured:
+            return file_key in self._dev_storage
+
+        async def _head() -> bool:
+            async with self.get_client() as s3:
+                try:
+                    await s3.head_object(Bucket=self.bucket_name, Key=file_key)
+                    return True
+                except Exception as exc:
+                    if hasattr(exc, "response") and isinstance(exc.response, dict):
+                        code = exc.response.get("Error", {}).get("Code")
+                        if code in ("404", "NoSuchKey", "NotFound"):
+                            return False
+                    if "404" in str(exc) or "NotFound" in str(exc):
+                        return False
+                    raise exc
+
+        try:
+            return await _run_with_retry(_head)
+        except Exception as exc:
+            logger.warning("Error checking file existence for '%s': %s", file_key, exc)
+            return False
+
     async def upload_file(
         self,
         file_data: bytes | BinaryIO,
         file_key: str,
         content_type: str = "application/octet-stream",
     ) -> str:
-        """Uploads a file to Cloudflare R2 bucket.
+        """Uploads a file to Cloudflare R2 bucket with automated retry.
 
         Args:
             file_data: File payload as bytes or readable binary stream.
@@ -74,18 +127,22 @@ class R2StorageService:
             return file_key
 
         body = file_data if isinstance(file_data, bytes) else file_data.read()
-        async with self.get_client() as s3:
-            await s3.put_object(
-                Bucket=self.bucket_name,
-                Key=file_key,
-                Body=body,
-                ContentType=content_type,
-            )
+
+        async def _put():
+            async with self.get_client() as s3:
+                await s3.put_object(
+                    Bucket=self.bucket_name,
+                    Key=file_key,
+                    Body=body,
+                    ContentType=content_type,
+                )
+
+        await _run_with_retry(_put)
         logger.info("Uploaded file to Cloudflare R2: key='%s' in bucket='%s'", file_key, self.bucket_name)
         return file_key
 
     async def download_file(self, file_key: str) -> bytes:
-        """Downloads a file's raw bytes from Cloudflare R2.
+        """Downloads a file's raw bytes from Cloudflare R2 with automated retry.
 
         Args:
             file_key: Storage key of the object to retrieve.
@@ -98,13 +155,16 @@ class R2StorageService:
                 return self._dev_storage[file_key][0]
             raise FileNotFoundError(f"File key '{file_key}' not found in development storage.")
 
-        async with self.get_client() as s3:
-            response = await s3.get_object(Bucket=self.bucket_name, Key=file_key)
-            async with response["Body"] as stream:
-                return await stream.read()
+        async def _get() -> bytes:
+            async with self.get_client() as s3:
+                response = await s3.get_object(Bucket=self.bucket_name, Key=file_key)
+                async with response["Body"] as stream:
+                    return await stream.read()
+
+        return await _run_with_retry(_get)
 
     async def delete_file(self, file_key: str) -> bool:
-        """Deletes an object from Cloudflare R2.
+        """Deletes an object from Cloudflare R2 with automated retry.
 
         Args:
             file_key: Storage key of the object to delete.
@@ -116,20 +176,42 @@ class R2StorageService:
             self._dev_storage.pop(file_key, None)
             return True
 
-        async with self.get_client() as s3:
-            await s3.delete_object(Bucket=self.bucket_name, Key=file_key)
+        async def _delete():
+            async with self.get_client() as s3:
+                await s3.delete_object(Bucket=self.bucket_name, Key=file_key)
+
+        await _run_with_retry(_delete)
         logger.info("Deleted file from Cloudflare R2: key='%s'", file_key)
         return True
 
-    async def generate_presigned_url(self, file_key: str, expires_in: int = 3600) -> str:
-        """Generates a presigned GET URL for downloading private R2 files."""
+    async def generate_presigned_url(
+        self,
+        file_key: str,
+        expires_in: int = 3600,
+        inline: bool = False,
+        filename: str | None = None,
+    ) -> str:
+        """Generates a presigned GET URL for downloading or viewing private R2 files.
+
+        Args:
+            file_key: Storage key in bucket.
+            expires_in: Lifetime of the signed URL in seconds.
+            inline: If True, sets ResponseContentDisposition to 'inline' for browser viewing/citations.
+            filename: Optional clean filename for Content-Disposition header.
+        """
         if not self.is_configured:
-            return f"/api/v1/storage/dev-download/{file_key}"
+            params = "?inline=true" if inline else ""
+            return f"/api/v1/storage/dev-download/{file_key}{params}"
+
+        params: dict[str, Any] = {"Bucket": self.bucket_name, "Key": file_key}
+        if inline:
+            display_name = filename or file_key.split("/")[-1]
+            params["ResponseContentDisposition"] = f'inline; filename="{display_name}"'
 
         async with self.get_client() as s3:
             url = await s3.generate_presigned_url(
                 "get_object",
-                Params={"Bucket": self.bucket_name, "Key": file_key},
+                Params=params,
                 ExpiresIn=expires_in,
             )
             return url
