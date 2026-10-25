@@ -17,7 +17,7 @@ from app.services.thread_service import (
     get_or_create_user,
     get_thread_assets_with_signed_urls,
 )
-from app.services.tools import AGENT_TOOLS, hybrid_document_search
+from app.services.tools import AGENT_TOOLS, make_search_tool
 
 __all__ = [
     "AgentState",
@@ -36,6 +36,6 @@ __all__ = [
     "add_thread_asset",
     "get_thread_assets_with_signed_urls",
     "format_thread_assets_context",
-    "hybrid_document_search",
+    "make_search_tool",
     "AGENT_TOOLS",
 ]

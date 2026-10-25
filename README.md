@@ -77,7 +77,7 @@ Base-Agent/
 │       ├── agent.py            # LangGraph agent topology (retrieve -> chat)
 │       ├── memory.py           # PostgreSQL checkpointer (AsyncPostgresSaver)
 │       ├── thread_service.py   # Thread metadata, root user, and asset management
-│       ├── tools.py            # LangChain agent tools (hybrid_document_search)
+│       ├── tools.py            # LangChain agent tool factory (make_search_tool, user-scoped hybrid search)
 │       ├── document_loader.py  # Canonical Microsoft MarkItDown parser
 │       ├── document_processor.py # Asynchronous RAG ingestion pipeline (BackgroundTasks / Taskiq)
 │       ├── text_splitter.py    # Structure-aware token chunking
@@ -235,8 +235,10 @@ uv run python -m scripts.test_lightrag_live
 - [x] RAG-augmented LangGraph conversational agent with source citations (`use_rag=True`)
 - [x] Pluggable RAG architecture (`KnowledgeProvider` protocol, registry, workspace isolation, factory)
 - [x] LightRAG integration with `PGTableGraphStorage` (native graph tables on Neon, zero Apache AGE dependency)
+- [x] Security hardening: user-scoped tool factory (`make_search_tool`), path-traversal guards, R2 key authorization, sanitized `Content-Disposition` headers, error messages stripped of internal details
+- [x] Bug fixes: `user_id` default consistency across all endpoints (`root`), correct pagination `total` count via `COUNT(*)` subquery, atomic-safe cascade delete with R2 failure guard
+- [x] Performance: PGVector and StateGraph singleton caches, parallel `asyncio.gather` dense+sparse retrieval, thread-asset 10 MB upload cap with chunked streaming read
 - [ ] Clerk authentication middleware
 - [ ] ParadeDB `pg_search` BM25 extension migration (see `TODO.md`)
 - [ ] Agent Builder dynamic configuration API
 - [ ] Next.js frontend
-

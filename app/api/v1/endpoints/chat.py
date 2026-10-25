@@ -32,6 +32,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/chat", tags=["Chat & Memory"])
 
+# Maximum allowed thread-asset upload size: 10 MB
+MAX_ASSET_SIZE_BYTES = 10 * 1024 * 1024
+
 
 def _map_message_to_schema(msg: BaseMessage) -> ChatMessage:
     """Maps a LangChain BaseMessage to ChatMessage response model."""
@@ -109,7 +112,7 @@ async def chat(
         logger.error("Chat turn failed for thread_id=%s: %s", request.thread_id, exc, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Chat execution failed: {exc}",
+            detail="Chat execution failed. Please try again.",
         )
 
 
@@ -175,7 +178,25 @@ async def upload_thread_asset(
     db: AsyncSession = Depends(get_db),
 ) -> ThreadAssetUploadResponse:
     """Uploads an image or document asset scoped directly to a conversation session."""
-    contents = await file.read()
+    # Stream the upload in chunks and enforce size limit before sending to R2,
+    # avoiding reading an arbitrarily large file into memory all at once.
+    chunks: list[bytes] = []
+    total_read = 0
+    chunk_size = 64 * 1024  # 64 KB read window
+
+    while True:
+        chunk = await file.read(chunk_size)
+        if not chunk:
+            break
+        total_read += len(chunk)
+        if total_read > MAX_ASSET_SIZE_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=f"Asset exceeds maximum allowed size of {MAX_ASSET_SIZE_BYTES // (1024 * 1024)} MB.",
+            )
+        chunks.append(chunk)
+
+    contents = b"".join(chunks)
     if not contents:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Uploaded file is empty.")
 
@@ -194,7 +215,7 @@ async def upload_thread_asset(
         logger.error("Failed to upload thread asset to R2: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Storage upload failed: {exc}",
+            detail="Storage upload failed. Please try again.",
         )
 
     asset = await add_thread_asset(
@@ -283,7 +304,7 @@ async def get_history(thread_id: str) -> ThreadHistoryResponse:
         logger.error("Failed to fetch history for thread_id=%s: %s", thread_id, exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve thread history: {exc}",
+            detail="Failed to retrieve thread history. Please try again.",
         )
 
 

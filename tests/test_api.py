@@ -195,14 +195,17 @@ def test_upload_and_list_thread_assets():
 
 
 import pytest
-from app.services.tools import hybrid_document_search
+from app.services.tools import make_search_tool
 
 
 @pytest.mark.asyncio
 async def test_hybrid_document_search_tool():
+    # make_search_tool returns a user-scoped tool; user_id is NOT exposed to the LLM
+    tool = make_search_tool("root")
+    assert "user_id" not in tool.args, "user_id must NOT be an LLM-visible argument"
     with patch("app.services.tools.hybrid_search", new_callable=AsyncMock) as mock_search:
         mock_search.return_value = []
-        result = await hybrid_document_search.ainvoke({"query": "What is LangGraph?"})
+        result = await tool.ainvoke({"query": "What is LangGraph?"})
         assert "No relevant documents found" in result
 
 

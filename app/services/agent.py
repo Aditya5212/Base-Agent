@@ -247,10 +247,27 @@ def build_agent_graph() -> StateGraph:
     return builder
 
 
+# ---------------------------------------------------------------------------
+# Module-level graph cache: compile the StateGraph once per checkpointer
+# identity and reuse it for all subsequent requests.  LangGraph's compiled
+# graph is stateless between invocations (all state lives in the checkpointer),
+# so sharing a single compiled instance across concurrent requests is safe.
+# ---------------------------------------------------------------------------
+_graph_cache: dict[int, CompiledStateGraph] = {}
+
+
 def get_agent_graph(checkpointer: BaseCheckpointSaver | None = None) -> CompiledStateGraph:
-    """Compiles the StateGraph with the provided or default checkpointer."""
-    builder = build_agent_graph()
-    return builder.compile(checkpointer=checkpointer)
+    """Returns a cached compiled StateGraph for the given checkpointer.
+
+    The graph is compiled on the first call and reused on all subsequent calls
+    with the same checkpointer object, avoiding redundant compilation overhead.
+    """
+    cache_key = id(checkpointer)  # None maps to id(None), unique per process
+    if cache_key not in _graph_cache:
+        builder = build_agent_graph()
+        _graph_cache[cache_key] = builder.compile(checkpointer=checkpointer)
+        logger.debug("StateGraph compiled and cached (checkpointer id=%d)", cache_key)
+    return _graph_cache[cache_key]
 
 
 async def _build_human_message(

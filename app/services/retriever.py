@@ -6,6 +6,7 @@ Implements the production standard:
 - Fusion: Reciprocal Rank Fusion (RRF) combining dense and sparse rank scores
 """
 
+import asyncio
 import hashlib
 import logging
 from typing import Any
@@ -191,18 +192,20 @@ async def hybrid_search(
     rag_cfg = config or get_rag_config()
     target_collection = collection_name or settings.RAG_COLLECTION_NAME
 
-    # Execute dense and sparse retrieval
-    dense_candidates = await _dense_search(
-        query=query,
-        top_k=rag_cfg.top_k_dense,
-        collection_name=target_collection,
-        filter_dict=filter_dict,
-    )
-    sparse_candidates = await _sparse_search(
-        query=query,
-        top_k=rag_cfg.top_k_sparse,
-        collection_name=target_collection,
-        filter_dict=filter_dict,
+    # Execute dense and sparse retrieval in parallel to minimise wall-clock latency
+    dense_candidates, sparse_candidates = await asyncio.gather(
+        _dense_search(
+            query=query,
+            top_k=rag_cfg.top_k_dense,
+            collection_name=target_collection,
+            filter_dict=filter_dict,
+        ),
+        _sparse_search(
+            query=query,
+            top_k=rag_cfg.top_k_sparse,
+            collection_name=target_collection,
+            filter_dict=filter_dict,
+        ),
     )
 
     # Fuse candidate lists

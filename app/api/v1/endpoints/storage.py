@@ -103,7 +103,7 @@ async def get_storage_stats(
         logger.error("Failed to fetch storage stats: %s", exc, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to fetch storage metrics: {exc}",
+            detail="Failed to fetch storage metrics. Please try again.",
         )
 
 
@@ -153,7 +153,7 @@ async def list_storage_objects(
         logger.error("Failed to list storage objects: %s", exc, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to list objects: {exc}",
+            detail="Failed to list objects. Please try again.",
         )
 
 
@@ -215,7 +215,7 @@ async def upload_storage_object(
         logger.error("Failed to upload object '%s': %s", storage_key, exc, exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Upload failed: {exc}",
+            detail="Upload failed. Please try again.",
         )
 
 
@@ -250,7 +250,7 @@ async def get_storage_object_metadata(
         logger.error("Failed to fetch metadata for '%s': %s", clean_key, exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to retrieve object metadata: {exc}",
+            detail="Failed to retrieve object metadata. Please try again.",
         )
 
 
@@ -274,11 +274,13 @@ async def download_storage_object(
         file_name = clean_key.split("/")[-1]
         disposition = "inline" if inline else "attachment"
 
+        # Sanitize filename: strip quotes/newlines that could break the header
+        safe_file_name = file_name.replace('"', '').replace('\n', '').replace('\r', '')
         return StreamingResponse(
             io.BytesIO(data),
             media_type=content_type,
             headers={
-                "Content-Disposition": f'{disposition}; filename="{file_name}"',
+                "Content-Disposition": f'{disposition}; filename="{safe_file_name}"',
                 "Content-Length": str(len(data)),
             },
         )
@@ -288,7 +290,7 @@ async def download_storage_object(
         logger.error("Download failed for '%s': %s", clean_key, exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Download failed: {exc}",
+            detail="Download failed. Please try again.",
         )
 
 
@@ -316,7 +318,7 @@ async def delete_storage_object(
         logger.error("Failed to delete object '%s': %s", clean_key, exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Deletion failed: {exc}",
+            detail="Deletion failed. Please try again.",
         )
 
 
@@ -356,5 +358,5 @@ async def create_presigned_url(
         logger.error("Presigned URL generation failed: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to generate presigned URL: {exc}",
+            detail="Failed to generate presigned URL. Please try again.",
         )

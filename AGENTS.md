@@ -64,7 +64,7 @@ Base-Agent/
 │       ├── agent.py            # LangGraph agent topology (retrieve -> chat) & state schema
 │       ├── memory.py           # PostgreSQL checkpointer service (AsyncPostgresSaver)
 │       ├── thread_service.py   # Thread persistence, root user, and asset management
-│       ├── tools.py            # LangChain agent tools (hybrid_document_search)
+│       ├── tools.py            # LangChain agent tool factory (make_search_tool, user-scoped hybrid search)
 │       ├── document_loader.py  # Canonical Microsoft MarkItDown parser
 │       ├── document_processor.py # Asynchronous RAG ingestion pipeline (BackgroundTasks / Taskiq)
 │       ├── text_splitter.py    # Structure-aware token chunking (tiktoken cl100k_base)
@@ -200,7 +200,7 @@ Combines dense semantic vector search and sparse keyword search:
 - **Presets**: `high_precision` (200 tokens), `balanced` (500 tokens), `high_recall` (1000 tokens).
 
 ### 2. Knowledge Graph Provider (`lightrag`)
-For zero-hallucination factual precision and multi-hop relationship reasoning, Base Agent integrates **LightRAG** with native PostgreSQL tables:
+For high-precision factual retrieval and multi-hop relationship reasoning, Base Agent integrates **LightRAG** with native PostgreSQL tables:
 - **Storage Backend (`PGTableGraphStorage`)**: Plain indexed PostgreSQL tables (`lightrag_graph_nodes`, `lightrag_graph_edges`, `lightrag_doc_full`, `lightrag_doc_chunks`, `lightrag_doc_status`) with JSONB properties and B-tree indexes. Requires **zero Apache AGE extension**, enabling seamless deployment on managed cloud PostgreSQL like **Neon**.
 - **Context-Only Mode (`only_need_context=True`)**: Extracts and returns graph entities, relations, and relevant chunks without triggering duplicate LLM answer generation, letting the LangGraph conversational agent own generation and streaming.
 - **Modes Supported**: `mix` (integrated local + global graph reasoning), `local` (neighborhood entities), `global` (thematic relations), `hybrid`, and `naive` (pure vector).
@@ -226,7 +226,11 @@ Tenant boundaries are enforced at the storage level using LightRAG's native `wor
 7. **Chunking**: Structure-aware splitting using `MarkdownHeaderTextSplitter` + `RecursiveCharacterTextSplitter.from_tiktoken_encoder` (`cl100k_base`), preserving section hierarchy.
 8. **Embedding & Indexing**: Vectors indexed into `langchain_pg_embedding` in PostgreSQL with HNSW cosine index and PostgreSQL FTS GIN index. Status updated to `INDEXED` or `FAILED`.
 9. **Stuck-Document Advisory Lock Sweeper**: Background sweeper running every 5 minutes and on startup uses a PostgreSQL advisory lock (`pg_try_advisory_lock(847291)`) to recover documents stuck in `PARSING`. Documents are retried up to 3 times before transitioning to `FAILED` with actionable guidance for 1-click re-indexing.
-10. **Cascade Delete & Re-index**: When a document is deleted via `DELETE /api/v1/documents/{document_id}` or re-indexed via `POST /api/v1/documents/{document_id}/reindex`, R2 storage, PGVector embeddings, and LightRAG knowledge graph entities are purged atomically.
+10. **Cascade Delete (Atomic-Safe)**: When a document is deleted via `DELETE /api/v1/documents/{document_id}` or re-indexed via `POST /api/v1/documents/{document_id}/reindex`, the following steps execute in order:
+    1. PGVector chunks purged (reversible via re-index).
+    2. LightRAG knowledge graph entities purged (best-effort, logged).
+    3. R2 raw file deleted — failure raises HTTP 500 and aborts the DB delete to prevent orphan rows.
+    4. Database record deleted (cascades to `document_chunks`).
 
 ---
 
@@ -301,3 +305,5 @@ Dynamic agent workflows defined through configuration API:
 4. **No In-Memory Production Traps**: Multi-worker persistence via PostgreSQL native FTS and PGVector.
 5. **Cross-Platform Compatibility**: Automatic selector loop policy for Windows and standard selector on POSIX.
 6. **Async First**: Fully async database queries, network calls, and agent invocations for maximum throughput.
+7. **Singleton Caching**: PGVector instance and compiled StateGraph are cached per collection/checkpointer at module level; hybrid dense+sparse searches run in parallel via `asyncio.gather` to minimise RAG latency.
+8. **User-Scoped Tool Security**: Agent tools never expose `user_id` as an LLM-callable argument. `make_search_tool(user_id)` closes over the caller-supplied identity so the model cannot escalate to another tenant's documents.

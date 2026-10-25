@@ -50,7 +50,7 @@ MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024
     description="Returns aggregated metrics for user's knowledge base including document counts, chunk counts, and storage usage.",
 )
 async def get_knowledge_base_stats(
-    user_id: str = "default_user",
+    user_id: str = "root",
     db: AsyncSession = Depends(get_db),
 ) -> KnowledgeBaseStatsResponse:
     """Calculates overall knowledge base metrics for the specified user."""
@@ -92,7 +92,7 @@ async def get_knowledge_base_stats(
 async def upload_document(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="Document file (PDF, DOCX, XLSX, HTML, TXT, MD)"),
-    user_id: str = Form(default="default_user", description="Owner user ID"),
+    user_id: str = Form(default="root", description="Owner user ID"),
     preset: str = Form(default="balanced", description="Chunking preset (high_precision, balanced, high_recall)"),
     db: AsyncSession = Depends(get_db),
 ) -> DocumentUploadResponse:
@@ -128,7 +128,7 @@ async def upload_document(
         logger.error("Failed to upload file to Cloudflare R2: %s", exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Storage upload failed: {exc}",
+            detail="Storage upload failed. Please try again.",
         )
 
     # Step 2: Record document in PostgreSQL with PARSING status
@@ -190,7 +190,7 @@ async def upload_document(
     description="Retrieves documents uploaded by a user with status, search filter, and presigned download links.",
 )
 async def list_documents(
-    user_id: str = "default_user",
+    user_id: str = "root",
     search: str | None = Query(default=None, description="Optional filename filter"),
     status_filter: str | None = Query(default=None, description="Filter by status (INDEXED, FAILED, PARSING)"),
     limit: int = Query(default=100, ge=1, le=500),
@@ -198,15 +198,20 @@ async def list_documents(
     db: AsyncSession = Depends(get_db),
 ) -> DocumentListResponse:
     """Returns document records for a given user with optional search and status filters."""
-    stmt = select(Document).where(Document.user_id == user_id)
-
+    # Build base filter predicate (reused for COUNT and paginated fetch)
+    base_stmt = select(Document).where(Document.user_id == user_id)
     if search:
-        stmt = stmt.where(Document.file_name.ilike(f"%{search}%"))
+        base_stmt = base_stmt.where(Document.file_name.ilike(f"%{search}%"))
     if status_filter:
-        stmt = stmt.where(Document.status == status_filter.upper())
+        base_stmt = base_stmt.where(Document.status == status_filter.upper())
 
-    stmt = stmt.order_by(Document.created_at.desc()).limit(limit).offset(offset)
-    result = await db.execute(stmt)
+    # Run total COUNT before applying pagination
+    count_stmt = select(func.count()).select_from(base_stmt.subquery())
+    total: int = (await db.execute(count_stmt)).scalar_one() or 0
+
+    # Paginated fetch
+    paged_stmt = base_stmt.order_by(Document.created_at.desc()).limit(limit).offset(offset)
+    result = await db.execute(paged_stmt)
     documents = result.scalars().all()
 
     items: list[DocumentItemResponse] = []
@@ -228,7 +233,7 @@ async def list_documents(
             )
         )
 
-    return DocumentListResponse(total=len(items), documents=items)
+    return DocumentListResponse(total=total, documents=items)
 
 
 @router.get(
@@ -239,7 +244,7 @@ async def list_documents(
 )
 async def get_document_details(
     document_id: str,
-    user_id: str = "default_user",
+    user_id: str = "root",
     db: AsyncSession = Depends(get_db),
 ) -> DocumentDetailResponse:
     """Fetches details for a single document."""
@@ -287,7 +292,7 @@ async def get_document_details(
 )
 async def get_document_chunks(
     document_id: str,
-    user_id: str = "default_user",
+    user_id: str = "root",
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db),
@@ -353,7 +358,7 @@ async def reindex_document(
     document_id: str,
     request: ReindexDocumentRequest,
     background_tasks: BackgroundTasks,
-    user_id: str = "default_user",
+    user_id: str = "root",
     db: AsyncSession = Depends(get_db),
 ) -> ReindexDocumentResponse:
     """Re-chunks and re-indexes an existing document from its R2 stored raw content in the background."""
@@ -405,7 +410,7 @@ async def reindex_document(
 )
 async def download_document(
     document_id: str,
-    user_id: str = "default_user",
+    user_id: str = "root",
     inline: bool = Query(default=False, description="Display inline in browser if true, otherwise trigger download"),
     db: AsyncSession = Depends(get_db),
 ):
@@ -431,11 +436,13 @@ async def download_document(
 
     try:
         raw_bytes = await r2_storage_service.download_file(doc.r2_key)
+        # Sanitize filename: strip quotes/newlines that could break the header
+        safe_filename = doc.file_name.replace('"', '').replace('\n', '').replace('\r', '')
         return StreamingResponse(
             io.BytesIO(raw_bytes),
             media_type=doc.mime_type,
             headers={
-                "Content-Disposition": f'{disposition_type}; filename="{doc.file_name}"',
+                "Content-Disposition": f'{disposition_type}; filename="{safe_filename}"',
                 "Content-Length": str(len(raw_bytes)),
             },
         )
@@ -443,7 +450,7 @@ async def download_document(
         logger.error("Download failed for doc %s: %s", document_id, exc)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to download document from storage: {exc}",
+            detail="Failed to download document from storage. Please try again.",
         )
 
 
@@ -455,10 +462,17 @@ async def download_document(
 )
 async def delete_document(
     document_id: str,
-    user_id: str = "default_user",
+    user_id: str = "root",
     db: AsyncSession = Depends(get_db),
 ) -> DeleteDocumentResponse:
-    """Cascade deletes document from storage and database."""
+    """Cascade deletes document from storage and database.
+
+    Deletion order (atomic-safe):
+      1. Purge vector-store chunks (reversible via re-index).
+      2. Purge LightRAG knowledge-graph entries (best-effort, logged).
+      3. Delete raw file from Cloudflare R2 — raises 500 on failure to prevent orphan rows.
+      4. Delete database record inside the same transaction (cascades to document_chunks).
+    """
     try:
         parsed_id = uuid.UUID(document_id)
     except ValueError:
@@ -477,33 +491,47 @@ async def delete_document(
             detail="Access denied: You do not have permission to delete this document.",
         )
 
-    # 1. Purge chunks from vector store
-    chunks_removed = await delete_documents_by_metadata("document_id", str(doc.id))
+    # Snapshot fields before any mutation so we can still reference them after deletion
+    doc_id_str = str(doc.id)
+    doc_file_name = doc.file_name
+    doc_r2_key = doc.r2_key
+    doc_user_id = doc.user_id
 
-    # 1.5. Purge knowledge graph entries if LightRAG is active
+    # Step 1: Purge vector-store chunks (reversible — re-index restores these)
+    chunks_removed = await delete_documents_by_metadata("document_id", doc_id_str)
+
+    # Step 2: Purge LightRAG knowledge-graph entries (best-effort; not fatal)
     try:
         from app.core.rag.factory import get_provider
         from app.core.rag.workspace import user_workspace
-        lightrag_provider = await get_provider("lightrag", user_workspace(doc.user_id))
-        await lightrag_provider.delete_document(str(doc.id))
+        lightrag_provider = await get_provider("lightrag", user_workspace(doc_user_id))
+        await lightrag_provider.delete_document(doc_id_str)
     except Exception as g_exc:
-        logger.debug("LightRAG knowledge graph purge skipped/failed for doc %s: %s", doc.id, g_exc)
+        logger.debug("LightRAG knowledge graph purge skipped/failed for doc %s: %s", doc_id_str, g_exc)
 
-    # 2. Delete raw object from Cloudflare R2
+    # Step 3: Delete raw object from Cloudflare R2 — MUST succeed before we touch the DB row.
+    # If this fails the DB record is still intact and the operator can retry or clean up R2 manually.
     try:
-        await r2_storage_service.delete_file(doc.r2_key)
+        await r2_storage_service.delete_file(doc_r2_key)
     except Exception as exc:
-        logger.warning("Failed to delete R2 object '%s': %s", doc.r2_key, exc)
+        logger.error(
+            "Failed to delete R2 object '%s' for document %s; aborting DB deletion to prevent orphan row: %s",
+            doc_r2_key, doc_id_str, exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Storage deletion failed — database record was NOT removed to prevent data loss. Retry or contact support.",
+        )
 
-    # 3. Delete database record (cascades to document_chunks)
+    # Step 4: Delete database record (cascades to document_chunks)
     await db.delete(doc)
     await db.commit()
 
     return DeleteDocumentResponse(
-        id=str(doc.id),
+        id=doc_id_str,
         deleted=True,
         chunks_removed=chunks_removed,
-        message=f"Document '{doc.file_name}' and all associated vector chunks were successfully deleted.",
+        message=f"Document '{doc_file_name}' and all associated vector chunks were successfully deleted.",
     )
 
 

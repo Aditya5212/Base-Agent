@@ -18,25 +18,41 @@ from app.core.embedding import get_embeddings
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Module-level singleton cache: one PGVector instance per collection name.
+# PGVector holds no per-request state — it wraps the shared async SQLAlchemy
+# engine — so reusing a cached instance across requests is safe and avoids the
+# overhead of reconstructing the object (embedding model init, JSONB config,
+# etc.) on every search call.
+# ---------------------------------------------------------------------------
+_vector_store_cache: dict[str, PGVector] = {}
+
 
 def get_vector_store(collection_name: str | None = None) -> PGVector:
-    """Returns a configured asynchronous PGVector instance.
+    """Returns a cached asynchronous PGVector instance for the given collection.
+
+    The first call for a given collection name constructs and caches the
+    instance; subsequent calls return the cached object instantly.
 
     Args:
         collection_name: Optional collection name override (defaults to settings.RAG_COLLECTION_NAME).
     """
     target_collection = collection_name or settings.RAG_COLLECTION_NAME
-    embeddings = get_embeddings()
 
-    return PGVector(
-        embeddings=embeddings,
-        collection_name=target_collection,
-        connection=engine,
-        async_mode=True,
-        embedding_length=settings.EMBEDDING_DIMENSIONS,
-        use_jsonb=True,
-        create_extension=True,
-    )
+    if target_collection not in _vector_store_cache:
+        embeddings = get_embeddings()
+        _vector_store_cache[target_collection] = PGVector(
+            embeddings=embeddings,
+            collection_name=target_collection,
+            connection=engine,
+            async_mode=True,
+            embedding_length=settings.EMBEDDING_DIMENSIONS,
+            use_jsonb=True,
+            create_extension=True,
+        )
+        logger.debug("PGVector instance created and cached for collection '%s'", target_collection)
+
+    return _vector_store_cache[target_collection]
 
 
 def get_vector_store_retriever(
@@ -58,7 +74,7 @@ async def setup_vector_store() -> None:
     """Ensures HNSW and GIN indexes exist on the underlying langchain_pg_embedding table."""
     try:
         # Trigger table initialization
-        store = get_vector_store()
+        get_vector_store()
         # Ping collection creation if not yet present
         async with engine.begin() as conn:
             # Create extension if not present
