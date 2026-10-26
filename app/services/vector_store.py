@@ -73,9 +73,9 @@ def get_vector_store_retriever(
 async def setup_vector_store() -> None:
     """Ensures HNSW and GIN indexes exist on the underlying langchain_pg_embedding table."""
     try:
-        # Trigger table initialization
-        get_vector_store()
-        # Ping collection creation if not yet present
+        # PGVector initializes lazily in async mode; create extension, tables and
+        # collection now so the index DDL below works on a fresh database.
+        await get_vector_store().acreate_collection()
         async with engine.begin() as conn:
             # Create extension if not present
             await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector;"))

@@ -10,6 +10,7 @@ from typing import Any
 
 from langchain_core.messages import BaseMessage
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from app.core.config import settings
@@ -31,6 +32,9 @@ async def get_checkpointer_pool() -> AsyncConnectionPool:
             max_size=settings.DATABASE_POOL_SIZE,
             min_size=1,
             open=False,
+            # Required by AsyncPostgresSaver: setup() runs CREATE INDEX CONCURRENTLY,
+            # which fails inside a transaction block on a fresh database.
+            kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
         )
         await _pool.open()
     return _pool

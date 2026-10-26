@@ -1,0 +1,147 @@
+"""Storage (Admin): raw object storage browser over the /storage endpoints."""
+
+from __future__ import annotations
+
+import streamlit as st
+
+from common import call, fmt_bytes, fmt_time, get_client
+
+client = get_client()
+ss = st.session_state
+ss.setdefault("st_tokens", [None])  # continuation tokens per page; index = page number
+ss.setdefault("st_selected", None)
+ss.setdefault("st_download", None)
+
+st.title("🗄️ Storage (Admin)")
+if ss.role not in ("root", "admin"):
+    st.warning("These endpoints require the **root** or **admin** role; expect HTTP 403 with the current identity.")
+
+stats = call(client.get_storage_stats)
+if stats:
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Objects", stats["total_files"])
+    c2.metric("Total size", stats["formatted_storage"])
+    c3.metric("Bucket", stats["bucket_name"] or "—")
+    c4.metric("Backend", "Cloudflare R2" if stats["configured"] else "Dev in-memory")
+    if not stats["configured"]:
+        st.info(
+            "R2 credentials are not set, so the API uses per-process in-memory storage. "
+            "Files vanish on restart and a separate Taskiq worker cannot see them.",
+            icon="ℹ️",
+        )
+
+browse_tab, upload_tab, presign_tab = st.tabs(["Browse", "Upload", "Presigned URL"])
+
+with browse_tab:
+    b1, b2 = st.columns([3, 1])
+    prefix = b1.text_input("Prefix", placeholder="documents/, threads/, users/root/")
+    max_keys = b2.selectbox("Page size", [25, 50, 100, 250], index=2)
+    if (prefix, max_keys) != ss.get("st_query"):
+        ss.st_query = (prefix, max_keys)
+        ss.st_tokens = [None]
+    page_index = len(ss.st_tokens) - 1
+
+    listing = call(client.list_objects, prefix=prefix, max_keys=max_keys, continuation_token=ss.st_tokens[-1])
+    if listing:
+        objects = listing["objects"]
+        st.caption(f"Page {page_index + 1} · {listing['total_count']} object(s) on this page")
+        if objects:
+            event = st.dataframe(
+                [
+                    {
+                        "Key": o["key"],
+                        "Size": o["formatted_size"],
+                        "Modified": fmt_time(o.get("last_modified")),
+                        "ETag": (o.get("etag") or "").strip('"'),
+                    }
+                    for o in objects
+                ],
+                hide_index=True,
+                width="stretch",
+                on_select="rerun",
+                selection_mode="single-row",
+                key="st_table",
+            )
+            if event.selection.rows:
+                ss.st_selected = objects[event.selection.rows[0]]["key"]
+        else:
+            st.info("No objects under this prefix.", icon="📭")
+
+        n1, n2, _ = st.columns([1, 1, 4])
+        if n1.button("◀ Previous", disabled=page_index == 0):
+            ss.st_tokens.pop()
+            st.rerun()
+        if n2.button("Next ▶", disabled=not listing.get("is_truncated")):
+            ss.st_tokens.append(listing.get("next_continuation_token"))
+            st.rerun()
+
+    if ss.st_selected:
+        key = ss.st_selected
+        st.divider()
+        st.subheader("Object details")
+        meta = call(client.get_object_metadata, key)
+        if meta:
+            st.markdown(f"`{meta['key']}`")
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Size", meta["formatted_size"])
+            m2.metric("Content type", meta["content_type"])
+            m3.metric("Modified", fmt_time(meta.get("last_modified")))
+            if meta.get("presigned_url", "").startswith("http"):
+                st.link_button("Open presigned URL", meta["presigned_url"])
+
+            d1, d2 = st.columns(2)
+            with d1.container(border=True):
+                if st.button("Fetch file", key="st_fetch", width="stretch"):
+                    downloaded = call(client.download_object, key)
+                    if downloaded:
+                        ss.st_download = (key, downloaded)
+                if ss.st_download and ss.st_download[0] == key:
+                    f = ss.st_download[1]
+                    st.download_button(
+                        f"Save {f.filename} ({fmt_bytes(len(f.content))})",
+                        data=f.content,
+                        file_name=f.filename,
+                        mime=f.content_type,
+                        width="stretch",
+                    )
+            with d2.container(border=True):
+                sure = st.checkbox("Confirm permanent delete", key="st_del_ok")
+                if st.button("Delete object", type="primary", disabled=not sure, width="stretch"):
+                    result = call(client.delete_object, key)
+                    if result:
+                        st.toast(result["message"], icon="🗑️")
+                        ss.st_selected = None
+                        st.rerun()
+
+with upload_tab:
+    st.caption("Stored under `users/{user_id}/{prefix}/{uuid}_{filename}` (key is generated by the server).")
+    with st.form("st_upload", clear_on_submit=True):
+        up_prefix = st.text_input("Prefix", value="uploads")
+        up_file = st.file_uploader("File (max 50 MB)")
+        send = st.form_submit_button("Upload", type="primary")
+    if send and up_file:
+        result = call(
+            client.upload_object,
+            up_file.name,
+            up_file.getvalue(),
+            up_file.type or "application/octet-stream",
+            up_prefix,
+        )
+        if result:
+            st.success(f"Stored as `{result['key']}` ({result['formatted_size']})")
+            if result.get("presigned_url", "").startswith("http"):
+                st.link_button("Open", result["presigned_url"])
+
+with presign_tab:
+    with st.form("st_presign"):
+        file_key = st.text_input("Object key", value=ss.st_selected or "")
+        p1, p2, p3 = st.columns(3)
+        operation = p1.selectbox("Operation", ["get_object", "put_object"])
+        content_type = p2.text_input("Content type (PUT)", value="application/octet-stream")
+        expires = p3.number_input("Expires in (s)", min_value=60, max_value=86400, value=3600, step=60)
+        make = st.form_submit_button("Generate", type="primary")
+    if make and file_key.strip():
+        result = call(client.create_presigned_url, file_key.strip(), operation, content_type, int(expires))
+        if result:
+            st.code(result["url"], language=None)
+            st.caption(f"{result['operation']} · valid for {result['expires_in']} s")
