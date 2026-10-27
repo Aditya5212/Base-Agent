@@ -29,6 +29,10 @@ class ChatRequest(BaseModel):
         default="balanced",
         description="RAG precision/recall preset: high_precision, balanced, high_recall",
     )
+    agent_id: str | None = Field(
+        default=None,
+        description="Optional agent UUID. If omitted, the user's default agent is resolved.",
+    )
 
 
 class ChatMessage(BaseModel):
@@ -44,6 +48,7 @@ class ChatResponse(BaseModel):
 
     thread_id: str = Field(..., description="Thread ID of the conversation")
     user_id: str = Field(..., description="User ID associated with the conversation")
+    agent_id: str | None = Field(default=None, description="Agent ID configured for this conversation turn")
     response: str = Field(..., description="Agent response message")
     model: str = Field(..., description="Model version used for generating the response")
     history_length: int = Field(..., description="Total number of messages currently stored in thread state")
@@ -55,6 +60,7 @@ class ChatResponse(BaseModel):
         default=None,
         description="Uploaded assets (images, documents) associated with this thread with fresh signed URLs",
     )
+
 
 
 class ThreadAssetItem(BaseModel):
@@ -157,6 +163,7 @@ class StreamEvent(BaseModel):
         model: str,
         history_length: int,
         sources: list[dict[str, Any]] | None = None,
+        agent_id: str | None = None,
     ) -> "StreamEvent":
         """Factory for final turn completion event."""
         data: dict[str, Any] = {
@@ -167,6 +174,8 @@ class StreamEvent(BaseModel):
             "model": model,
             "history_length": history_length,
         }
+        if agent_id is not None:
+            data["agent_id"] = agent_id
         if sources is not None:
             data["sources"] = sources
         return cls(event=StreamEventType.END, data=data)

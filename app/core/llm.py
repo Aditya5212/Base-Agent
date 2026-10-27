@@ -67,6 +67,7 @@ def resolve_model_name(name_or_alias: str | None) -> str:
 def get_llm(
     model_name: str | None = None,
     temperature: float | None = None,
+    max_tokens: int | None = None,
     base_url: str | None = None,
     api_key: str | None = None,
     extra_body: dict[str, Any] | None = None,
@@ -76,6 +77,7 @@ def get_llm(
     Args:
         model_name: Model identifier or alias (e.g. 'deepseek-flash' or 'deepseek-v4-pro').
         temperature: Sampling temperature (defaults to settings.DEFAULT_TEMPERATURE).
+        max_tokens: Maximum tokens in generated completion.
         base_url: API endpoint URL (defaults to settings.DEEPSEEK_BASE_URL).
         api_key: DeepSeek API key (defaults to settings.effective_llm_api_key).
         extra_body: Optional extra payload (e.g. thinking mode parameters).
@@ -106,8 +108,12 @@ def get_llm(
         "temperature": resolved_temp,
     }
 
+    if max_tokens is not None:
+        client_kwargs["max_tokens"] = max_tokens
+
     if extra_body:
         client_kwargs["extra_body"] = extra_body
+
 
     logger.debug(
         "Initializing DeepSeek ChatOpenAI [model=%s, base_url=%s, temperature=%s]",

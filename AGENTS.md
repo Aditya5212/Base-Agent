@@ -60,22 +60,30 @@ Base-Agent/
 │   │           ├── health.py   # Health & liveness probes (/health, /ping)
 │   │           ├── chat.py     # Conversation turns, streaming (SSE), & memory deletion
 │   │           ├── documents.py# Document upload, search, and cascade delete
-│   │           └── storage.py  # Admin-only raw Cloudflare R2 object storage operations
+│   │           ├── storage.py  # Admin-only raw Cloudflare R2 object storage operations
+│   │           ├── agents.py   # Agent Builder CRUD, clone & promotion endpoints
+│   │           └── structured_schemas.py # JSON Schema registration & validation endpoints
 │   ├── models/                 # Database persistence models
 │   │   ├── __init__.py
 │   │   ├── base.py             # Declarative Base & UTC TimestampMixin
 │   │   ├── user.py             # User model (root user auto-seeded)
 │   │   ├── thread.py           # Thread & ThreadAsset models
-│   │   └── document.py         # Document & DocumentChunk persistence models
+│   │   ├── document.py         # Document & DocumentChunk persistence models
+│   │   ├── agent.py            # Agent persistence model with JSONB configuration
+│   │   └── structured_schema.py# Structured JSON schema definition model
 │   ├── schemas/                # Request & response Pydantic contracts
 │   │   ├── __init__.py
 │   │   ├── health.py           # Health response models
 │   │   ├── chat.py             # ChatRequest, ChatResponse, StreamEvent, ThreadAssetItem
 │   │   ├── storage.py          # StorageObjectListResponse, PresignedUrlRequest
-│   │   └── document.py         # DocumentUploadResponse, RAGSearchRequest/Response
+│   │   ├── document.py         # DocumentUploadResponse, RAGSearchRequest/Response
+│   │   ├── agent.py            # AgentConfig, AgentCreate, AgentUpdate, AgentResponse
+│   │   └── structured_schema.py# StructuredSchemaCreate, StructuredSchemaResponse
 │   ├── services/               # Business logic & agent workflows
 │   │   ├── __init__.py
 │   │   ├── agent.py            # LangGraph agent topology (retrieve -> chat) & state schema
+│   │   ├── agent_service.py    # Agent CRUD, cloning, default resolution & LRU config cache
+│   │   ├── schema_service.py   # Structured JSON Schema validation and persistence
 │   │   ├── memory.py           # PostgreSQL checkpointer service (AsyncPostgresSaver)
 │   │   ├── thread_service.py   # Thread persistence, root user, and asset management
 │   │   ├── tools.py            # LangChain agent tool factory (make_search_tool, user-scoped hybrid search)
@@ -102,6 +110,8 @@ Base-Agent/
     ├── test_storage_api.py     # Object storage endpoint tests
     ├── test_config.py          # Settings validation & URL normalization tests
     ├── test_agent.py           # Multi-turn memory & thread isolation tests
+    ├── test_agents.py          # AgentConfig validation, Agent CRUD, cloning, LRU cache & isolation
+    ├── test_structured_schemas.py # JSON Schema validation, CRUD & isolation tests
     ├── test_llm.py             # DeepSeek model registry & alias resolution tests
     ├── test_document_loader.py # MarkItDown parser tests
     ├── test_text_splitter.py   # Token chunking & header tracking tests
@@ -304,9 +314,28 @@ Real-time token and reasoning event streaming over HTTP via **Server-Sent Events
 | `POST` | `/api/v1/storage/upload` | Direct Upload | Uploads asset under deterministic user namespace (Root only) |
 | `GET` | `/api/v1/storage/objects/{key}` | Object Details | Metadata, size, content-type, and presigned URL (Root only) |
 | `GET` | `/api/v1/storage/download/{key}` | Download Object | Streams binary file directly from Cloudflare R2 (Root only) |
-| `DELETE` | `/api/v1/storage/objects/{key}` | Delete Object | Deletes object from Cloudflare R2 bucket (Root only) |
 | `POST` | `/api/v1/storage/presigned-url` | Generate Presigned URL | Generates temporary PUT (direct client upload) or GET URL (Root only) |
 
+### Agent Management (`/api/v1/agents`)
+| Method | Path | Summary | Description |
+| ------ | ---- | ------- | ----------- |
+| `GET` | `/api/v1/agents/default` | Default Agent | Returns or auto-provisions user's default assistant |
+| `GET` | `/api/v1/agents` | List Agents | Lists user's agents with pagination and search filter |
+| `POST` | `/api/v1/agents` | Create Agent | Creates a custom agent with validated configuration |
+| `GET` | `/api/v1/agents/{agent_id}` | Get Agent | Retrieves agent configuration and metadata by ID |
+| `PUT` | `/api/v1/agents/{agent_id}` | Update Agent | Updates agent settings, auto-incrementing its version |
+| `POST` | `/api/v1/agents/{agent_id}/clone` | Clone Agent | Clones configuration into a new non-default agent instance |
+| `POST` | `/api/v1/agents/{agent_id}/set-default` | Set Default | Promotes agent to user's default assistant |
+| `DELETE` | `/api/v1/agents/{agent_id}` | Delete Agent | Deletes agent (deletion of default agent rejected) |
+
+### Structured Schema Management (`/api/v1/structured-schemas`)
+| Method | Path | Summary | Description |
+| ------ | ---- | ------- | ----------- |
+| `GET` | `/api/v1/structured-schemas` | List Schemas | Lists user's registered JSON schemas with search |
+| `POST` | `/api/v1/structured-schemas` | Create Schema | Validates against Draft 2020-12 and persists schema |
+| `GET` | `/api/v1/structured-schemas/{schema_id}` | Get Schema | Retrieves schema definition and metadata by ID |
+| `PUT` | `/api/v1/structured-schemas/{schema_id}` | Update Schema | Updates definition, auto-incrementing schema version |
+| `DELETE` | `/api/v1/structured-schemas/{schema_id}` | Delete Schema | Deletes registered schema definition |
 
 ---
 

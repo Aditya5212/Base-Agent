@@ -1,5 +1,11 @@
-"""Pydantic schemas for request and response validation."""
-
+from app.schemas.agent import (
+    AgentCloneRequest,
+    AgentConfig,
+    AgentCreate,
+    AgentListResponse,
+    AgentResponse,
+    AgentUpdate,
+)
 from app.schemas.chat import (
     ChatMessage,
     ChatRequest,
@@ -8,6 +14,12 @@ from app.schemas.chat import (
     ThreadHistoryResponse,
 )
 from app.schemas.health import DatabaseHealth, HealthResponse
+from app.schemas.structured_schema import (
+    StructuredSchemaCreate,
+    StructuredSchemaListResponse,
+    StructuredSchemaResponse,
+    StructuredSchemaUpdate,
+)
 
 __all__ = [
     "HealthResponse",
@@ -17,4 +29,15 @@ __all__ = [
     "ChatResponse",
     "ThreadHistoryResponse",
     "DeleteThreadResponse",
+    "AgentConfig",
+    "AgentCreate",
+    "AgentUpdate",
+    "AgentResponse",
+    "AgentListResponse",
+    "AgentCloneRequest",
+    "StructuredSchemaCreate",
+    "StructuredSchemaUpdate",
+    "StructuredSchemaResponse",
+    "StructuredSchemaListResponse",
 ]
+

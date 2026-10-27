@@ -22,6 +22,7 @@ from app.schemas.chat import (
     ThreadHistoryResponse,
 )
 from app.services.agent import execute_agent, stream_agent_events
+from app.services.agent_service import resolve_agent_for_chat
 from app.services.memory import delete_thread_memory, get_thread_messages
 from app.services.r2_storage import r2_storage_service
 from app.services.thread_service import (
@@ -86,6 +87,14 @@ async def chat(
             is_admin=current_user.is_admin,
         )
 
+        # Resolve target agent and configuration (falls back to user's default agent if omitted)
+        agent, agent_config = await resolve_agent_for_chat(
+            db,
+            user_id=effective_user_id,
+            agent_id=chat_request.agent_id,
+            is_admin=current_user.is_admin,
+        )
+
         result, resolved_model = await execute_agent(
             message=chat_request.message,
             thread_id=chat_request.thread_id,
@@ -94,6 +103,8 @@ async def chat(
             model=chat_request.model,
             use_rag=chat_request.use_rag,
             rag_preset=chat_request.rag_preset,
+            agent_id=str(agent.id),
+            agent_config=agent_config,
         )
 
         messages = result.get("messages", [])
@@ -109,12 +120,15 @@ async def chat(
         return ChatResponse(
             thread_id=chat_request.thread_id,
             user_id=effective_user_id,
+            agent_id=str(agent.id),
             response=response_text,
             model=resolved_model,
             history_length=len(messages),
             sources=result.get("rag_sources"),
             thread_assets=result.get("thread_assets"),
         )
+    except HTTPException:
+        raise
     except ValueError as val_err:
         logger.warning("Invalid chat request parameters for thread_id=%s: %s", chat_request.thread_id, val_err)
         raise HTTPException(
@@ -155,6 +169,14 @@ async def chat_stream(
         is_admin=current_user.is_admin,
     )
 
+    # Resolve target agent and configuration (falls back to user's default agent if omitted)
+    agent, agent_config = await resolve_agent_for_chat(
+        db,
+        user_id=effective_user_id,
+        agent_id=chat_request.agent_id,
+        is_admin=current_user.is_admin,
+    )
+
     async def sse_event_generator():
         try:
             async for event in stream_agent_events(
@@ -165,6 +187,8 @@ async def chat_stream(
                 model=chat_request.model,
                 use_rag=chat_request.use_rag,
                 rag_preset=chat_request.rag_preset,
+                agent_id=str(agent.id),
+                agent_config=agent_config,
             ):
                 yield event.to_sse()
         except Exception as exc:

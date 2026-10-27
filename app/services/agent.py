@@ -21,7 +21,9 @@ from langgraph.graph.state import CompiledStateGraph
 
 from app.core.config import settings
 from app.core.llm import DEFAULT_MODEL, get_llm
+from app.core.rag.workspace import agent_workspace
 from app.core.rag_config import RAGPreset, get_rag_config
+from app.schemas.agent import AgentConfig
 from app.schemas.chat import StreamEvent
 from app.services.memory import get_checkpointer
 from app.services.r2_storage import r2_storage_service
@@ -34,6 +36,18 @@ DEFAULT_SYSTEM_PROMPT = (
     "You are Base Agent, an intelligent and helpful AI assistant powered by DeepSeek. "
     "You have persistent conversation memory and recall previous context within this thread."
 )
+
+
+def _normalize_agent_config(cfg: Any) -> AgentConfig:
+    """Safely normalizes raw dicts or AgentConfig instances into a validated AgentConfig."""
+    if isinstance(cfg, AgentConfig):
+        return cfg
+    if isinstance(cfg, dict):
+        try:
+            return AgentConfig.model_validate(cfg)
+        except Exception:
+            pass
+    return AgentConfig()
 
 
 class AgentState(TypedDict, total=False):
@@ -53,6 +67,8 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
     configurable = config.get("configurable", {})
     thread_id = state.get("thread_id") or configurable.get("thread_id")
     user_id = state.get("user_id") or configurable.get("user_id", "root")
+    agent_id = configurable.get("agent_id")
+    agent_config = _normalize_agent_config(configurable.get("agent_config"))
 
     # 1. Fetch thread assets (uploaded images, documents) with signed URLs
     thread_assets = []
@@ -98,7 +114,13 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
     else:
         query_text = str(last_human_msg.content)
 
-    preset = configurable.get("rag_preset") or RAGPreset.BALANCED
+    preset = configurable.get("rag_preset")
+    if not preset and agent_config and agent_config.knowledge_providers:
+        for p in agent_config.knowledge_providers:
+            if p.enabled and p.mode:
+                preset = p.mode
+                break
+    preset = preset or RAGPreset.BALANCED
     rag_cfg = get_rag_config(preset)
 
     try:
@@ -174,11 +196,34 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]
     """Chat node: receives message history, thread assets, and RAG context, invokes DeepSeek LLM."""
     messages = list(state.get("messages", []))
     configurable = config.get("configurable", {})
-    model_name = configurable.get("model") or settings.LLM_MODEL or DEFAULT_MODEL
+    agent_config = _normalize_agent_config(configurable.get("agent_config"))
+
+    # Resolve model: configurable override > agent_config.model > settings
+    if configurable.get("model"):
+        model_name = configurable["model"]
+    elif agent_config.model and agent_config.model.model_id:
+        model_name = agent_config.model.model_id
+    else:
+        model_name = settings.LLM_MODEL or DEFAULT_MODEL
+
+    temperature = agent_config.model.temperature if agent_config.model else None
+    max_tokens = agent_config.model.max_tokens if agent_config.model else None
+    base_url = agent_config.model.base_url if agent_config.model else None
+
+    # Context window slicing based on agent memory configuration
+    context_window = agent_config.memory.context_window_messages if agent_config.memory else 20
+    if len(messages) > context_window:
+        messages = messages[-context_window:]
+
     rag_context = state.get("rag_context")
     thread_assets_context = state.get("thread_assets_context")
 
-    llm = get_llm(model_name=model_name)
+    llm = get_llm(
+        model_name=model_name,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        base_url=base_url,
+    )
 
     if llm is None:
         last_human = "Hello"
@@ -203,8 +248,12 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]
         )
         return {"messages": [AIMessage(content=mock_response)]}
 
-    # Prepend system prompt
-    system_prompt = DEFAULT_SYSTEM_PROMPT
+    # Dynamic system persona prompt from agent_config
+    system_prompt = (
+        agent_config.identity.system_prompt
+        if agent_config and agent_config.identity and agent_config.identity.system_prompt
+        else DEFAULT_SYSTEM_PROMPT
+    )
     if thread_assets_context:
         system_prompt += f"\n\n{thread_assets_context}"
 
@@ -338,6 +387,8 @@ async def execute_agent(
     model: str | None = None,
     use_rag: bool = False,
     rag_preset: str | RAGPreset | None = None,
+    agent_id: str | None = None,
+    agent_config: AgentConfig | dict[str, Any] | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> tuple[dict[str, Any], str]:
     """Executes a single conversational turn with persistent memory in PostgreSQL.
@@ -350,6 +401,8 @@ async def execute_agent(
         model: Optional model override (e.g. DeepSeek-V4.1-Flash-1017 or DeepSeek-V4-Pro-0813).
         use_rag: Whether to execute hybrid retrieval across user documents.
         rag_preset: Preset tuning chunk size and fusion weights.
+        agent_id: Optional UUID identifier of target agent.
+        agent_config: Optional agent configuration schema or dict.
         checkpointer: Optional explicit checkpointer (defaults to global AsyncPostgresSaver).
 
     Returns:
@@ -358,7 +411,14 @@ async def execute_agent(
     if checkpointer is None:
         checkpointer = await get_checkpointer()
 
-    resolved_model = model or settings.LLM_MODEL or DEFAULT_MODEL
+    norm_cfg = _normalize_agent_config(agent_config) if agent_config is not None else None
+    if model:
+        resolved_model = model
+    elif norm_cfg and norm_cfg.model and norm_cfg.model.model_id:
+        resolved_model = norm_cfg.model.model_id
+    else:
+        resolved_model = settings.LLM_MODEL or DEFAULT_MODEL
+
     graph = get_agent_graph(checkpointer=checkpointer)
 
     thread_config: RunnableConfig = {
@@ -368,6 +428,8 @@ async def execute_agent(
             "model": resolved_model,
             "use_rag": use_rag,
             "rag_preset": rag_preset or RAGPreset.BALANCED,
+            "agent_id": agent_id,
+            "agent_config": norm_cfg,
         }
     }
 
@@ -396,6 +458,8 @@ async def stream_agent_events(
     model: str | None = None,
     use_rag: bool = False,
     rag_preset: str | RAGPreset | None = None,
+    agent_id: str | None = None,
+    agent_config: AgentConfig | dict[str, Any] | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
 ) -> AsyncGenerator[StreamEvent, None]:
     """Streams a conversational turn using LangGraph v3 event streaming with persistent memory.
@@ -408,6 +472,8 @@ async def stream_agent_events(
         thread_id: Unique thread identifier for conversation memory isolation.
         user_id: Unique user identifier (defaults to 'root').
         rag_preset: Preset tuning chunk size and fusion weights.
+        agent_id: Optional UUID identifier of target agent.
+        agent_config: Optional agent configuration schema or dict.
         checkpointer: Optional checkpointer override (defaults to global AsyncPostgresSaver).
 
     Yields:
@@ -416,7 +482,14 @@ async def stream_agent_events(
     if checkpointer is None:
         checkpointer = await get_checkpointer()
 
-    resolved_model = model or settings.LLM_MODEL or DEFAULT_MODEL
+    norm_cfg = _normalize_agent_config(agent_config) if agent_config is not None else None
+    if model:
+        resolved_model = model
+    elif norm_cfg and norm_cfg.model and norm_cfg.model.model_id:
+        resolved_model = norm_cfg.model.model_id
+    else:
+        resolved_model = settings.LLM_MODEL or DEFAULT_MODEL
+
     graph = get_agent_graph(checkpointer=checkpointer)
 
     thread_config: RunnableConfig = {
@@ -426,6 +499,8 @@ async def stream_agent_events(
             "model": resolved_model,
             "use_rag": use_rag,
             "rag_preset": rag_preset or RAGPreset.BALANCED,
+            "agent_id": agent_id,
+            "agent_config": norm_cfg,
         }
     }
 
@@ -499,6 +574,7 @@ async def stream_agent_events(
                     model=resolved_model,
                     history_length=len(messages),
                     sources=sources,
+                    agent_id=agent_id,
                 )
             elif kind == "error":
                 yield StreamEvent.error(error=val)

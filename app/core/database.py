@@ -138,9 +138,13 @@ async def seed_root_user() -> None:
                 session.add(root_user)
                 await session.commit()
                 logger.info("Default root user seeded in database.")
+
+            # Ensure root user has default agent seeded
+            from app.services.agent_service import get_or_create_default_agent
+            await get_or_create_default_agent(session, "root")
     except Exception as exc:
         logger.warning(
-            "Could not auto-seed root user (may already exist or DB not ready): %s",
+            "Could not auto-seed root user or default agent (may already exist or DB not ready): %s",
             exc,
         )
 

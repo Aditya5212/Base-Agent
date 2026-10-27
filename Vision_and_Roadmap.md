@@ -286,15 +286,15 @@ agent system where every user has a customizable default agent.
 | # | Task | Details | Priority |
 |---|---|---|---|
 | 1.1.1 | Set up Alembic | ✅ Complete (Phase 0.5). Async Alembic migrations operational (`alembic/`) and auto-run on startup. | P0 |
-| 1.1.2 | Create `agents` table | Columns: id, user_id, name, description, config (JSON), is_default, is_published, version, timestamps | P0 |
-| 1.1.3 | Create `structured_schemas` table | Reusable Pydantic/JSON Schema definitions for structured output enforcement | P1 |
-| 1.1.4 | Define `AgentConfig` Pydantic schema | Model config, system prompt, knowledge providers, tools, structured output, guardrails, streaming | P0 |
-| 1.1.5 | Agent CRUD endpoints | `POST /agents`, `GET /agents`, `GET /agents/{id}`, `PUT /agents/{id}`, `DELETE /agents/{id}` | P0 |
-| 1.1.6 | Default agent seeding | Auto-create a default agent for every new user on first auth. Migrate existing root user. | P0 |
-| 1.1.7 | Agent resolution middleware | Modify `/api/v1/chat` to resolve agent config from DB instead of hardcoded values | P0 |
-| 1.1.8 | Agent-to-workspace binding | Wire `agent_workspace(user_id, agent_id)` for knowledge isolation per agent | P1 |
-| 1.1.9 | Config validation | Validate AgentConfig JSON on save. Reject invalid provider names, out-of-range params. | P1 |
-| 1.1.10 | Agent cloning | `POST /agents/{id}/clone` — duplicate an agent config for experimentation | P2 |
+| 1.1.2 | Create `agents` table | ✅ Complete. PostgreSQL `agents` table with JSONB `config`, versioning, default flag, and foreign keys. | P0 |
+| 1.1.3 | Create `structured_schemas` table | ✅ Complete. `structured_schemas` table with Draft 2020-12 validation and versioning. | P1 |
+| 1.1.4 | Define `AgentConfig` Pydantic schema | ✅ Complete. Full contract with identity, model, knowledge providers, tools, guardrails, memory, and advanced settings. | P0 |
+| 1.1.5 | Agent CRUD endpoints | ✅ Complete. `/api/v1/agents` endpoints for create, list, details, update, set-default, and delete. | P0 |
+| 1.1.6 | Default agent seeding | ✅ Complete. Auto-provisions and protects default assistant per user (`get_or_create_default_agent`). | P0 |
+| 1.1.7 | Agent resolution middleware | ✅ Complete. `/api/v1/chat` and `/api/v1/chat/stream` dynamically resolve agent & config with LRU caching. | P0 |
+| 1.1.8 | Agent-to-workspace binding | ✅ Complete. Scoped knowledge isolation via `agent_workspace(user_id, agent_id)`. | P1 |
+| 1.1.9 | Config validation | ✅ Complete. Validates JSON Schema and attached knowledge providers against registry on save/update. | P1 |
+| 1.1.10 | Agent cloning | ✅ Complete. `POST /api/v1/agents/{id}/clone` duplicates agent configuration into a new version 1 instance. | P2 |
 
 #### 1.2 AgentConfig Schema (Detailed)
 
@@ -390,6 +390,7 @@ into executable LangGraph state machines.
 | 2.1.12 | Run status endpoint | `GET /workflows/runs/{run_id}` — returns status, output, error | P0 |
 | 2.1.13 | Graph validation | Validate node/edge references, detect orphan nodes, ensure connectivity from START to END | P1 |
 | 2.1.14 | Workflow state schema | Define `WorkflowState` TypedDict with messages, variables dict, user_id, workflow_id | P0 |
+| 2.1.15 | Curated Agent Middleware Pipeline | Integrate high-value provider-agnostic middlewares (ModelRetry, ModelFallback, Summarization, HumanInTheLoop) into graph execution lifecycle | P0 |
 
 #### 2.2 Node Types Specification
 
@@ -452,10 +453,31 @@ Output: CompiledStateGraph (executable, checkpointed)
 - **Checkpoint storage:** Each workflow run creates checkpoints. Implement TTL-based cleanup (e.g., delete checkpoints older than 30 days for non-published workflows).
 - **Concurrent execution limit:** Cap concurrent runs per user (e.g., 5) to prevent resource exhaustion.
 
-#### 2.6 Testing Strategy
+#### 2.6 Curated Agent Middleware Pipeline (`langchain.agents.middleware`)
+
+To keep the Agent Builder robust and production-grade without unnecessary architectural bloat, we adopt a **curated, high-value subset** of provider-agnostic middlewares from LangChain (`langchain.agents.middleware`). These intercept model and tool executions via standard lifecycle hooks (`wrap_model_call`, `wrap_tool_call`, `before_agent`, `after_agent`).
+
+##### Included Curated Middlewares
+
+| Middleware | Hook Layer | Purpose in Agent Builder | Configuration Binding |
+|---|---|---|---|
+| **`ModelRetryMiddleware`** | `wrap_model_call` | Automatic exponential backoff on transient HTTP 429/5xx errors from LLM providers | `agent_config.advanced.max_retries` |
+| **`ModelFallbackMiddleware`** | `wrap_model_call` | Failover to backup model (e.g. `deepseek-flash`) if primary reasoning model times out | `agent_config.model.fallback_model_id` |
+| **`ModelCallLimitMiddleware`** | `before_model` | Guard against infinite recursion or runaway generation costs per session turn | `agent_config.advanced.max_model_calls` |
+| **`SummarizationMiddleware`** | `before_agent` | Automatically condenses older conversation history when approaching token thresholds | `agent_config.memory.summarization_threshold` |
+| **`ToolErrorMiddleware`** | `wrap_tool_call` | Catches unhandled tool execution exceptions and formats actionable error feedback for LLM self-correction (Phase 3) | `agent_config.tools[*].catch_errors` |
+| **`ToolRetryMiddleware`** | `wrap_tool_call` | Automatic retry with backoff for transient HTTP tool network failures (Phase 3) | `agent_config.tools[*].retry_count` |
+| **`HumanInTheLoopMiddleware`** | `wrap_tool_call` | Pauses execution using LangGraph `interrupt()` when sensitive actions require user confirmation | `agent_config.tools[*].requires_approval` |
+| **`PIIMiddleware`** | `before_agent` / `after_model` | Redacts sensitive PII (emails, phone numbers, credit cards) before sending or saving | `agent_config.guardrails.output_filtering` |
+
+> [!NOTE]
+> **Explicitly Excluded Primitives:** Overly complex or niche middlewares (such as `DockerExecutionPolicy`, `CodexSandboxExecutionPolicy`, `LLMToolEmulator`, and `RubricGrading`) are deliberately omitted to avoid heavyweight dependencies, security attack surfaces, and runtime performance penalties.
+
+#### 2.7 Testing Strategy
 
 - Unit: WorkflowCompiler with valid/invalid graphs
 - Unit: Each node builder in isolation
+- Unit: Curated middleware pipeline (ModelRetry, Summarization, ToolError)
 - Unit: Conditional routing logic (JSONPath, variable match)
 - Integration: End-to-end workflow execution with 3+ nodes
 - Integration: Workflow with conditional branching (verify correct path taken)
@@ -488,6 +510,7 @@ attach knowledge bases to specific workflow nodes.
 | 3.1.11 | Migrate BackgroundTasks to Taskiq | Replace FastAPI BackgroundTasks with Taskiq + Redis for distributed processing | P1 |
 | 3.1.12 | Tool execution timeout | Per-tool timeout with graceful error handling | P1 |
 | 3.1.13 | Tool result caching | Cache tool results for identical inputs (TTL-based) | P2 |
+| 3.1.14 | Tool Execution Middleware | Hook ToolErrorMiddleware and ToolRetryMiddleware into dynamic tool node invocation to catch tool errors and retry transient network failures | P0 |
 
 #### 3.2 Tool Type Specifications
 

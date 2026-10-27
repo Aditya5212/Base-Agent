@@ -6,6 +6,8 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base, TimestampMixin
 
 if TYPE_CHECKING:
+    from app.models.agent import Agent
+    from app.models.structured_schema import StructuredSchema
     from app.models.thread import Thread, ThreadAsset
 
 
@@ -37,3 +39,16 @@ class User(Base, TimestampMixin):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+    agents: Mapped[list["Agent"]] = relationship(
+        "Agent",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    structured_schemas: Mapped[list["StructuredSchema"]] = relationship(
+        "StructuredSchema",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+
