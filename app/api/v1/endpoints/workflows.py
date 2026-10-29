@@ -1,0 +1,267 @@
+from __future__ import annotations
+
+import logging
+from typing import Any
+import uuid
+
+from fastapi import APIRouter, Depends, Query, Request, status
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.core.auth import UserContext, get_current_user
+from app.core.database import get_db
+from app.core.rate_limit import limiter
+from app.schemas.workflow import (
+    GraphValidationResponse,
+    WorkflowCreate,
+    WorkflowListResponse,
+    WorkflowResponse,
+    WorkflowResumeRequest,
+    WorkflowRunListResponse,
+    WorkflowRunRequest,
+    WorkflowRunResponse,
+    WorkflowUpdate,
+)
+from app.services.workflow.validator import validate_workflow_graph
+from app.services.workflow_service import (
+    create_workflow,
+    delete_workflow,
+    execute_workflow,
+    get_workflow_by_id,
+    get_workflow_run,
+    list_workflow_runs,
+    list_workflows,
+    resume_workflow_run,
+    update_workflow,
+)
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(prefix="/workflows", tags=["Workflow Engine"])
+
+
+@router.post(
+    "",
+    response_model=WorkflowResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create workflow",
+    description="Registers a new workflow with graph nodes and directed edges after validating topology.",
+)
+@limiter.limit("20/minute")
+async def create_workflow_endpoint(
+    request: Request,
+    workflow_in: WorkflowCreate,
+    current_user: UserContext = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WorkflowResponse:
+    workflow = await create_workflow(
+        session=db,
+        user_id=current_user.user_id,
+        payload=workflow_in,
+    )
+    return WorkflowResponse.model_validate(workflow)
+
+
+@router.get(
+    "",
+    response_model=WorkflowListResponse,
+    summary="List workflows",
+    description="Retrieves a paginated list of workflows created by the authenticated user.",
+)
+@limiter.limit("60/minute")
+async def list_workflows_endpoint(
+    request: Request,
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(20, ge=1, le=100, description="Items per page"),
+    search: str | None = Query(None, description="Filter by workflow name or description"),
+    current_user: UserContext = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WorkflowListResponse:
+    items, total = await list_workflows(
+        session=db,
+        user_id=current_user.user_id,
+        page=page,
+        page_size=page_size,
+        search=search,
+    )
+    return WorkflowListResponse(
+        items=[WorkflowResponse.model_validate(w) for w in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+
+
+@router.post(
+    "/validate",
+    response_model=GraphValidationResponse,
+    summary="Validate workflow graph topology",
+    description="Performs dry-run topological validation of nodes and edges without persisting.",
+)
+@limiter.limit("30/minute")
+async def validate_workflow_endpoint(
+    request: Request,
+    workflow_in: WorkflowCreate,
+    current_user: UserContext = Depends(get_current_user),
+) -> GraphValidationResponse:
+    raw_nodes = [node.model_dump(mode="json") for node in workflow_in.nodes]
+    raw_edges = [edge.model_dump(mode="json") for edge in workflow_in.edges]
+    is_valid, errors, warnings = validate_workflow_graph(raw_nodes, raw_edges)
+
+    return GraphValidationResponse(
+        valid=is_valid,
+        errors=errors,
+        warnings=warnings,
+        node_count=len(raw_nodes),
+        edge_count=len(raw_edges),
+    )
+
+
+@router.get(
+    "/runs/{run_id}",
+    response_model=WorkflowRunResponse,
+    summary="Get workflow execution run details",
+    description="Retrieves execution status, output data, and traces for a specific run.",
+)
+@limiter.limit("60/minute")
+async def get_workflow_run_endpoint(
+    request: Request,
+    run_id: uuid.UUID,
+    current_user: UserContext = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WorkflowRunResponse:
+    run = await get_workflow_run(session=db, run_id=run_id, user_id=current_user.user_id)
+    return WorkflowRunResponse.model_validate(run)
+
+
+@router.post(
+    "/runs/{run_id}/resume",
+    response_model=WorkflowRunResponse,
+    summary="Resume interrupted workflow run",
+    description="Resumes execution of an INTERRUPTED workflow (e.g. human-in-the-loop approval).",
+)
+@limiter.limit("20/minute")
+async def resume_workflow_run_endpoint(
+    request: Request,
+    run_id: uuid.UUID,
+    payload: WorkflowResumeRequest,
+    current_user: UserContext = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WorkflowRunResponse:
+    run = await resume_workflow_run(
+        session=db,
+        run_id=run_id,
+        user_id=current_user.user_id,
+        payload=payload,
+    )
+    return WorkflowRunResponse.model_validate(run)
+
+
+@router.get(
+    "/{workflow_id}",
+    response_model=WorkflowResponse,
+    summary="Get workflow details",
+    description="Retrieves workflow configuration, nodes, and edges by ID.",
+)
+@limiter.limit("60/minute")
+async def get_workflow_endpoint(
+    request: Request,
+    workflow_id: uuid.UUID,
+    current_user: UserContext = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WorkflowResponse:
+    workflow = await get_workflow_by_id(session=db, workflow_id=workflow_id, user_id=current_user.user_id)
+    return WorkflowResponse.model_validate(workflow)
+
+
+@router.put(
+    "/{workflow_id}",
+    response_model=WorkflowResponse,
+    summary="Update workflow",
+    description="Updates workflow configuration, re-validates topology, and auto-increments version.",
+)
+@limiter.limit("20/minute")
+async def update_workflow_endpoint(
+    request: Request,
+    workflow_id: uuid.UUID,
+    workflow_in: WorkflowUpdate,
+    current_user: UserContext = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WorkflowResponse:
+    workflow = await update_workflow(
+        session=db,
+        workflow_id=workflow_id,
+        user_id=current_user.user_id,
+        payload=workflow_in,
+    )
+    return WorkflowResponse.model_validate(workflow)
+
+
+@router.delete(
+    "/{workflow_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Delete workflow",
+    description="Deletes a workflow and cascades deletion to all execution run records.",
+)
+@limiter.limit("20/minute")
+async def delete_workflow_endpoint(
+    request: Request,
+    workflow_id: uuid.UUID,
+    current_user: UserContext = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> None:
+    await delete_workflow(session=db, workflow_id=workflow_id, user_id=current_user.user_id)
+
+
+@router.post(
+    "/{workflow_id}/run",
+    response_model=WorkflowRunResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Execute workflow",
+    description="Compiles and executes the workflow with input variables, returning execution output.",
+)
+@limiter.limit("20/minute")
+async def run_workflow_endpoint(
+    request: Request,
+    workflow_id: uuid.UUID,
+    payload: WorkflowRunRequest,
+    current_user: UserContext = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WorkflowRunResponse:
+    run = await execute_workflow(
+        session=db,
+        workflow_id=workflow_id,
+        user_id=current_user.user_id,
+        payload=payload,
+    )
+    return WorkflowRunResponse.model_validate(run)
+
+
+@router.get(
+    "/{workflow_id}/runs",
+    response_model=WorkflowRunListResponse,
+    summary="List workflow execution runs",
+    description="Lists previous execution runs and outcomes for this workflow.",
+)
+@limiter.limit("60/minute")
+async def list_workflow_runs_endpoint(
+    request: Request,
+    workflow_id: uuid.UUID,
+    page: int = Query(1, ge=1, description="Page number"),
+    page_size: int = Query(20, ge=1, le=100, description="Items per page"),
+    current_user: UserContext = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WorkflowRunListResponse:
+    items, total = await list_workflow_runs(
+        session=db,
+        workflow_id=workflow_id,
+        user_id=current_user.user_id,
+        page=page,
+        page_size=page_size,
+    )
+    return WorkflowRunListResponse(
+        items=[WorkflowRunResponse.model_validate(r) for r in items],
+        total=total,
+        page=page,
+        page_size=page_size,
+    )
+

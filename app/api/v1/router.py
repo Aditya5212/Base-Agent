@@ -1,6 +1,14 @@
 from fastapi import APIRouter
 
-from app.api.v1.endpoints import agents, chat, documents, health, storage, structured_schemas
+from app.api.v1.endpoints import (
+    agents,
+    chat,
+    documents,
+    health,
+    storage,
+    structured_schemas,
+    workflows,
+)
 
 api_router = APIRouter()
 
@@ -8,9 +16,11 @@ api_router = APIRouter()
 api_router.include_router(health.router)
 api_router.include_router(chat.router)
 api_router.include_router(agents.router)
+api_router.include_router(workflows.router)
 api_router.include_router(structured_schemas.router)
 api_router.include_router(documents.router)
 api_router.include_router(storage.router)
+
 
 
 

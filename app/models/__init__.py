@@ -4,6 +4,7 @@ from app.models.document import Document, DocumentChunk, DocumentStatus
 from app.models.structured_schema import StructuredSchema
 from app.models.thread import Thread, ThreadAsset
 from app.models.user import User
+from app.models.workflow import Workflow, WorkflowRun
 
 __all__ = [
     "Agent",
@@ -16,5 +17,7 @@ __all__ = [
     "User",
     "Thread",
     "ThreadAsset",
+    "Workflow",
+    "WorkflowRun",
 ]
 

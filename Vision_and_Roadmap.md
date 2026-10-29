@@ -376,21 +376,21 @@ into executable LangGraph state machines.
 
 | # | Task | Details | Priority |
 |---|---|---|---|
-| 2.1.1 | Create `workflows` table | id, user_id, name, description, nodes (JSON), edges (JSON), input_schema, output_schema, version, is_published | P0 |
-| 2.1.2 | Create `workflow_runs` table | id, workflow_id, user_id, status, thread_id, input_data, output_data, started_at, completed_at, error_message | P0 |
-| 2.1.3 | Define NodeConfig schemas | Pydantic models for each node type: Chat, Retrieve, ToolCall, Conditional, HumanApproval, Code, Subgraph, Start, End | P0 |
-| 2.1.4 | Define EdgeConfig schema | source, target, condition (optional), label | P0 |
-| 2.1.5 | Build WorkflowCompiler | Translates `nodes + edges` JSON → LangGraph `StateGraph`. Validates graph acyclicity (except intentional loops), ensures single START/END. | P0 |
-| 2.1.6 | Implement Chat Node builder | Creates async node function from ChatNodeConfig. Supports variable interpolation in system prompt. | P0 |
-| 2.1.7 | Implement Retrieve Node builder | Creates node that fans out to configured providers, fuses results via RRF. | P0 |
-| 2.1.8 | Implement Conditional Node builder | Router function evaluating JSONPath, variable match, or LLM classification. Returns target node ID. | P0 |
-| 2.1.9 | Implement Tool Call Node builder | Resolves tool from registry, maps state variables to inputs, writes output to state. | P1 |
-| 2.1.10 | Workflow CRUD endpoints | Create, read, update, delete, list workflows | P0 |
-| 2.1.11 | Workflow execution endpoint | `POST /workflows/{id}/run` with input_data. Returns run_id. Supports sync and async execution. | P0 |
-| 2.1.12 | Run status endpoint | `GET /workflows/runs/{run_id}` — returns status, output, error | P0 |
-| 2.1.13 | Graph validation | Validate node/edge references, detect orphan nodes, ensure connectivity from START to END | P1 |
-| 2.1.14 | Workflow state schema | Define `WorkflowState` TypedDict with messages, variables dict, user_id, workflow_id | P0 |
-| 2.1.15 | Curated Agent Middleware Pipeline | Integrate high-value provider-agnostic middlewares (ModelRetry, ModelFallback, Summarization, HumanInTheLoop) into graph execution lifecycle | P0 |
+| 2.1.1 | Create workflows table | ✅ Complete. PostgreSQL workflows table with nodes/edges JSONB, schemas, versioning, cascade delete. | P0 |
+| 2.1.2 | Create workflow_runs table | ✅ Complete. PostgreSQL workflow_runs table with thread_id, status, input/output JSONB, execution log. | P0 |
+| 2.1.3 | Define NodeConfig schemas | ✅ Complete. Strongly-typed Pydantic schemas and Discriminated Union for 10 node types. | P0 |
+| 2.1.4 | Define EdgeConfig schema | ✅ Complete. WorkflowEdge schema with source, target, condition, and UI label. | P0 |
+| 2.1.5 | Build WorkflowCompiler | ✅ Complete. Translates declarative JSON graph into executable LangGraph StateGraph(WorkflowState). | P0 |
+| 2.1.6 | Implement Chat Node builder | ✅ Complete. Async handler with variable template interpolation, memory preservation, and middlewares. | P0 |
+| 2.1.7 | Implement Retrieve Node builder | ✅ Complete. Knowledge retrieval querying hybrid search, formatted passages, and citations. | P0 |
+| 2.1.8 | Implement Conditional Node builder | ✅ Complete. AST safe expression evaluation, variable comparison, regex matching, and default fallback. | P0 |
+| 2.1.9 | Implement Tool Call Node builder | ✅ Complete. Tool invocation with input mappings, built-in utilities (calculator, datetime), search tool, retry & error isolation. | P1 |
+| 2.1.10 | Workflow CRUD endpoints | ✅ Complete. Create, read, update, delete, list workflows with multi-tenant isolation. | P0 |
+| 2.1.11 | Workflow execution endpoint | ✅ Complete. POST /workflows/{id}/run with checkpointer and recursion guards. | P0 |
+| 2.1.12 | Run status & resume endpoints | ✅ Complete. GET /workflows/runs/{run_id} and POST /workflows/runs/{run_id}/resume. | P0 |
+| 2.1.13 | Graph validation | ✅ Complete. alidate_workflow_graph checks start/end nodes, edge connectivity, conditional targets, reachability. | P1 |
+| 2.1.14 | Workflow state schema | ✅ Complete. WorkflowState TypedDict with messages reducer, variables, thread_id, node_history. | P0 |
+| 2.1.15 | Curated Agent Middleware Pipeline | ✅ Complete. Integrated ModelRetry, ModelFallback, and CallLimit wrappers with LangGraph. | P0 |
 
 #### 2.2 Node Types Specification
 

@@ -101,7 +101,9 @@ Base-Agent/
 │   ├── test_deepseek_live.py        # Interactive script testing live DeepSeek + PostgreSQL turns
 │   ├── test_deepseek_stream_live.py # Interactive script testing live DeepSeek SSE streaming
 │   ├── test_lightrag_live.py        # Interactive script testing live LightRAG + PGTableGraphStorage
-│   └── test_taskiq_live.py          # Interactive script testing live Taskiq dispatch and PG queue
+│   ├── test_taskiq_live.py          # Interactive script testing live Taskiq dispatch and PG queue
+│   ├── test_workflow_live.py        # Interactive script testing live Workflow Engine + Graph Compiler
+│   └── test_multi_agent_structured_workflow.py # Interactive multi-agent advisory council workflow
 └── tests/
     ├── __init__.py
     ├── conftest.py             # Pytest session setup & database table auto-initialization
@@ -336,6 +338,20 @@ Real-time token and reasoning event streaming over HTTP via **Server-Sent Events
 | `GET` | `/api/v1/structured-schemas/{schema_id}` | Get Schema | Retrieves schema definition and metadata by ID |
 | `PUT` | `/api/v1/structured-schemas/{schema_id}` | Update Schema | Updates definition, auto-incrementing schema version |
 | `DELETE` | `/api/v1/structured-schemas/{schema_id}` | Delete Schema | Deletes registered schema definition |
+
+### Workflow Engine & Execution (/api/v1/workflows)
+| Method | Path | Summary | Description |
+| ------ | ---- | ------- | ----------- |
+| POST | /api/v1/workflows | Create Workflow | Registers workflow with node & edge graph after topological validation |
+| GET | /api/v1/workflows | List Workflows | Lists user workflows with pagination and search |
+| GET | /api/v1/workflows/{workflow_id} | Get Workflow | Retrieves graph topology, nodes, edges, and validation schemas |
+| PUT | /api/v1/workflows/{workflow_id} | Update Workflow | Updates workflow graph, re-validates topology, increments version |
+| DELETE | /api/v1/workflows/{workflow_id} | Delete Workflow | Cascades deletion of workflow and all execution run logs |
+| POST | /api/v1/workflows/validate | Validate Graph | Dry-run topological validation of nodes and edges without saving |
+| POST | /api/v1/workflows/{workflow_id}/run | Execute Workflow | Runs compiled state graph with persistent checkpointing |
+| GET | /api/v1/workflows/{workflow_id}/runs | List Runs | Lists historical runs and outcomes for a workflow |
+| GET | /api/v1/workflows/runs/{run_id} | Run Details | Inspects status, execution traces, node history, and error logs |
+| POST | /api/v1/workflows/runs/{run_id}/resume | Resume Run | Resumes an INTERRUPTED workflow with human decision input |
 
 ---
 
