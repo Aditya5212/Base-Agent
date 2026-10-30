@@ -1,6 +1,6 @@
 # Base Agent — Architecture & Agent Design
 
-This document serves as the comprehensive architectural specification for **Base Agent**, detailing the current conversational agent implementation, persistence layer, LLM provider integration, repository structure, and the future Agent Builder platform.
+This document serves as the comprehensive architectural specification for **Base Agent**, detailing the conversational agent implementation, persistence layer, LLM provider integration, repository structure, and the **Agent Builder & Dynamic Workflow Engine** platform (Phases 1 & 2).
 
 ---
 
@@ -62,7 +62,8 @@ Base-Agent/
 │   │           ├── documents.py# Document upload, search, and cascade delete
 │   │           ├── storage.py  # Admin-only raw Cloudflare R2 object storage operations
 │   │           ├── agents.py   # Agent Builder CRUD, clone & promotion endpoints
-│   │           └── structured_schemas.py # JSON Schema registration & validation endpoints
+│   │           ├── structured_schemas.py # JSON Schema registration & validation endpoints
+│   │           └── workflows.py# Dynamic Workflow Engine CRUD, compilation & execution endpoints
 │   ├── models/                 # Database persistence models
 │   │   ├── __init__.py
 │   │   ├── base.py             # Declarative Base & UTC TimestampMixin
@@ -70,7 +71,8 @@ Base-Agent/
 │   │   ├── thread.py           # Thread & ThreadAsset models
 │   │   ├── document.py         # Document & DocumentChunk persistence models
 │   │   ├── agent.py            # Agent persistence model with JSONB configuration
-│   │   └── structured_schema.py# Structured JSON schema definition model
+│   │   ├── structured_schema.py# Structured JSON schema definition model
+│   │   └── workflow.py         # Workflow & WorkflowRun state persistence models
 │   ├── schemas/                # Request & response Pydantic contracts
 │   │   ├── __init__.py
 │   │   ├── health.py           # Health response models
@@ -78,12 +80,20 @@ Base-Agent/
 │   │   ├── storage.py          # StorageObjectListResponse, PresignedUrlRequest
 │   │   ├── document.py         # DocumentUploadResponse, RAGSearchRequest/Response
 │   │   ├── agent.py            # AgentConfig, AgentCreate, AgentUpdate, AgentResponse
-│   │   └── structured_schema.py# StructuredSchemaCreate, StructuredSchemaResponse
+│   │   ├── structured_schema.py# StructuredSchemaCreate, StructuredSchemaResponse
+│   │   └── workflow.py         # Discriminated WorkflowNode, WorkflowEdge, execution contracts
 │   ├── services/               # Business logic & agent workflows
 │   │   ├── __init__.py
 │   │   ├── agent.py            # LangGraph agent topology (retrieve -> chat) & state schema
 │   │   ├── agent_service.py    # Agent CRUD, cloning, default resolution & LRU config cache
 │   │   ├── schema_service.py   # Structured JSON Schema validation and persistence
+│   │   ├── workflow_service.py # Multi-tenant workflow persistence, run lifecycle & execution
+│   │   ├── workflow/           # Declarative Workflow Engine & Graph Compiler
+│   │   │   ├── state.py        # WorkflowState, template interpolation & safe AST evaluator
+│   │   │   ├── validator.py    # Topological validation (START/END connectivity, cycles)
+│   │   │   ├── compiler.py     # StateGraph compiler (JSON -> LangGraph StateGraph)
+│   │   │   ├── middleware/     # Curated middleware pipeline (ModelRetry, ModelFallback)
+│   │   │   └── nodes/          # Node builders (chat, retrieve, conditional, code, human, tool)
 │   │   ├── memory.py           # PostgreSQL checkpointer service (AsyncPostgresSaver)
 │   │   ├── thread_service.py   # Thread persistence, root user, and asset management
 │   │   ├── tools.py            # LangChain agent tool factory (make_search_tool, user-scoped hybrid search)
@@ -113,7 +123,7 @@ Base-Agent/
     ├── test_config.py          # Settings validation & URL normalization tests
     ├── test_agent.py           # Multi-turn memory & thread isolation tests
     ├── test_agents.py          # AgentConfig validation, Agent CRUD, cloning, LRU cache & isolation
-    ├── test_structured_schemas.py # JSON Schema validation, CRUD & isolation tests
+    ├── test_structured_schemas.py # JSON Schema registration & validation endpoints
     ├── test_llm.py             # DeepSeek model registry & alias resolution tests
     ├── test_document_loader.py # MarkItDown parser tests
     ├── test_text_splitter.py   # Token chunking & header tracking tests
@@ -123,7 +133,10 @@ Base-Agent/
     ├── test_documents_api.py   # Document upload, search, and delete endpoint tests
     ├── test_rag_agent.py       # RAG-augmented agent execution and streaming tests
     ├── test_rag_providers.py   # Pluggable RAG framework and provider tests
-    └── test_taskiq.py          # Taskiq task queue and broker lifecycle tests
+    ├── test_taskiq.py          # Taskiq task queue and broker lifecycle tests
+    ├── test_workflow_compiler.py# Workflow topological validation & compiler tests
+    ├── test_workflow_nodes.py  # Node builder unit tests (code sandboxing, chat, retrieval)
+    └── test_workflows_api.py   # Workflow CRUD, execution & multi-tenant isolation tests
 ```
 
 ---
@@ -131,7 +144,7 @@ Base-Agent/
 ## 2. Conversational Agent & RAG Topology
 
 ### Overview
-The agent is a stateful **LangGraph** workflow that combines conversation turn processing, persistent short-term PostgreSQL checkpointing, and dynamic knowledge retrieval from uploaded user documents.
+The default agent is a stateful **LangGraph** workflow that combines conversation turn processing, persistent short-term PostgreSQL checkpointing, dynamic agent resolution (Phase 1), and dynamic knowledge retrieval from uploaded user documents.
 
 ### State Schema
 
@@ -169,9 +182,9 @@ START ──► [retrieve_node] ──► [chat_node] ──► END
   6. Returns `rag_context`, `rag_sources`, `thread_assets`, and `thread_assets_context`.
 - **`chat_node`**:
   1. Reads conversation history from the checkpointer.
-  2. Injects system instructions combining knowledge grounding (if `rag_context` is present) and thread asset context with presigned URLs.
+  2. Injects system instructions combining dynamic persona from the resolved agent config, knowledge grounding (if `rag_context` is present), and thread asset context with presigned URLs.
   3. Formats human input into OpenAI-compatible multimodal vision blocks (`image_url`) if image URLs or R2 keys are provided.
-  4. Invokes the DeepSeek model asynchronously (or streams via SSE).
+  4. Invokes the DeepSeek model asynchronously (or streams via SSE) with model overrides and max token settings.
   5. Appends the model response to state.
 
 ---
@@ -185,9 +198,9 @@ To avoid running duplicate connection pools and mismatched database drivers, bot
 
 ### PostgreSQL Checkpointer (`AsyncPostgresSaver`)
 - **Tables**: `checkpoints`, `checkpoint_blobs`, `checkpoint_writes` (auto-created at startup via `setup_checkpointer()`).
-- **Isolation**: Each conversation turn is isolated by `configurable = {"thread_id": "...", "user_id": "..."}`.
+- **Isolation**: Each conversation turn or workflow execution run is isolated by `configurable = {"thread_id": "...", "user_id": "..."}`.
 - **Operations Supported**:
-  - `execute_agent()`: Resumes state, executes nodes, writes new checkpoint.
+  - `execute_agent()` / `execute_workflow()`: Resumes state, executes nodes, writes new checkpoint.
   - `get_thread_messages()`: Fetches full message history directly from storage.
   - `delete_thread_memory()`: Drops all checkpoints for a thread upon user request.
 
@@ -204,16 +217,16 @@ The application connects to **DeepSeek** via its OpenAI-compatible endpoint:
 
 | Shorthand / API Identifier | Underlying Model Version | Context | Max Output | Vision | Concurrency | Primary Use Case |
 | -------------------------- | ------------------------ | ------- | ---------- | ------ | ----------- | ---------------- |
-| **`deepseek-flash`** (Default) | `DeepSeek-V4.1-Flash-1017` | 1M | 384K | Yes | 2500 | Fast, high-throughput conversational chatbot |
+| **`deepseek-flash`** (Default) | `DeepSeek-V4.1-Flash-1017` | 1M | 384K | Yes | 2500 | Fast, high-throughput conversational chatbot & workflows |
 | **`deepseek-v4-pro`** | `DeepSeek-V4-Pro-0813` | 1M | 384K | No | 500 | Advanced reasoning & complex multi-step tasks |
 
 ---
 
 ## 5. Knowledge Retrieval & Pluggable RAG Architecture
 
-Base Agent implements a modular **Pluggable RAG Architecture** (`app/core/rag/`) that allows the agent and future Agent Builder workflows to bind against standardized knowledge retrieval and graph reasoning backends:
+Base Agent implements a modular **Pluggable RAG Architecture** (`app/core/rag/`) that allows the conversational agent and custom workflow nodes to bind against standardized knowledge retrieval and graph reasoning backends:
 
-```
+```text
 app/core/rag/
 ├── protocols.py            # KnowledgeProvider Protocol + standardized contracts
 ├── registry.py             # PROVIDER_REGISTRY + @register_provider decorator
@@ -254,7 +267,7 @@ Tenant boundaries are enforced at the storage level using LightRAG's native `wor
 2. **Object Storage**: Stored in Cloudflare R2 (S3-compatible) via async `aioboto3` with `tenacity` exponential backoff retries on transient network/5xx errors.
 3. **Atomic Rollback**: If PostgreSQL metadata commitment fails after upload, the raw R2 object is automatically deleted to prevent orphaned files.
 4. **Immediate 202 Response**: Document record is initialized with status `PARSING`, and an HTTP 202 Accepted response is returned immediately to prevent client timeouts.
-5. **Asynchronous Background Processing**: Dispatched to FastAPI `BackgroundTasks` executing `process_document_pipeline` in an isolated database session.
+5. **Asynchronous Background Processing**: Dispatched to Taskiq worker (with fallback to FastAPI `BackgroundTasks`) executing `process_document_pipeline` in an isolated database session.
 6. **Parsing**: Converted to structured markdown via Microsoft **MarkItDown** (`markitdown`).
 7. **Chunking**: Structure-aware splitting using `MarkdownHeaderTextSplitter` + `RecursiveCharacterTextSplitter.from_tiktoken_encoder` (`cl100k_base`), preserving section hierarchy.
 8. **Embedding & Indexing**: Vectors indexed into `langchain_pg_embedding` in PostgreSQL with HNSW cosine index and PostgreSQL FTS GIN index. Status updated to `INDEXED` or `FAILED`.
@@ -274,7 +287,7 @@ Real-time token and reasoning event streaming over HTTP via **Server-Sent Events
 ### Wire Format
 - `token`: Incremental response text chunk.
 - `reasoning`: Incremental reasoning delta (DeepSeek thinking mode).
-- `end`: Final turn snapshot containing `response`, `history_length`, and retrieved `sources` (including `view_url` and `download_url`).
+- `end`: Final turn snapshot containing `response`, `agent_id`, `history_length`, and retrieved `sources` (including `view_url` and `download_url`).
 - `error`: Error payload.
 
 ---
@@ -287,7 +300,7 @@ Real-time token and reasoning event streaming over HTTP via **Server-Sent Events
 | `GET` | `/` | Root | Service info and API status |
 | `GET` | `/api/v1/health` | Readiness Probe | Verifies PostgreSQL connectivity |
 | `GET` | `/api/v1/ping` | Liveness Probe | Lightweight health check |
-| `POST` | `/api/v1/chat` | Send Message | Executes a conversation turn (optional RAG, multimodal images with key authorization) |
+| `POST` | `/api/v1/chat` | Send Message | Executes a conversation turn (optional RAG, multimodal images, agent_id resolution) |
 | `POST` | `/api/v1/chat/stream` | Stream Message | Streams real-time tokens & reasoning via SSE with multimodal images |
 | `POST` | `/api/v1/chat/{thread_id}/assets` | Upload Asset | Uploads an image or document attachment linked to thread |
 | `GET` | `/api/v1/chat/{thread_id}/assets` | List Assets | Lists uploaded images & documents in thread with fresh signed URLs |
@@ -339,19 +352,19 @@ Real-time token and reasoning event streaming over HTTP via **Server-Sent Events
 | `PUT` | `/api/v1/structured-schemas/{schema_id}` | Update Schema | Updates definition, auto-incrementing schema version |
 | `DELETE` | `/api/v1/structured-schemas/{schema_id}` | Delete Schema | Deletes registered schema definition |
 
-### Workflow Engine & Execution (/api/v1/workflows)
+### Workflow Engine & Execution (`/api/v1/workflows`)
 | Method | Path | Summary | Description |
 | ------ | ---- | ------- | ----------- |
-| POST | /api/v1/workflows | Create Workflow | Registers workflow with node & edge graph after topological validation |
-| GET | /api/v1/workflows | List Workflows | Lists user workflows with pagination and search |
-| GET | /api/v1/workflows/{workflow_id} | Get Workflow | Retrieves graph topology, nodes, edges, and validation schemas |
-| PUT | /api/v1/workflows/{workflow_id} | Update Workflow | Updates workflow graph, re-validates topology, increments version |
-| DELETE | /api/v1/workflows/{workflow_id} | Delete Workflow | Cascades deletion of workflow and all execution run logs |
-| POST | /api/v1/workflows/validate | Validate Graph | Dry-run topological validation of nodes and edges without saving |
-| POST | /api/v1/workflows/{workflow_id}/run | Execute Workflow | Runs compiled state graph with persistent checkpointing |
-| GET | /api/v1/workflows/{workflow_id}/runs | List Runs | Lists historical runs and outcomes for a workflow |
-| GET | /api/v1/workflows/runs/{run_id} | Run Details | Inspects status, execution traces, node history, and error logs |
-| POST | /api/v1/workflows/runs/{run_id}/resume | Resume Run | Resumes an INTERRUPTED workflow with human decision input |
+| `POST` | `/api/v1/workflows` | Create Workflow | Registers workflow with node & edge graph after topological validation |
+| `GET` | `/api/v1/workflows` | List Workflows | Lists user workflows with pagination and search |
+| `GET` | `/api/v1/workflows/{workflow_id}` | Get Workflow | Retrieves graph topology, nodes, edges, and validation schemas |
+| `PUT` | `/api/v1/workflows/{workflow_id}` | Update Workflow | Updates workflow graph, re-validates topology, increments version |
+| `DELETE` | `/api/v1/workflows/{workflow_id}` | Delete Workflow | Cascades deletion of workflow and all execution run logs |
+| `POST` | `/api/v1/workflows/validate` | Validate Graph | Dry-run topological validation of nodes and edges without saving |
+| `POST` | `/api/v1/workflows/{workflow_id}/run` | Execute Workflow | Runs compiled state graph with persistent checkpointing |
+| `GET` | `/api/v1/workflows/{workflow_id}/runs` | List Runs | Lists historical runs and outcomes for a workflow |
+| `GET` | `/api/v1/workflows/runs/{run_id}` | Run Details | Inspects status, execution traces, node history, and error logs |
+| `POST` | `/api/v1/workflows/runs/{run_id}/resume` | Resume Run | Resumes an INTERRUPTED workflow with human decision input |
 
 ---
 
@@ -378,6 +391,7 @@ class UserContext(BaseModel):
 2. **`require_admin`**: Validates `current_user.is_admin`, rejecting non-admin callers with `HTTP 403 Forbidden`. Enforced on all direct R2 object storage administration routes (`/api/v1/storage/*`).
 3. **Thread Ownership Enforcement**: `verify_thread_ownership(thread, user_id)` verifies that conversation threads cannot be accessed, modified, listed, or deleted by any user other than the owner or a superadmin (`root`).
 4. **Document Scoping**: All document operations (`upload`, `list`, `chunks`, `reindex`, `download`, `delete`, `search`) scope queries by `document.user_id == current_user.user_id`.
+5. **Agent & Workflow Scoping**: Custom agents, structured schemas, workflows, and execution runs are strictly isolated to `user_id == current_user.user_id`. Attempting to access or mutate another user's resource results in an immediate `HTTP 403 Forbidden`.
 
 ---
 
@@ -385,7 +399,7 @@ class UserContext(BaseModel):
 
 For production background task execution (document parsing, chunking, and embedding generation), Base Agent integrates **Taskiq** (`0.12.6`) with a native PostgreSQL broker (`taskiq-pg` `0.2.0`):
 
-```
+```text
 API Request (upload/reindex)
        │
        ▼
@@ -415,7 +429,7 @@ Database schema evolution is managed via async **Alembic** (`alembic/`):
 
 ### Architecture & Isolation:
 - **Unified Driver**: Uses `postgresql+psycopg://` with an async SQLAlchemy engine inside [`alembic/env.py`](file:///c:/Users/Aditya/Desktop/Base-Agent/alembic/env.py).
-- **Target Metadata Isolation (`include_name`)**: Only tables registered in application ORM `Base.metadata` (`users`, `threads`, `thread_assets`, `documents`, `document_chunks`) and `alembic_version` are managed by Alembic. External tables managed by other subsystems (`lightrag_*`, `checkpoint_*`, `langchain_pg_*`, `taskiq_*`) are strictly excluded from autogeneration diffs.
+- **Target Metadata Isolation (`include_name`)**: Only tables registered in application ORM `Base.metadata` (`users`, `threads`, `thread_assets`, `documents`, `document_chunks`, `agents`, `structured_schemas`, `workflows`, `workflow_runs`) and `alembic_version` are managed by Alembic. External tables managed by other subsystems (`lightrag_*`, `checkpoint_*`, `langchain_pg_*`, `taskiq_*`) are strictly excluded from autogeneration diffs.
 - **Transaction Safety**: `run_async_migrations()` executes `await connection.commit()` to ensure DDL changes are persisted cleanly on serverless PostgreSQL (Neon).
 - **Programmatic Startup Migration**: [`app/core/database.py`](file:///c:/Users/Aditya/Desktop/Base-Agent/app/core/database.py) executes `run_migrations()` (`alembic upgrade head`) automatically inside the FastAPI `lifespan` handler before incoming requests are accepted.
 
@@ -432,6 +446,13 @@ Base Agent incorporates endpoint-level rate limiting using **slowapi** (`app/cor
 | `POST /api/v1/chat/{thread_id}/assets` | `20/minute` | Caps media uploads and R2 writes |
 | `POST /api/v1/documents/upload` | `10/minute` | Restricts CPU-intensive MarkItDown parsing & embedding compute |
 | `POST /api/v1/documents/search` | `60/minute` | Balances interactive search against vector index load |
+| `POST /api/v1/agents` | `20/minute` | Protects agent provisioning and JSONB validation |
+| `GET /api/v1/agents` | `60/minute` | Governs agent catalog queries |
+| `POST /api/v1/structured-schemas` | `20/minute` | Governs JSON Schema registration |
+| `POST /api/v1/workflows` | `20/minute` | Protects graph persistence and validation |
+| `POST /api/v1/workflows/validate` | `30/minute` | Throttles dry-run graph topological checks |
+| `POST /api/v1/workflows/{id}/run` | `20/minute` | Caps workflow execution runs and LLM fan-outs |
+| `GET /api/v1/workflows` | `60/minute` | Governs workflow listings |
 
 ---
 
@@ -451,17 +472,96 @@ The project includes production-hardened Docker and Docker Compose definitions:
 
 ---
 
-## 14. Future Agent Builder Architecture (Phase 2)
+## 14. Agent Builder Platform: Configurable Agents & Schemas (Phase 1)
 
-Dynamic agent workflows defined through configuration API:
-- Graph types: `linear`, `cyclic` (ReAct), `multi_agent`.
-- Custom node registry: `chat`, `rag_retriever`, `tool_executor`, `human_approval`.
+Base Agent provides complete custom agent management:
+
+### 1. Persistence & JSONB Storage
+- **`agents` table**: Decouples relational identity (`id`, `user_id`, `name`, `is_default`, `version`) from dynamic capabilities stored in a validated JSONB `config` column.
+- **Auto-Seeded Default Assistant**: Every user automatically receives a default assistant upon initial turn or query (`GET /api/v1/agents/default`), ensuring zero disruption to existing `/api/v1/chat` clients. Default agents are protected from accidental deletion.
+- **Config Contract (`AgentConfig`)**: Validated via Pydantic v2:
+  - `identity`: System prompt, name, avatar, locale, response format.
+  - `model`: Target provider, model ID, temperature, max tokens, fallback model.
+  - `providers`: List of knowledge provider attachments with weights and presets.
+  - `tools`: Attached tools with approval toggles and retry settings.
+  - `guardrails`: Input/output sanitization and safety filters.
+  - `memory`: Context window length and summarization thresholds.
+  - `advanced`: Max recursion, timeout, and retry counts.
+
+### 2. In-Memory LRU Configuration Caching
+To eliminate database overhead on every conversational turn, resolved agent configurations are cached in an in-memory LRU cache (`app/services/agent_service.py`), keyed by `(agent_id, version)`. Mutations (`PUT`, `DELETE`, `clone`) automatically invalidate stale entries.
+
+### 3. Structured JSON Schema Registry
+- **`structured_schemas` table**: Stores validated JSON schemas (JSON Schema Draft 2020-12 via `jsonschema`).
+- Users can register schemas to enforce structured outputs across agent responses or workflow outputs.
 
 ---
 
-## 15. Design Principles
+## 15. Declarative Workflow Engine & Graph Compiler (Phase 2)
 
-1. **Stateless API, Stateful Graph**: FastAPI endpoints remain stateless; conversation state is persisted across turns via the checkpointer.
+Phase 2 introduces a **production-grade declarative workflow engine** that compiles JSON graph definitions into executable LangGraph `StateGraph(WorkflowState)` state machines.
+
+### 1. Data Models (`workflows` & `workflow_runs`)
+- **`workflows` table**: Stores graph topology (`nodes` JSONB, `edges` JSONB), optional `input_schema` and `output_schema`, recursion limits (default 25), and versioning.
+- **`workflow_runs` table**: Persists run status (`PENDING`, `RUNNING`, `COMPLETED`, `FAILED`, `INTERRUPTED`), input data, output data, error messages, and execution traces (`node_history`).
+
+### 2. Node Types & Discriminated Union (`app/schemas/workflow.py`)
+All nodes inherit from `BaseNodeModel` and deserialize via a discriminated union on `type`:
+
+| Node Type | Config Schema | Runtime Behavior |
+|---|---|---|
+| **`start`** | `StartNodeConfig` | Entry point. Ingests inputs, validates against `input_schema`, seeds `initial_variables`. |
+| **`end`** | `EndNodeConfig` | Terminal node. Validates against `output_schema`, returns `response_variable` or full state. |
+| **`chat`** | `ChatNodeConfig` | LLM invocation. Renders prompts via template engine, wraps execution in `ModelRetry` and `ModelFallback` middlewares. |
+| **`retrieve`** | `RetrieveNodeConfig` | Knowledge retrieval. Queries Hybrid Search (PGVector + FTS) with tenant scoping and top-$k$ slicing. |
+| **`conditional`** | `ConditionalNodeConfig` | Router node. Evaluates AST expressions, variable comparisons, regex, and routes to matching branch or fallback. |
+| **`code`** | `CodeNodeConfig` | Python execution. Runs code in an AST-inspected restricted sandbox with forbidden call/import guards and timeouts. |
+| **`human_approval`** | `HumanApprovalNodeConfig` | HITL review. Triggers LangGraph `interrupt()`, moves run to `INTERRUPTED` until resumed via API. |
+| **`tool_call`** | `ToolCallNodeConfig` | Executes built-in tools (`calculator`, `datetime`) or hybrid search with retry and error catching. |
+| **`subgraph`** | `SubgraphNodeConfig` | Sub-workflow execution. Invokes nested workflow and maps returned state. |
+| **`parallel`** | `ParallelNodeConfig` | Concurrently dispatches multiple nodes with `wait_all` synchronization. |
+
+### 3. Graph Compiler (`WorkflowCompiler`)
+- **Topological Validation (`validate_workflow_graph`)**:
+  - Enforces exactly one `start` node.
+  - Ensures at least one `end` node is reachable.
+  - Rejects incoming edges to `start` or outgoing edges from `end`.
+  - Verifies that all conditional branch targets exist.
+  - Detects orphan and unreachable nodes.
+- **Compilation**: Translates JSON nodes and directed edges into LangGraph `StateGraph(WorkflowState)`. Automatically configures static edges, conditional routing functions, and connects to the PostgreSQL `AsyncPostgresSaver` checkpointer.
+
+### 4. Curated Middleware Pipeline (`app/services/workflow/middleware/`)
+- **`ModelRetryMiddleware`**: Exponential backoff with jitter on HTTP 429 and 5xx errors via `tenacity`.
+- **`ModelFallbackMiddleware`**: Automatic failover to secondary backup models if the primary model fails.
+- **`ToolErrorMiddleware` & `ToolRetryMiddleware`**: Catches tool execution exceptions and retries transient failures.
+
+### 5. Multi-Agent Orchestration & Structured Output
+Workflows can assemble collaborative multi-agent teams. Verified via [`scripts/test_multi_agent_structured_workflow.py`](file:///c:/Users/Aditya/Desktop/Base-Agent/scripts/test_multi_agent_structured_workflow.py):
+- **Retrieval Agent** fetches factual context.
+- **Technical Architect, Security Officer, and Business Specialist Agents** perform domain-specific evaluations.
+- **Lead Evaluator Agent** synthesizes specialist findings into an executive summary.
+- **Structured Formatter Code Node** extracts and validates the final output against a strict Pydantic model (`MultiAgentEvaluationReport`).
+
+---
+
+## 16. Future Roadmap: Phase 3 Tool Builder & Beyond
+
+- **Phase 3 (Tool Builder & Knowledge Integration)**:
+  - Custom HTTP/REST API tool builder with authentication and response mapping.
+  - Code tool executor with subprocess isolation.
+  - Read-only SQL database query executor.
+  - Per-node dynamic knowledge base attachment.
+- **Phase 4 (Orchestration & Advanced Primitives)**:
+  - Subgraph nesting and cross-workflow invocation.
+  - Dynamic map-reduce over large datasets.
+- **Phase 5 (Visual Frontend)**:
+  - Next.js 15 drag-and-drop canvas (React Flow) with real-time SSE execution visualization.
+
+---
+
+## 17. Design Principles
+
+1. **Stateless API, Stateful Graph**: FastAPI endpoints remain stateless; conversation and workflow states are persisted across turns via the checkpointer.
 2. **Unified Driver Ecosystem**: Single `psycopg3` engine and pool for ORM, LangGraph, and PGVector.
 3. **Decoupled Embedding and LLM Providers**: Independent OpenAI embeddings and DeepSeek conversational reasoning.
 4. **No In-Memory Production Traps**: Multi-worker persistence via PostgreSQL native FTS and PGVector.
@@ -469,7 +569,7 @@ Dynamic agent workflows defined through configuration API:
 6. **Async First**: Fully async database queries, network calls, and agent invocations for maximum throughput.
 7. **Singleton Caching**: PGVector instance and compiled StateGraph are cached per collection/checkpointer at module level; hybrid dense+sparse searches run in parallel via `asyncio.gather` to minimise RAG latency.
 8. **User-Scoped Tool Security**: Agent tools never expose `user_id` as an LLM-callable argument. `make_search_tool(user_id)` closes over the caller-supplied identity so the model cannot escalate to another tenant's documents.
-9. **Zero Cross-Tenant Data Leakage**: User context is enforced at dependency injection boundaries; thread assets, conversation history, and document embeddings are strictly tenant-isolated.
+9. **Zero Cross-Tenant Data Leakage**: User context is enforced at dependency injection boundaries; thread assets, conversation history, custom agents, workflows, and document embeddings are strictly tenant-isolated.
 10. **Worker-Decoupled Large Payloads**: High-volume binary files are stored in S3/R2 and referenced by key rather than transmitted across database task queues.
 11. **Explicit Schema Migrations**: All production schema changes are version-controlled via Alembic migrations, never ad-hoc DDL.
-
+12. **Compile-Time & Ingestion Safety**: Graphs are topologically validated and node configs validated with Pydantic discriminated unions before persistence or execution.

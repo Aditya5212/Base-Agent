@@ -1,43 +1,50 @@
 # Base Agent
 
-A production-grade, extensible AI chatbot built with FastAPI and LangGraph. Starts as a simple conversational agent and is architected to evolve into a full **Agent Builder** platform.
+A production-grade, extensible AI agent platform and **declarative workflow engine** built with FastAPI and LangGraph. Starting as a persistent conversational chatbot, Base Agent has evolved into a complete **Agent Builder & Dynamic Workflow Engine** (Phases 1 & 2) that compiles declarative JSON graphs into stateful, persistent LangGraph state machines.
 
-## 🧠 Vision
+---
 
-**Phase 1 (Current):** A simple, persistent chatbot with conversation memory, authentication, and production-ready infrastructure.
+## 🧠 Platform Vision & Milestones
 
-**Phase 2 (Future):** An Agent Builder platform where users can define custom agent workflows, tools, RAG pipelines, and multi-step reasoning graphs.
+- **Phase 0.5 (Infrastructure & Prerequisites — ✅ Complete):** Async Alembic database migrations, Taskiq PostgreSQL background task queue, multi-tenant auth & ownership enforcement, slowapi rate limiting, and production Docker containerization.
+- **Phase 1 (Agent Configuration Core & Schemas — ✅ Complete):** Database-persisted custom agents with JSONB configs, auto-seeded default assistant, in-memory LRU config caching, and JSON Schema Draft 2020-12 registry.
+- **Phase 2 (Dynamic Workflow Engine & Graph Compiler — ✅ Complete):** Declarative workflow engine compiling JSON graphs into executable LangGraph `StateGraph(WorkflowState)` state machines with 10 node types, safe AST condition routing, curated middlewares (`ModelRetry`, `ModelFallback`), persistent checkpointing, and multi-agent structured evaluation pipelines.
+- **Phase 3 (Tool Builder & Knowledge Integration — 🚧 Upcoming):** Custom HTTP/REST API tool builder, sandboxed code execution, read-only SQL querying, and per-node dynamic knowledge attachments.
+
+---
 
 ## 🛠️ Tech Stack
 
-| Layer          | Technology                          |
-| -------------- | ----------------------------------- |
-| Backend        | Python 3.12+, FastAPI               |
-| Package Manager| `uv`                                |
-| Agent Framework| LangGraph + LangChain               |
-| Database / ORM | PostgreSQL + SQLAlchemy (async, psycopg3) |
-| Migrations     | Alembic (async, psycopg3 runner)    |
-| Task Queue     | Taskiq (0.12.6) + PostgreSQL Broker (`taskiq-pg` 0.2.0) |
-| Rate Limiting  | `slowapi`                           |
-| Containerization| Docker (multi-stage) + Docker Compose |
-| Vector Store   | `pgvector` (HNSW Cosine Index) via `langchain-postgres` |
-| Sparse Search  | PostgreSQL Native Full-Text Search (GIN `to_tsvector`) |
-| Graph RAG      | LightRAG (`PGTableGraphStorage` native tables on Neon) |
-| Hybrid Ranking | Reciprocal Rank Fusion (RRF)        |
-| Embeddings     | OpenAI `text-embedding-3-small` (1536-dim) |
-| LLM Chat Model | DeepSeek (`deepseek-flash` & `deepseek-v4-pro`) |
-| Parser         | Microsoft MarkItDown (`markitdown`) |
-| Chunking       | Structure-aware token splitter (`tiktoken` `cl100k_base`) |
-| Object Storage | Cloudflare R2 (S3-compatible via `aioboto3`) |
-| Auth           | Mock Auth & Multi-Tenant Isolation (Clerk in Phase 1) |
-| Frontend       | Next.js (Phase 5)                   |
+| Layer | Technology |
+| --- | --- |
+| **Backend Framework** | Python 3.12+, FastAPI, Pydantic v2 |
+| **Package Manager** | `uv` (deterministic locking with `uv.lock`) |
+| **Agent & Workflow Engine** | LangGraph, LangChain, Pregel (`StateGraph`, `interrupt()`, `Command`) |
+| **Database & ORM** | PostgreSQL (Neon serverless), SQLAlchemy 2.0 (async), unified `psycopg3` |
+| **Migrations** | Alembic (async psycopg3 runner with table inclusion filters) |
+| **Task Queue** | Taskiq (0.12.6) + PostgreSQL Broker (`taskiq-pg` 0.2.0) |
+| **Vector Database** | `pgvector` (HNSW Cosine Index) via `langchain-postgres` |
+| **Sparse Keyword Search** | PostgreSQL Full-Text Search (GIN `to_tsvector('english')`) |
+| **Knowledge Graph RAG** | LightRAG (`PGTableGraphStorage` native tables, zero Apache AGE dependency) |
+| **Hybrid Ranking** | Reciprocal Rank Fusion (RRF) combining dense & sparse scores |
+| **Embeddings** | OpenAI `text-embedding-3-small` (1536 dimensions) |
+| **Conversational LLM** | DeepSeek (`deepseek-flash` & `deepseek-v4-pro`) via OpenAI-compatible API |
+| **Document Parser** | Microsoft MarkItDown (`markitdown`) |
+| **Chunking** | Structure-aware token splitter (`tiktoken` `cl100k_base`) |
+| **Object Storage** | Cloudflare R2 (S3-compatible via `aioboto3` with SigV4 presigned URLs) |
+| **Rate Limiting** | `slowapi` tier-based limiter |
+| **Schema Validation** | `jsonschema` (Draft 2020-12) & Pydantic Discriminated Unions |
+| **Containerization** | Docker (multi-stage) + Docker Compose (API + Taskiq worker) |
 
-## 📁 Project Structure
+---
 
-```
+## 📁 Repository Structure
+
+```text
 Base-Agent/
 ├── pyproject.toml              # Dependencies & pytest configuration
 ├── uv.lock                     # Deterministic dependency lockfile
+├── .python-version             # Python version pin (3.12)
 ├── .env.example                # Documented configuration template
 ├── Dockerfile                  # Production multi-stage Docker build
 ├── docker-compose.yml          # Multi-container orchestration (api + taskiq worker)
@@ -45,26 +52,26 @@ Base-Agent/
 ├── .dockerignore               # Docker build exclusions
 ├── alembic.ini                 # Alembic migration configuration
 ├── README.md                   # Project overview and getting started
-├── AGENTS.md                   # Agent and architecture specifications
+├── AGENTS.md                   # Comprehensive architecture and design specifications
 ├── TODO.md                     # Roadmap enhancements & observability items
 ├── Vision_and_Roadmap.md       # Long-term vision and phased milestone specification
-├── main.py                     # Development runner
+├── main.py                     # Root development runner
 ├── alembic/                    # Alembic async migration environment
 │   ├── env.py                  # Async migration runner with psycopg3 & model inclusion filters
 │   ├── script.py.mako          # Migration template with pgvector support
 │   └── versions/               # Versioned migration revision scripts
 ├── app/
-│   ├── main.py                 # FastAPI factory, lifespan, CORS, rate limiting & routes
-│   ├── core/                   # Infrastructure configuration
+│   ├── main.py                 # FastAPI application factory, lifespan, CORS, rate limiting & routes
+│   ├── core/                   # Infrastructure & singleton configurations
 │   │   ├── config.py           # Pydantic settings & postgres environment sync
 │   │   ├── database.py         # Async SQLAlchemy engine, session dependency & auto-migrations
 │   │   ├── auth.py             # Swappable UserContext, get_current_user & require_admin
 │   │   ├── rate_limit.py       # slowapi Limiter configuration
 │   │   ├── taskiq.py           # Taskiq PostgreSQL broker & lifecycle hooks
 │   │   ├── llm.py              # DeepSeek model registry & client factory
-│   │   ├── embedding.py        # Decoupled OpenAI embedding factory
-│   │   ├── rag_config.py       # Precision vs Recall presets & RRF config
-│   │   └── rag/                # Pluggable KnowledgeProvider architecture
+│   │   ├── embedding.py        # Decoupled OpenAI embedding factory (1536 dims)
+│   │   ├── rag_config.py       # Precision vs Recall presets & RRF configuration
+│   │   └── rag/                # Pluggable KnowledgeProvider framework
 │   │       ├── protocols.py    # KnowledgeProvider protocol & data contracts
 │   │       ├── workspace.py    # Multi-tenant workspace isolation (user, thread, global)
 │   │       ├── registry.py     # Provider registry & decorator (@register_provider)
@@ -74,30 +81,48 @@ Base-Agent/
 │   │           └── lightrag_provider.py # LightRAG + PGTableGraphStorage provider
 │   ├── api/                    # HTTP presentation layer
 │   │   └── v1/
-│   │       ├── router.py       # API v1 aggregator
+│   │       ├── router.py       # API v1 aggregator router
 │   │       └── endpoints/
-│   │           ├── health.py   # Health & liveness probes
+│   │           ├── health.py   # Health & liveness probes (/health, /ping)
 │   │           ├── chat.py     # Persistent chat, streaming (SSE), assets, & history
-│   │           ├── documents.py# Knowledge Base management, chunks, reindex, search
-│   │           └── storage.py  # Object storage management (upload, presigned URLs, stats)
-│   ├── models/                 # SQLAlchemy ORM models
-│   │   ├── base.py             # Declarative base & timestamps
+│   │           ├── documents.py# Document upload, search, and cascade delete
+│   │           ├── storage.py  # Admin-only raw Cloudflare R2 object storage operations
+│   │           ├── agents.py   # Agent Builder CRUD, clone & promotion endpoints
+│   │           ├── structured_schemas.py # JSON Schema registration & validation endpoints
+│   │           └── workflows.py# Dynamic Workflow Engine CRUD, compilation & execution endpoints
+│   ├── models/                 # Database persistence models
+│   │   ├── base.py             # Declarative Base & UTC TimestampMixin
 │   │   ├── user.py             # User model (root user auto-seeded)
-│   │   ├── thread.py           # Thread & ThreadAsset persistence models
-│   │   └── document.py         # Document & DocumentChunk models
-│   ├── schemas/                # Pydantic request & response contracts
+│   │   ├── thread.py           # Thread & ThreadAsset models
+│   │   ├── document.py         # Document & DocumentChunk persistence models
+│   │   ├── agent.py            # Agent persistence model with JSONB configuration
+│   │   ├── structured_schema.py# Structured JSON schema definition model
+│   │   └── workflow.py         # Workflow & WorkflowRun state persistence models
+│   ├── schemas/                # Request & response Pydantic contracts
 │   │   ├── chat.py             # ChatRequest, ChatResponse, StreamEvent, ThreadAssetItem
 │   │   ├── document.py         # Knowledge Base documents, chunks, reindex schemas
 │   │   ├── health.py           # Health response schemas
-│   │   └── storage.py          # Object storage items, presigned URLs, stats schemas
+│   │   ├── storage.py          # StorageObjectListResponse, PresignedUrlRequest
+│   │   ├── agent.py            # AgentConfig, AgentCreate, AgentUpdate, AgentResponse
+│   │   ├── structured_schema.py# StructuredSchemaCreate, StructuredSchemaResponse
+│   │   └── workflow.py         # Discriminated WorkflowNode, WorkflowEdge, execution contracts
 │   ├── services/               # Core business logic
-│   │   ├── agent.py            # LangGraph agent topology (retrieve -> chat)
-│   │   ├── memory.py           # PostgreSQL checkpointer (AsyncPostgresSaver)
-│   │   ├── thread_service.py   # Thread metadata, root user, and asset management
+│   │   ├── agent.py            # LangGraph conversational agent (retrieve -> chat)
+│   │   ├── agent_service.py    # Agent CRUD, cloning, default resolution & LRU config cache
+│   │   ├── schema_service.py   # Structured JSON Schema validation and persistence
+│   │   ├── workflow_service.py # Multi-tenant workflow persistence, run lifecycle & execution
+│   │   ├── workflow/           # Declarative Workflow Engine & Graph Compiler
+│   │   │   ├── state.py        # WorkflowState, template interpolation & safe AST evaluator
+│   │   │   ├── validator.py    # Topological validation (START/END connectivity, cycles)
+│   │   │   ├── compiler.py     # StateGraph compiler (JSON -> LangGraph StateGraph)
+│   │   │   ├── middleware/     # Curated middleware pipeline (ModelRetry, ModelFallback)
+│   │   │   └── nodes/          # Node builders (chat, retrieve, conditional, code, human, tool)
+│   │   ├── memory.py           # PostgreSQL checkpointer service (AsyncPostgresSaver)
+│   │   ├── thread_service.py   # Thread persistence, root user, and asset management
 │   │   ├── tools.py            # LangChain agent tool factory (make_search_tool, user-scoped hybrid search)
 │   │   ├── document_loader.py  # Canonical Microsoft MarkItDown parser
 │   │   ├── document_processor.py # Asynchronous RAG ingestion pipeline (BackgroundTasks / Taskiq)
-│   │   ├── text_splitter.py    # Structure-aware token chunking
+│   │   ├── text_splitter.py    # Structure-aware token chunking (tiktoken cl100k_base)
 │   │   ├── vector_store.py     # PGVector HNSW vector store service
 │   │   ├── retriever.py        # Hybrid Search (Dense + FTS + RRF)
 │   │   └── r2_storage.py       # Cloudflare R2 / S3 object storage service
@@ -109,9 +134,13 @@ Base-Agent/
 │   ├── test_deepseek_live.py        # Live DeepSeek multi-turn chat test
 │   ├── test_deepseek_stream_live.py # Live DeepSeek SSE streaming test
 │   ├── test_lightrag_live.py        # Live LightRAG + PGTableGraphStorage smoke test
-│   └── test_taskiq_live.py          # Live Taskiq task dispatch and PostgreSQL message storage
-└── tests/                           # Complete pytest suite (82 tests)
+│   ├── test_taskiq_live.py          # Live Taskiq dispatch and PostgreSQL message storage
+│   ├── test_workflow_live.py        # Live Workflow Engine + Graph Compiler verification
+│   └── test_multi_agent_structured_workflow.py # Live multi-agent advisory council workflow
+└── tests/                           # Complete pytest suite (120 tests passing)
 ```
+
+---
 
 ## 🔌 API Endpoints Summary
 
@@ -123,7 +152,7 @@ Interactive Swagger UI is available at `http://localhost:8000/docs`.
 | `GET` | `/` | Service root and health check link |
 | `GET` | `/api/v1/health` | Readiness probe (validates PostgreSQL connectivity) |
 | `GET` | `/api/v1/ping` | Liveness probe |
-| `POST` | `/api/v1/chat` | Multi-turn agent conversation turn (optional RAG, multimodal vision with key authorization) |
+| `POST` | `/api/v1/chat` | Multi-turn agent turn (optional RAG, multimodal vision, dynamic agent resolution) |
 | `POST` | `/api/v1/chat/stream` | Server-Sent Events (SSE) streaming (tokens + reasoning) |
 | `POST` | `/api/v1/chat/{thread_id}/assets` | Upload an image or document attachment to thread |
 | `GET` | `/api/v1/chat/{thread_id}/assets` | List uploaded images & documents in thread with signed URLs |
@@ -144,6 +173,41 @@ Interactive Swagger UI is available at `http://localhost:8000/docs`.
 | `DELETE` | `/api/v1/documents/{id}` | Cascade delete: R2 storage, PGVector embeddings, LightRAG graph & record |
 | `POST` | `/api/v1/documents/search` | Direct Hybrid Search (Dense HNSW + FTS GIN + RRF fusion) |
 
+### Agent Management (`/api/v1/agents`)
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/v1/agents/default` | Returns or auto-provisions user's default assistant |
+| `GET` | `/api/v1/agents` | Lists user's agents with pagination and search filter |
+| `POST` | `/api/v1/agents` | Creates a custom agent with validated `AgentConfig` |
+| `GET` | `/api/v1/agents/{agent_id}` | Retrieves agent configuration and metadata by ID |
+| `PUT` | `/api/v1/agents/{agent_id}` | Updates agent settings, auto-incrementing version |
+| `POST` | `/api/v1/agents/{agent_id}/clone` | Clones configuration into a new non-default agent instance |
+| `POST` | `/api/v1/agents/{agent_id}/set-default` | Promotes agent to user's default assistant |
+| `DELETE` | `/api/v1/agents/{agent_id}` | Deletes agent (deletion of default agent rejected) |
+
+### Structured Schema Management (`/api/v1/structured-schemas`)
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/v1/structured-schemas` | Lists user's registered JSON schemas with search |
+| `POST` | `/api/v1/structured-schemas` | Validates against Draft 2020-12 and persists schema |
+| `GET` | `/api/v1/structured-schemas/{schema_id}` | Retrieves schema definition and metadata by ID |
+| `PUT` | `/api/v1/structured-schemas/{schema_id}` | Updates schema definition, auto-incrementing version |
+| `DELETE` | `/api/v1/structured-schemas/{schema_id}` | Deletes registered schema definition |
+
+### Dynamic Workflow Engine & Execution (`/api/v1/workflows`)
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/v1/workflows` | Registers workflow with node & edge graph after topological validation |
+| `GET` | `/api/v1/workflows` | Lists user workflows with pagination and search |
+| `GET` | `/api/v1/workflows/{workflow_id}` | Retrieves graph topology, nodes, edges, and validation schemas |
+| `PUT` | `/api/v1/workflows/{workflow_id}` | Updates workflow graph, re-validates topology, increments version |
+| `DELETE` | `/api/v1/workflows/{workflow_id}` | Cascades deletion of workflow and all execution run logs |
+| `POST` | `/api/v1/workflows/validate` | Dry-run topological validation of nodes and edges without saving |
+| `POST` | `/api/v1/workflows/{workflow_id}/run` | Compiles and executes workflow state graph with persistent checkpointing |
+| `GET` | `/api/v1/workflows/{workflow_id}/runs` | Lists historical runs and outcomes for a workflow |
+| `GET` | `/api/v1/workflows/runs/{run_id}` | Inspects status, execution traces, node history, and error logs |
+| `POST` | `/api/v1/workflows/runs/{run_id}/resume` | Resumes an INTERRUPTED workflow with human decision input |
+
 ### Object Storage Management (`/api/v1/storage` — Admin Only)
 | Method | Endpoint | Description |
 |---|---|---|
@@ -155,6 +219,26 @@ Interactive Swagger UI is available at `http://localhost:8000/docs`.
 | `DELETE` | `/api/v1/storage/objects/{key}` | Delete object from Cloudflare R2 bucket (Root only) |
 | `POST` | `/api/v1/storage/presigned-url` | Generate temporary PUT (upload) or GET (download) signed URL (Root only) |
 
+---
+
+## ⚡ Workflow Engine & Node Types Specification
+
+The Workflow Engine (`app/services/workflow/`) translates declarative JSON graphs into LangGraph `StateGraph(WorkflowState)` state machines.
+
+### Supported Node Types:
+1. **`start`**: Ingests runtime inputs, validates against optional `input_schema`, and initializes default variables.
+2. **`end`**: Terminal exit node. Validates outputs against optional `output_schema` and returns the designated `response_variable`.
+3. **`chat`**: Invokes LLM with template-interpolated prompts (`{{variables.name}}`), conversation memory, and `ModelRetry`/`ModelFallback` middlewares.
+4. **`retrieve`**: Multi-tenant hybrid knowledge search querying PostgreSQL PGVector HNSW and FTS with citations.
+5. **`conditional`**: Dynamic branch routing evaluating AST expressions, variable comparisons, regex, or fallback paths.
+6. **`code`**: Sandboxed Python script execution with AST forbidden call/import guards and execution timeouts.
+7. **`human_approval`**: Human-in-the-loop review triggering LangGraph `interrupt()`, paused until resumed via API.
+8. **`tool_call`**: Invokes built-in tools (`calculator`, `datetime`) or hybrid search with retry and error catching.
+9. **`subgraph`**: Invokes another workflow as a child routine.
+10. **`parallel`**: Concurrently triggers multiple nodes with `wait_all` merging.
+
+---
+
 ## 🚀 Getting Started
 
 ### Prerequisites
@@ -162,7 +246,7 @@ Interactive Swagger UI is available at `http://localhost:8000/docs`.
 - [`uv`](https://github.com/astral-sh/uv) package manager
 - PostgreSQL with `vector` extension (e.g. [Neon](https://neon.tech))
 - OpenAI API key (for embeddings)
-- DeepSeek API key (for conversational agent)
+- DeepSeek API key (for conversational agent & workflow models)
 - Cloudflare R2 bucket & API token (for object storage)
 
 ### Installation
@@ -200,8 +284,6 @@ R2_ACCESS_KEY_ID=your_r2_access_key_id
 R2_SECRET_ACCESS_KEY=your_r2_secret_access_key
 R2_BUCKET_NAME=base-agent
 R2_REGION=auto
-# Optional CDN URL:
-# R2_PUBLIC_BASE_URL=https://files.yourdomain.com
 ```
 
 ### Database Migrations (Alembic)
@@ -225,12 +307,9 @@ uv run alembic current
 uv run uvicorn app.main:app --reload
 ```
 
-Interactive Swagger API documentation is available at:
-`http://localhost:8000/docs`
+Interactive Swagger API documentation is available at `http://localhost:8000/docs`.
 
 ### Running the Distributed Background Worker (Taskiq)
-
-To run the background task queue worker for distributed document ingestion:
 
 ```bash
 uv run taskiq worker app.core.taskiq:broker app.tasks.document_tasks
@@ -239,8 +318,6 @@ uv run taskiq worker app.core.taskiq:broker app.tasks.document_tasks
 *(Note: If the background worker is not running, the application automatically falls back to in-process `BackgroundTasks`.)*
 
 ### Running with Docker Compose
-
-To spin up the entire production stack (API server + Taskiq background worker):
 
 ```bash
 # Build and run containers
@@ -253,80 +330,84 @@ docker compose up -d
 docker compose logs -f
 ```
 
-### Authentication & Tenant Isolation
+---
 
-Base Agent uses a swappable authentication system that isolates all user threads, documents, and assets:
-- **`X-User-ID`**: ID of caller (e.g. `user_123`). Defaults to `"root"`.
-- **`X-User-Role`**: Role of caller (`"user"` or `"admin"`). Default is `"admin"` for `root`, `"user"` otherwise.
-- **`X-User-Email`**: Optional user email for tracking.
-- **`Authorization: Bearer mock_<user_id>`**: Bearer token authentication support.
-- Direct R2 storage routes (`/api/v1/storage/*`) strictly require admin privileges (`HTTP 403 Forbidden` for non-admins).
-- Users can only access, view, search, stream, or delete their own conversation threads, thread assets, and knowledge base documents.
+## 🧪 Testing & Verification
 
-### Rate Limiting
-
-Endpoints are protected by `slowapi` rate limits:
-- `POST /api/v1/chat`: `30/minute`
-- `POST /api/v1/chat/stream`: `20/minute`
-- `POST /api/v1/chat/{thread_id}/assets`: `20/minute`
-- `POST /api/v1/documents/upload`: `10/minute`
-- `POST /api/v1/documents/search`: `60/minute`
-
-### Running the Automated Tests
+### Running Automated Test Suite (120 Tests)
 
 ```bash
 uv run pytest
 ```
 
-### Running Live Interactive Scripts
-
-```bash
-# Test live RAG ingestion, PGVector HNSW, PostgreSQL FTS, and RRF
-uv run python -m scripts.test_rag_live
-
-# Test live multi-turn DeepSeek conversation with PostgreSQL memory
-uv run python -m scripts.test_deepseek_live
-
-# Test live DeepSeek SSE token and reasoning streaming
-uv run python -m scripts.test_deepseek_stream_live
-
-# Test live LightRAG entity/relationship extraction and graph retrieval on Neon
-uv run python -m scripts.test_lightrag_live
-
-# Test live Taskiq task dispatch and PostgreSQL message storage
-uv run python -m scripts.test_taskiq_live
+Output:
+```text
+======================= 120 passed, 6 warnings in 74.12s =======================
 ```
 
-## 🗺️ Roadmap
+### Running Live Interactive Verification Scripts
 
-- [x] Project scaffolding with `uv` and FastAPI
-- [x] LangGraph conversational agent with persistent PostgreSQL memory
-- [x] Real-time Server-Sent Events (SSE) streaming (`POST /api/v1/chat/stream`)
-- [x] DeepSeek integration (`deepseek-flash` & `deepseek-v4-pro`)
-- [x] Cloudflare R2 object storage service (`aioboto3` with SigV4)
-- [x] Cloudflare R2 object storage management APIs (`/api/v1/storage`: list, upload, presigned URLs, stats)
-- [x] Canonical document ingestion with Microsoft MarkItDown (`markitdown`)
-- [x] Structure-aware token chunking (`tiktoken` `cl100k_base`)
-- [x] PGVector HNSW + PostgreSQL FTS Hybrid Search with Reciprocal Rank Fusion (RRF)
-- [x] RAG Precision vs Recall presets (`high_precision`, `balanced`, `high_recall`)
-- [x] Knowledge Base management APIs (`/api/v1/documents`: upload, list, chunk inspection, re-indexing, download, stats)
-- [x] Multimodal conversational agent with image uploads & vision handling (`images` / `thread_assets`)
-- [x] LangChain hybrid search agent tool (`hybrid_document_search`)
-- [x] Thread asset tracking with signed URLs and dynamic prompt context injection
-- [x] Production DB tables (`users` with auto-seeded root user, `threads`, and `thread_assets`)
-- [x] RAG-augmented LangGraph conversational agent with source citations (`use_rag=True`)
-- [x] Pluggable RAG architecture (`KnowledgeProvider` protocol, registry, workspace isolation, factory)
-- [x] LightRAG integration with `PGTableGraphStorage` (native graph tables on Neon, zero Apache AGE dependency)
-- [x] Security hardening: user-scoped tool factory (`make_search_tool`), path-traversal guards, R2 key authorization, sanitized `Content-Disposition` headers, error messages stripped of internal details
-- [x] Bug fixes: `user_id` default consistency across all endpoints (`root`), correct pagination `total` count via `COUNT(*)` subquery, atomic-safe cascade delete with R2 failure guard
-- [x] Performance: PGVector and StateGraph singleton caches, parallel `asyncio.gather` dense+sparse retrieval, thread-asset 10 MB upload cap with chunked streaming read
-- [x] Database schema migrations via Alembic (`alembic upgrade head` auto-run on startup)
-- [x] Distributed background task queue via Taskiq (0.12.6) + PostgreSQL broker (`taskiq-pg` 0.2.0) with dual-dispatch fallback
-- [x] Swappable Mock Auth & multi-tenant isolation with thread & document ownership enforcement
-- [x] API rate limiting with `slowapi`
-- [x] Multi-stage production `Dockerfile` and `docker-compose.yml` orchestration
-- [ ] Clerk authentication provider integration (Phase 1)
-- [ ] ParadeDB `pg_search` BM25 extension migration (see `TODO.md`)
-- [ ] Agent Builder dynamic configuration API (Phase 1 & Phase 2)
-- [ ] Next.js frontend (Phase 5)
+```bash
+# 1. Test live RAG ingestion, PGVector HNSW, PostgreSQL FTS, and RRF
+uv run python scripts/test_rag_live.py
 
+# 2. Test live multi-turn DeepSeek conversation with PostgreSQL memory
+uv run python scripts/test_deepseek_live.py
+
+# 3. Test live DeepSeek SSE token and reasoning streaming
+uv run python scripts/test_deepseek_stream_live.py
+
+# 4. Test live LightRAG entity/relationship extraction on Neon
+uv run python scripts/test_lightrag_live.py
+
+# 5. Test live Taskiq task dispatch and PostgreSQL message storage
+uv run python scripts/test_taskiq_live.py
+
+# 6. Test live Workflow Engine with branching routing & checkpointer
+uv run python scripts/test_workflow_live.py
+
+# 7. Test live Multi-Agent Advisory Council with Pydantic structured output
+uv run python scripts/test_multi_agent_structured_workflow.py
+```
+
+---
+
+## 🗺️ Roadmap & Completed Milestones
+
+- [x] **Phase 0: Conversational Core & RAG**
+  - [x] Project scaffolding with `uv` and FastAPI
+  - [x] LangGraph conversational agent with persistent PostgreSQL memory (`AsyncPostgresSaver`)
+  - [x] Real-time Server-Sent Events (SSE) streaming (`POST /api/v1/chat/stream`)
+  - [x] DeepSeek integration (`deepseek-flash` & `deepseek-v4-pro`)
+  - [x] Cloudflare R2 object storage service (`aioboto3` with SigV4 presigned URLs)
+  - [x] Canonical document ingestion with Microsoft MarkItDown (`markitdown`)
+  - [x] Structure-aware token chunking (`tiktoken` `cl100k_base`)
+  - [x] PGVector HNSW + PostgreSQL FTS Hybrid Search with Reciprocal Rank Fusion (RRF)
+  - [x] Multimodal vision agent handling (`images` / `thread_assets`)
+  - [x] Pluggable RAG framework (`KnowledgeProvider` protocol & LightRAG integration)
+- [x] **Phase 0.5: Production Hardening & Infrastructure**
+  - [x] Database migrations via async Alembic with model filters & startup runner
+  - [x] Distributed background task queue via Taskiq (`taskiq-pg` PostgreSQL broker)
+  - [x] Swappable Mock Auth & multi-tenant isolation with thread & document ownership
+  - [x] Rate limiting with `slowapi`
+  - [x] Production multi-stage `Dockerfile` and `docker-compose.yml`
+- [x] **Phase 1: Agent Configuration Core & Schemas**
+  - [x] PostgreSQL `agents` table with JSONB `config` and auto-seeded user default assistants
+  - [x] In-memory LRU configuration caching (`(agent_id, version)`)
+  - [x] JSON Schema Draft 2020-12 registry (`structured_schemas` table and CRUD)
+  - [x] Dynamic agent resolution in conversational chat endpoints
+- [x] **Phase 2: Workflow Engine & Graph Compiler**
+  - [x] PostgreSQL `workflows` and `workflow_runs` persistence models
+  - [x] Polymorphic `WorkflowNode` discriminated union for 10 node types
+  - [x] Topological graph validation (`validate_workflow_graph`)
+  - [x] `WorkflowCompiler` translating declarative JSON into LangGraph `StateGraph`
+  - [x] Safe template interpolation & AST condition evaluation
+  - [x] Curated Agent Middleware Pipeline (`ModelRetryMiddleware`, `ModelFallbackMiddleware`)
+  - [x] End-to-end multi-agent orchestration and structured JSON synthesis
+- [ ] **Phase 3: Tool Builder & Knowledge Integration**
+  - [ ] Custom HTTP/REST API tool builder with auth & response mapping
+  - [ ] Subprocess-isolated code execution tools
+  - [ ] Read-only SQL database querying tools
+  - [ ] Dynamic per-node knowledge base attachment
+- [ ] **Phase 4: Advanced Orchestration & Cross-Workflow Subgraphs**
+- [ ] **Phase 5: Visual Drag-and-Drop Frontend (Next.js 15 & React Flow)**
