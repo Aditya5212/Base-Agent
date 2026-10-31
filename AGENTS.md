@@ -96,7 +96,9 @@ Base-Agent/
 │   │   │   └── nodes/          # Node builders (chat, retrieve, conditional, code, human, tool)
 │   │   ├── memory.py           # PostgreSQL checkpointer service (AsyncPostgresSaver)
 │   │   ├── thread_service.py   # Thread persistence, root user, and asset management
-│   │   ├── tools.py            # LangChain agent tool factory (make_search_tool, user-scoped hybrid search)
+│   │   ├── tools.py            # LangChain agent tool factory & backwards-compatible re-exports
+│   │   ├── rag_tools.py        # Modular RAG research tools (Exploitation & Exploration)
+│   │   ├── multi_query.py      # LLM query expansion & parallel cross-query RRF fusion
 │   │   ├── document_loader.py  # Canonical Microsoft MarkItDown parser
 │   │   ├── document_processor.py # Asynchronous RAG ingestion pipeline (BackgroundTasks / Taskiq)
 │   │   ├── text_splitter.py    # Structure-aware token chunking (tiktoken cl100k_base)
@@ -113,7 +115,8 @@ Base-Agent/
 │   ├── test_lightrag_live.py        # Interactive script testing live LightRAG + PGTableGraphStorage
 │   ├── test_taskiq_live.py          # Interactive script testing live Taskiq dispatch and PG queue
 │   ├── test_workflow_live.py        # Interactive script testing live Workflow Engine + Graph Compiler
-│   └── test_multi_agent_structured_workflow.py # Interactive multi-agent advisory council workflow
+│   ├── test_multi_agent_structured_workflow.py # Interactive multi-agent advisory council workflow
+│   └── test_rag_research_tools_live.py # Interactive live Modular RAG Research Tool Suite verification
 └── tests/
     ├── __init__.py
     ├── conftest.py             # Pytest session setup & database table auto-initialization
@@ -133,6 +136,7 @@ Base-Agent/
     ├── test_documents_api.py   # Document upload, search, and delete endpoint tests
     ├── test_rag_agent.py       # RAG-augmented agent execution and streaming tests
     ├── test_rag_providers.py   # Pluggable RAG framework and provider tests
+    ├── test_rag_tools.py       # Modular RAG research tools unit and integration tests
     ├── test_taskiq.py          # Taskiq task queue and broker lifecycle tests
     ├── test_workflow_compiler.py# Workflow topological validation & compiler tests
     ├── test_workflow_nodes.py  # Node builder unit tests (code sandboxing, chat, retrieval)
@@ -257,6 +261,58 @@ Tenant boundaries are enforced at the storage level using LightRAG's native `wor
 - **`thread_workspace(user_id, thread_id)`**: Thread-isolated graph bucket providing session-scoped memory and zero cross-thread pollution.
 - **`agent_workspace(user_id, agent_id)`**: Dedicated knowledge base for custom Agent Builder agents.
 - **`global_workspace()`**: Shared cross-user knowledge base (`global_kb`).
+
+### 4. Modular RAG Research Tool Suite (Exploitation vs Exploration)
+Base Agent provides a first-class suite of research tools (`app/services/rag_tools.py`) designed for complete 3-tier modularity across Chatbot turns, Agent Builder configs, and Workflow Engine nodes:
+
+```mermaid
+flowchart TD
+    subgraph ClientTiers["3-Tier Modularity Standard"]
+        T1_Chat["Tier 1: Chatbot (/api/v1/chat)"]
+        T2_Agent["Tier 2: Agent Node (AgentConfig.tools)"]
+        T3_WF["Tier 3: Workflow Engine (tool_call / retrieve)"]
+    end
+
+    subgraph RAGSuite["Modular RAG Research Suite (app/services/rag_tools.py)"]
+        subgraph Exploitation["Exploitation (Precision Facts & Knowledge Graphs)"]
+            E1["hybrid_document_search\n(Dense + FTS + RRF)"]
+            E2["graph_rag_search\n(LightRAG Knowledge Graph)"]
+        end
+        subgraph Exploration["Exploration (Agent-Driven Multi-Query Search)"]
+            X1["multi_query_search\n(Parallel Hybrid Search + Cross-Query RRF)"]
+        end
+    end
+
+    subgraph AgenticWorkflows["Agentic Deep Research Orchestration"]
+        ADR["Deep Research Synthesis\n(Agent combines multi_query_search + graph_rag_search)"]
+    end
+
+    T1_Chat --> RAGSuite
+    T2_Agent --> RAGSuite
+    T3_WF --> RAGSuite
+    T2_Agent --> AgenticWorkflows
+    T3_WF --> AgenticWorkflows
+    AgenticWorkflows --> RAGSuite
+```
+
+#### Exploitation Tools (Precision Retrieval & Factual Grounding)
+- **`hybrid_document_search`**: Single-query targeted retrieval using OpenAI `text-embedding-3-small` (1536 dims) + PostgreSQL Full-Text Search fused via Reciprocal Rank Fusion (`high_precision`, `balanced`, `high_recall`). Returns formatted passages with section headers and filenames.
+- **`graph_rag_search`**: Navigates the LightRAG knowledge graph stored in PostgreSQL (`PGTableGraphStorage`). Supports `mix`, `local`, `global`, `hybrid`, and `naive` traversal for entity networks, multi-hop relationship reasoning, and high-level summaries.
+
+#### Exploration Tools (Agent-Driven Multi-Perspective Discovery)
+- **`multi_query_search`**: Accepts an array of complementary search queries directly from the calling agent (`queries: list[str]`). Dispatches concurrent hybrid searches across all queries (`asyncio.gather`), deduplicates documents, and fuses results using cross-query Reciprocal Rank Fusion with multi-query coverage bonuses:
+  $$\text{Score}(d) = \sum_{q \in Q} \frac{1}{60 + \text{rank}(d, q)} + (\text{matched\_queries} - 1) \times 0.05$$
+  Allows the agent to actively drive multi-perspective exploration without internal black-box query rewriting.
+
+#### Agentic Deep Research Orchestration
+Rather than a rigid monolithic tool, **Deep Research** is an agentic pattern orchestrated by autonomous agents and multi-agent workflows. The agent formulates an exploratory query array (`multi_query_search`), queries the relational knowledge graph (`graph_rag_search`), and synthesizes evidence into a structured research dossier.
+
+#### 3-Tier Modularity Standard
+1. **Tier 1 (Chatbot Level)**: Chat requests (`/api/v1/chat` and `/api/v1/chat/stream`) accept `retrieval_mode` (`"hybrid"`, `"lightrag"`, `"multi_query"`), seamlessly selecting the retrieval pipeline during conversation turn execution.
+2. **Tier 2 (Agent Node Level)**: Custom agents in the Agent Builder platform declaratively attach research tools via `AgentConfig.tools`. `resolve_agent_tools(agent_config, user_id)` pre-binds tools to the caller's identity at runtime.
+3. **Tier 3 (Workflow Engine Level)**:
+   - **`ToolCallNode`**: Directly resolves and executes any RAG research tool by name (`hybrid_document_search`, `graph_rag_search`, `multi_query_search`) with argument normalization and retry backoff.
+   - **`RetrieveNode`**: Configurable via `RetrieveNodeConfig.provider_name` (`"hybrid"`, `"lightrag"`, `"multi_query"`) with automatic workspace resolution (`user`, `thread`, `agent`, `global`).
 
 ---
 

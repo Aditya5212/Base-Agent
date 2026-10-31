@@ -9,7 +9,7 @@ from typing import Any
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 from app.schemas.workflow import ToolCallNodeConfig
-from app.services.tools import make_search_tool
+from app.services.rag_tools import get_user_rag_tool_map
 from app.services.workflow.state import WorkflowState, render_template
 
 logger = logging.getLogger(__name__)
@@ -49,7 +49,9 @@ def _execute_builtin_tool(tool_name: str, args: dict[str, Any], user_id: str) ->
 
 
 def build_tool_call_node(node_id: str, config_dict: dict[str, Any]):
-    """Builds a tool execution node handler supporting retries and error isolation."""
+    """Builds a tool execution node handler supporting retries, error isolation,
+    and modular RAG research tool resolution.
+    """
     config = ToolCallNodeConfig.model_validate(config_dict or {})
 
     async def tool_call_handler(state: WorkflowState) -> dict[str, Any]:
@@ -82,14 +84,21 @@ def build_tool_call_node(node_id: str, config_dict: dict[str, Any]):
             if builtin_res is not None:
                 return builtin_res
 
-            # Check hybrid search tool
-            if config.tool_name in ("hybrid_document_search", "document_search", "search"):
-                tool_instance = make_search_tool(user_id=user_id)
-                query = resolved_args.get("query") or resolved_args.get("q") or ""
-                preset = resolved_args.get("preset", "balanced")
-                return await tool_instance.ainvoke({"query": query, "preset": preset})
+            # Check modular RAG research tools (hybrid, graph, multi_query)
+            rag_tools = get_user_rag_tool_map(user_id=user_id)
+            tool_key = config.tool_name.lower().strip()
+            if tool_key in rag_tools:
+                tool_instance = rag_tools[tool_key]
+                call_args = dict(resolved_args)
+                # Normalize common parameter aliases
+                if "q" in call_args and "query" not in call_args:
+                    call_args["query"] = call_args.pop("q")
+                if "query" in call_args and "queries" not in call_args and tool_key in ("multi_query_search", "multi_query", "multiquery", "parallel_search"):
+                    raw_q = call_args.pop("query")
+                    call_args["queries"] = [raw_q] if isinstance(raw_q, str) else list(raw_q)
+                return await tool_instance.ainvoke(call_args)
 
-            # Placeholder for future dynamic tool registry (Phase 3)
+            # Placeholder for future dynamic custom tool registry (Phase 3.1)
             return f"[Tool '{config.tool_name}' executed with args: {resolved_args}]"
 
         # 2. Execute with ToolRetryMiddleware and ToolErrorMiddleware
@@ -125,4 +134,3 @@ def build_tool_call_node(node_id: str, config_dict: dict[str, Any]):
         }
 
     return tool_call_handler
-

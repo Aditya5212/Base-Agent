@@ -103,6 +103,7 @@ async def chat(
             model=chat_request.model,
             use_rag=chat_request.use_rag,
             rag_preset=chat_request.rag_preset,
+            retrieval_mode=chat_request.retrieval_mode,
             agent_id=str(agent.id),
             agent_config=agent_config,
         )
@@ -187,6 +188,7 @@ async def chat_stream(
                 model=chat_request.model,
                 use_rag=chat_request.use_rag,
                 rag_preset=chat_request.rag_preset,
+                retrieval_mode=chat_request.retrieval_mode,
                 agent_id=str(agent.id),
                 agent_config=agent_config,
             ):

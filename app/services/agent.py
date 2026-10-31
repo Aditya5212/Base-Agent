@@ -21,11 +21,14 @@ from langgraph.graph.state import CompiledStateGraph
 
 from app.core.config import settings
 from app.core.llm import DEFAULT_MODEL, get_llm
-from app.core.rag.workspace import agent_workspace
+from app.core.rag.factory import get_provider
+from app.core.rag.protocols import RetrievalQuery
+from app.core.rag.workspace import agent_workspace, user_workspace
 from app.core.rag_config import RAGPreset, get_rag_config
 from app.schemas.agent import AgentConfig
 from app.schemas.chat import StreamEvent
 from app.services.memory import get_checkpointer
+from app.services.multi_query import multi_query_hybrid_search
 from app.services.r2_storage import r2_storage_service
 from app.services.retriever import hybrid_search
 from app.services.thread_service import format_thread_assets_context, get_thread_assets_with_signed_urls
@@ -123,13 +126,78 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
     preset = preset or RAGPreset.BALANCED
     rag_cfg = get_rag_config(preset)
 
+    retrieval_mode = configurable.get("retrieval_mode")
+    if not retrieval_mode and agent_config and agent_config.knowledge_providers:
+        for p in agent_config.knowledge_providers:
+            if p.enabled:
+                if p.name == "lightrag":
+                    retrieval_mode = "lightrag"
+                    break
+                if p.mode in ("multi_query", "deep_research"):
+                    retrieval_mode = p.mode
+                    break
+    retrieval_mode = (retrieval_mode or "hybrid").lower().strip()
+
+    # 1. Knowledge Graph mode
+    if retrieval_mode in ("lightrag", "graph", "knowledge_graph"):
+        try:
+            workspace = user_workspace(user_id)
+            rag_provider = await get_provider("lightrag", workspace=workspace)
+            graph_res = await rag_provider.query(
+                RetrievalQuery(query=query_text, mode="mix", top_k=5)
+            )
+            if not graph_res.context:
+                return {
+                    "rag_context": None,
+                    "rag_sources": [],
+                    "thread_assets": thread_assets,
+                    "thread_assets_context": thread_assets_context,
+                }
+            graph_sources = [
+                {
+                    "source_id": idx,
+                    "document_id": None,
+                    "chunk_id": chunk.chunk_id,
+                    "filename": "Knowledge Graph",
+                    "section": None,
+                    "preview": chunk.content[:150],
+                    "content": chunk.content,
+                    "view_url": None,
+                    "download_url": None,
+                    "metadata": chunk.metadata,
+                }
+                for idx, chunk in enumerate(graph_res.chunks, 1)
+            ]
+            return {
+                "rag_context": graph_res.context,
+                "rag_sources": graph_sources,
+                "thread_assets": thread_assets,
+                "thread_assets_context": thread_assets_context,
+            }
+        except Exception as exc:
+            logger.error("Error during LightRAG retrieval in retrieve_node: %s", exc, exc_info=True)
+            return {
+                "rag_context": None,
+                "rag_sources": [],
+                "thread_assets": thread_assets,
+                "thread_assets_context": thread_assets_context,
+            }
+
+    # 2. Multi-Query or Standard Hybrid Search
     try:
-        # Search documents indexed under this user's user_id
-        fused_docs = await hybrid_search(
-            query=query_text,
-            config=rag_cfg,
-            filter_dict={"user_id": user_id},
-        )
+        if retrieval_mode in ("multi_query", "multiquery", "multi_query_search"):
+            fused_docs = await multi_query_hybrid_search(
+                queries=[query_text],
+                user_id=user_id,
+                preset=preset,
+            )
+        else:
+            # Search documents indexed under this user's user_id
+            fused_docs = await hybrid_search(
+                query=query_text,
+                config=rag_cfg,
+                filter_dict={"user_id": user_id},
+            )
     except Exception as exc:
         logger.error("Error during RAG retrieval in retrieve_node: %s", exc, exc_info=True)
         return {
@@ -387,6 +455,7 @@ async def execute_agent(
     model: str | None = None,
     use_rag: bool = False,
     rag_preset: str | RAGPreset | None = None,
+    retrieval_mode: str = "hybrid",
     agent_id: str | None = None,
     agent_config: AgentConfig | dict[str, Any] | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
@@ -401,6 +470,7 @@ async def execute_agent(
         model: Optional model override (e.g. DeepSeek-V4.1-Flash-1017 or DeepSeek-V4-Pro-0813).
         use_rag: Whether to execute hybrid retrieval across user documents.
         rag_preset: Preset tuning chunk size and fusion weights.
+        retrieval_mode: Retrieval strategy ('hybrid', 'lightrag', 'multi_query').
         agent_id: Optional UUID identifier of target agent.
         agent_config: Optional agent configuration schema or dict.
         checkpointer: Optional explicit checkpointer (defaults to global AsyncPostgresSaver).
@@ -428,6 +498,7 @@ async def execute_agent(
             "model": resolved_model,
             "use_rag": use_rag,
             "rag_preset": rag_preset or RAGPreset.BALANCED,
+            "retrieval_mode": retrieval_mode,
             "agent_id": agent_id,
             "agent_config": norm_cfg,
         }
@@ -458,6 +529,7 @@ async def stream_agent_events(
     model: str | None = None,
     use_rag: bool = False,
     rag_preset: str | RAGPreset | None = None,
+    retrieval_mode: str = "hybrid",
     agent_id: str | None = None,
     agent_config: AgentConfig | dict[str, Any] | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
@@ -472,6 +544,7 @@ async def stream_agent_events(
         thread_id: Unique thread identifier for conversation memory isolation.
         user_id: Unique user identifier (defaults to 'root').
         rag_preset: Preset tuning chunk size and fusion weights.
+        retrieval_mode: Retrieval strategy ('hybrid', 'lightrag', 'multi_query').
         agent_id: Optional UUID identifier of target agent.
         agent_config: Optional agent configuration schema or dict.
         checkpointer: Optional checkpointer override (defaults to global AsyncPostgresSaver).
@@ -499,6 +572,7 @@ async def stream_agent_events(
             "model": resolved_model,
             "use_rag": use_rag,
             "rag_preset": rag_preset or RAGPreset.BALANCED,
+            "retrieval_mode": retrieval_mode,
             "agent_id": agent_id,
             "agent_config": norm_cfg,
         }

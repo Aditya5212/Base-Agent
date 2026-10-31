@@ -119,7 +119,9 @@ Base-Agent/
 │   │   │   └── nodes/          # Node builders (chat, retrieve, conditional, code, human, tool)
 │   │   ├── memory.py           # PostgreSQL checkpointer service (AsyncPostgresSaver)
 │   │   ├── thread_service.py   # Thread persistence, root user, and asset management
-│   │   ├── tools.py            # LangChain agent tool factory (make_search_tool, user-scoped hybrid search)
+│   │   ├── tools.py            # LangChain agent tool factory & backwards-compatible re-exports
+│   │   ├── rag_tools.py        # Modular RAG research tools (Exploitation & Exploration)
+│   │   ├── multi_query.py      # LLM query expansion & parallel cross-query RRF fusion
 │   │   ├── document_loader.py  # Canonical Microsoft MarkItDown parser
 │   │   ├── document_processor.py # Asynchronous RAG ingestion pipeline (BackgroundTasks / Taskiq)
 │   │   ├── text_splitter.py    # Structure-aware token chunking (tiktoken cl100k_base)
@@ -136,8 +138,9 @@ Base-Agent/
 │   ├── test_lightrag_live.py        # Live LightRAG + PGTableGraphStorage smoke test
 │   ├── test_taskiq_live.py          # Live Taskiq dispatch and PostgreSQL message storage
 │   ├── test_workflow_live.py        # Live Workflow Engine + Graph Compiler verification
-│   └── test_multi_agent_structured_workflow.py # Live multi-agent advisory council workflow
-└── tests/                           # Complete pytest suite (120 tests passing)
+│   ├── test_multi_agent_structured_workflow.py # Live multi-agent advisory council workflow
+│   └── test_rag_research_tools_live.py # Live Modular RAG Research Tool Suite verification
+└── tests/                           # Complete pytest suite (129 tests passing)
 ```
 
 ---

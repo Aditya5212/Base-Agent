@@ -29,6 +29,10 @@ class ChatRequest(BaseModel):
         default="balanced",
         description="RAG precision/recall preset: high_precision, balanced, high_recall",
     )
+    retrieval_mode: str = Field(
+        default="hybrid",
+        description="RAG retrieval strategy: hybrid (dense+sparse), lightrag (graph), multi_query (parallel queries)",
+    )
     agent_id: str | None = Field(
         default=None,
         description="Optional agent UUID. If omitted, the user's default agent is resolved.",
@@ -134,7 +138,6 @@ class StreamEvent(BaseModel):
 
     def to_sse(self) -> str:
         """Serializes event to Server-Sent Events wire format."""
-        import json
         payload = json.dumps(self.data)
         return f"event: {self.event}\ndata: {payload}\n\n"
 

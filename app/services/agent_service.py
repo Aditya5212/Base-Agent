@@ -370,3 +370,41 @@ async def resolve_agent_for_chat(
     validated_cfg = validate_agent_config(agent.config)
     set_cached_agent_config(str(agent.id), agent.version, validated_cfg)
     return agent, validated_cfg
+
+
+def resolve_agent_tools(agent_config: AgentConfig, user_id: str) -> list[Any]:
+    """Resolves and instantiates LangChain tools attached to an agent, bound to *user_id*.
+
+    Supports:
+    - RAG research tools: 'hybrid_document_search', 'graph_rag_search', 'multi_query_search', 'deep_research_search'
+    - Macro selector: 'all_rag_tools' (attaches full exploitation & exploration suite)
+    """
+    if not agent_config.tools:
+        return []
+
+    from app.services.rag_tools import get_user_rag_tool_map, get_user_rag_tools
+
+    rag_tool_map = get_user_rag_tool_map(user_id=user_id)
+    resolved_tools: list[Any] = []
+    seen_names: set[str] = set()
+
+    for tool_spec in agent_config.tools:
+        if not tool_spec.enabled:
+            continue
+
+        tool_id = tool_spec.tool_id.lower().strip()
+        if tool_id in ("all_rag_tools", "all_rag", "rag_suite"):
+            for t in get_user_rag_tools(user_id=user_id):
+                if t.name not in seen_names:
+                    resolved_tools.append(t)
+                    seen_names.add(t.name)
+            continue
+
+        if tool_id in rag_tool_map:
+            t = rag_tool_map[tool_id]
+            if t.name not in seen_names:
+                resolved_tools.append(t)
+                seen_names.add(t.name)
+
+    return resolved_tools
+

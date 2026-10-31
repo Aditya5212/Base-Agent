@@ -1,20 +1,33 @@
-"""LangChain agent tools for hybrid document retrieval and knowledge search."""
+"""LangChain agent tools for hybrid document retrieval and knowledge search.
+
+Re-exports the modular RAG research tool suite from app.services.rag_tools
+while preserving complete backwards-compatibility for existing call-sites and test fixtures.
+"""
+
+from __future__ import annotations
 
 import logging
-from langchain_core.tools import tool
+from typing import Any
+
+from langchain_core.tools import BaseTool, tool
 
 from app.core.rag_config import get_rag_config
+from app.services.rag_tools import (
+    get_user_rag_tool_map,
+    get_user_rag_tools,
+    make_graph_rag_tool,
+    make_hybrid_search_tool,
+    make_multi_query_search_tool,
+)
 from app.services.retriever import hybrid_search
 
 logger = logging.getLogger(__name__)
 
 
-def make_search_tool(user_id: str):
+def make_search_tool(user_id: str) -> BaseTool:
     """Returns a hybrid_document_search tool pre-bound to *user_id*.
 
-    The returned tool does NOT expose user_id as an LLM-callable argument —
-    it is closed over from the call-site so the model can never escalate to
-    another tenant's documents.
+    Backwards-compatible implementation preserving patchability of app.services.tools.hybrid_search.
     """
 
     @tool
@@ -23,9 +36,6 @@ def make_search_tool(user_id: str):
         preset: str = "balanced",
     ) -> str:
         """Searches user uploaded documents and knowledge base using Hybrid Search (PGVector HNSW Dense + PostgreSQL Full-Text Sparse + Reciprocal Rank Fusion).
-
-        Use this tool whenever you need to find factual information, technical specifications, documentation,
-        or citations from uploaded files to answer a user's question accurately.
 
         Args:
             query: The natural language search question or keyword query.
@@ -49,7 +59,7 @@ def make_search_tool(user_id: str):
                 filename = doc.metadata.get("filename") or doc.metadata.get("source") or "Document"
                 headers = [v for k, v in doc.metadata.items() if k.startswith("header_")]
                 section_str = f" | Section: {' > '.join(headers)}" if headers else ""
-                results.append(f"[Source {idx}: {filename}{section_str}]\n{doc.page_content}")
+                results.append(f"[Source {idx}: {filename}{section_str}]\n{doc.page_content.strip()}")
 
             return "\n\n---\n\n".join(results)
         except Exception as exc:
@@ -59,7 +69,22 @@ def make_search_tool(user_id: str):
     return hybrid_document_search
 
 
-# Default tool instance (user_id="root") kept for backwards-compatibility with
-# existing code that imports AGENT_TOOLS directly. Prefer make_search_tool() in
-# new agent code so the correct user scope is enforced per request.
-AGENT_TOOLS = [make_search_tool("root")]
+# Default tool instances (user_id="root") kept for backwards-compatibility with
+# existing code that imports AGENT_TOOLS directly.
+AGENT_TOOLS: list[BaseTool] = [
+    make_search_tool("root"),
+    make_graph_rag_tool("root"),
+    make_multi_query_search_tool("root"),
+]
+
+__all__ = [
+    "AGENT_TOOLS",
+    "hybrid_search",
+    "get_rag_config",
+    "make_search_tool",
+    "make_hybrid_search_tool",
+    "make_graph_rag_tool",
+    "make_multi_query_search_tool",
+    "get_user_rag_tools",
+    "get_user_rag_tool_map",
+]
