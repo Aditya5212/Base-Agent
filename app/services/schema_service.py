@@ -22,7 +22,7 @@ def validate_json_schema(schema_dict: dict[str, Any]) -> None:
     """Validates that a dictionary is a syntactically valid JSON Schema specification."""
     if not isinstance(schema_dict, dict):
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail="JSON Schema definition must be a valid JSON object.",
         )
 
@@ -30,7 +30,7 @@ def validate_json_schema(schema_dict: dict[str, Any]) -> None:
         Draft202012Validator.check_schema(schema_dict)
     except Exception as exc:
         raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
             detail=f"Invalid JSON Schema: {exc}",
         ) from exc
 

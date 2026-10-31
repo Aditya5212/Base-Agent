@@ -68,10 +68,14 @@ This document tracks planned architectural enhancements, future infrastructure u
 
 ## 🔐 Auth & Platform Features (Upcoming Phases)
 
-### 8. Production Clerk / OIDC Authentication (Phase 1)
+### 8. Production Clerk / OIDC Authentication
 - Swap the header-based mock implementation in `app/core/auth.py` (`get_current_user`) for Clerk SDK JWT validation.
 - All downstream route signatures (`UserContext = Depends(get_current_user)`) remain 100% stable with zero endpoint refactoring required.
 
-### 9. Dynamic Agent Builder Platform (Phase 2)
-- Dynamic graph topology compilation from user-submitted JSON / Pydantic specs.
-- Pluggable node registry: `ChatNode`, `RAGRetrieverNode`, `ToolExecutorNode`, `HumanApprovalNode`.
+### 9. Custom Tool Builder Platform (Phase 3 Roadmap)
+- Implement dynamic `tools` persistence table (id, user_id, name, description, type, input_schema, output_schema, config).
+- Build `ToolRegistry` caching compiled LangChain tools dynamically.
+- Implement HTTP/REST API tool executor using `httpx.AsyncClient` with auth credentials and response mapping.
+- Implement isolated Python code tool execution (subprocess sandbox).
+- Implement read-only SQL query tools for external databases.
+- Dynamic per-node knowledge base attachment API (`POST /workflows/{id}/nodes/{node_id}/knowledge`).
