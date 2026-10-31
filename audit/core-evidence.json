@@ -1,0 +1,61 @@
+{
+  "workspace_collision": {
+    "alice-bob": "u_alice_bob",
+    "alice_bob": "u_alice_bob",
+    "long_ids_collide": true
+  },
+  "human_approval_service_status": {
+    "reported_status": "COMPLETED",
+    "pending_nodes": [
+      "h"
+    ],
+    "interrupt_count": 1
+  },
+  "workflow_schemas_not_enforced": {
+    "invalid_empty_input_and_output_accepted": true
+  },
+  "tool_requires_approval_ignored": {
+    "executed_without_interrupt": true
+  },
+  "parallel_compile": "Unsupported node type 'parallel' for node 'n'.",
+  "subgraph_compile": "Unsupported node type 'subgraph' for node 'n'.",
+  "ordinary_fanout": {
+    "error_type": "InvalidUpdateError",
+    "message": "At key 'variables': Can receive only one value per step. Use an Annotated key to handle multiple values."
+  },
+  "chat_config_runtime": {
+    "structured_enforce_returned_plain_text": "plain unstructured answer",
+    "llm_invoked_with_blocked_topic": true,
+    "tool_binding_available_on_stub": false,
+    "call_received_plain_messages": true
+  },
+  "workflow_checkpoint_collision": {
+    "bob_model_context_contains_alice_text": true
+  },
+  "failed_tool_reported_success": {
+    "success": true,
+    "error": null,
+    "output": "Error executing tool 'audit_failure': Error executing entrypoint: division by zero"
+  },
+  "tool_schema_constraints_ignored": {
+    "n": -2
+  },
+  "valid_nullable_schema_compile_failure": "TypeError: unhashable type: 'list'",
+  "caller_controlled_module_allowlist": {
+    "os_import_accepted_and_executed": "nt"
+  },
+  "code_timeout": {
+    "finished_at_timeout": false,
+    "finished_after_timeout": true
+  },
+  "readonly_sql_lexical_checks": [
+    {
+      "query": "WITH moved AS (DELETE\nFROM audit_table RETURNING *) SELECT * FROM moved",
+      "accepted_by_validator_only_not_executed": true
+    },
+    {
+      "query": "SELECT pg_sleep(30)",
+      "accepted_by_validator_only_not_executed": true
+    }
+  ]
+}
