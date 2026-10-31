@@ -60,7 +60,8 @@ def build_tool_call_node(node_id: str, config_dict: dict[str, Any]):
 
         # 1. Resolve inputs from mappings
         resolved_args: dict[str, Any] = {}
-        for arg_key, arg_val in config.input_mapping.items():
+        input_mapping = config.input_mapping or (config_dict or {}).get("arguments_template") or (config_dict or {}).get("arguments") or {}
+        for arg_key, arg_val in input_mapping.items():
             if isinstance(arg_val, str):
                 rendered = render_template(arg_val, state)
                 # Try JSON deserialization if string looks like JSON
@@ -98,7 +99,20 @@ def build_tool_call_node(node_id: str, config_dict: dict[str, Any]):
                     call_args["queries"] = [raw_q] if isinstance(raw_q, str) else list(raw_q)
                 return await tool_instance.ainvoke(call_args)
 
-            # Placeholder for future dynamic custom tool registry (Phase 3.1)
+            # Check dynamic custom tool registry (Phase 3.1)
+            from app.core.database import AsyncSessionLocal
+            from app.services.tool_registry import ToolRegistry
+
+            async with AsyncSessionLocal() as session:
+                custom_tools = await ToolRegistry.resolve_tools(
+                    user_id=user_id,
+                    tool_names=[config.tool_name],
+                    db=session,
+                )
+                if custom_tools:
+                    return await custom_tools[0].ainvoke(resolved_args)
+
+            # Fallback for unrecognized test/mock tools
             return f"[Tool '{config.tool_name}' executed with args: {resolved_args}]"
 
         # 2. Execute with ToolRetryMiddleware and ToolErrorMiddleware

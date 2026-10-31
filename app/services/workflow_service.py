@@ -9,11 +9,13 @@ from fastapi import HTTPException, status
 from langgraph.errors import GraphInterrupt
 from langgraph.types import Command
 from sqlalchemy import func, select
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.workflow import Workflow, WorkflowRun
 from app.schemas.workflow import (
     WorkflowCreate,
+    WorkflowNodeKnowledgeConfig,
     WorkflowResumeRequest,
     WorkflowRunRequest,
     WorkflowUpdate,
@@ -173,6 +175,57 @@ async def update_workflow(
     await session.commit()
     await session.refresh(workflow)
     logger.info("Updated workflow '%s' to version %d", workflow.name, workflow.version)
+    return workflow
+
+
+async def attach_node_knowledge(
+    session: AsyncSession,
+    workflow_id: uuid.UUID,
+    user_id: str,
+    node_id: str,
+    knowledge_config: WorkflowNodeKnowledgeConfig,
+) -> Workflow:
+    """Configures or attaches knowledge retrieval parameters to a specific workflow node."""
+    workflow = await get_workflow_by_id(session, workflow_id, user_id)
+
+    nodes = list(workflow.nodes or [])
+    node_found = False
+    updated_nodes = []
+
+    for node in nodes:
+        if node.get("id") == node_id:
+            node_found = True
+            n_type = node.get("type")
+            node_cfg = dict(node.get("config") or {})
+
+            if n_type == "retrieve":
+                node_cfg["provider_name"] = knowledge_config.provider_name
+                node_cfg["workspace_type"] = knowledge_config.workspace_type
+                node_cfg["top_k"] = knowledge_config.top_k
+                if knowledge_config.query_template:
+                    node_cfg["query_template"] = knowledge_config.query_template
+                if knowledge_config.output_variable:
+                    node_cfg["output_variable"] = knowledge_config.output_variable
+                if knowledge_config.sources_variable:
+                    node_cfg["sources_variable"] = knowledge_config.sources_variable
+            else:
+                node_cfg["knowledge"] = knowledge_config.model_dump(mode="json")
+
+            node["config"] = node_cfg
+        updated_nodes.append(node)
+
+    if not node_found:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Node '{node_id}' not found in workflow '{workflow_id}'.",
+        )
+
+    workflow.nodes = updated_nodes
+    flag_modified(workflow, "nodes")
+    workflow.version += 1
+    await session.commit()
+    await session.refresh(workflow)
+    logger.info("Attached knowledge config to node '%s' in workflow '%s'", node_id, workflow.name)
     return workflow
 
 

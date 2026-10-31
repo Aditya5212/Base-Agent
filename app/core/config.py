@@ -176,6 +176,9 @@ class Settings(BaseSettings):
             return f"https://{self.R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
         return None
 
+    # Security & Secret Encryption
+    SECRET_ENCRYPTION_KEY: str | None = None
+
     # Embeddings & Vector Search (OpenAI text-embedding-3-small)
     EMBEDDING_MODEL: str = "text-embedding-3-small"
     EMBEDDING_DIMENSIONS: int = 1536

@@ -9,7 +9,8 @@ A production-grade, extensible AI agent platform and **declarative workflow engi
 - **Phase 0.5 (Infrastructure & Prerequisites — ✅ Complete):** Async Alembic database migrations, Taskiq PostgreSQL background task queue, multi-tenant auth & ownership enforcement, slowapi rate limiting, and production Docker containerization.
 - **Phase 1 (Agent Configuration Core & Schemas — ✅ Complete):** Database-persisted custom agents with JSONB configs, auto-seeded default assistant, in-memory LRU config caching, and JSON Schema Draft 2020-12 registry.
 - **Phase 2 (Dynamic Workflow Engine & Graph Compiler — ✅ Complete):** Declarative workflow engine compiling JSON graphs into executable LangGraph `StateGraph(WorkflowState)` state machines with 10 node types, safe AST condition routing, curated middlewares (`ModelRetry`, `ModelFallback`), persistent checkpointing, and multi-agent structured evaluation pipelines.
-- **Phase 3 (Tool Builder & Knowledge Integration — 🚧 Upcoming):** Custom HTTP/REST API tool builder, sandboxed code execution, read-only SQL querying, and per-node dynamic knowledge attachments.
+- **Phase 3 (Tool Builder & Knowledge Integration — ✅ Complete):** Dynamic tool builder supporting HTTP/REST APIs, AST-sandboxed Python code execution, and read-only SQL queries with symmetric Fernet encryption at rest; runtime dynamic Pydantic schema compilation and LangChain `BaseTool` registry; per-node knowledge attachment; modular RAG research suite (Exploitation vs Exploration).
+- **Phase 3.2 (Observability & Production Monitoring — 🚧 In Progress):** OpenTelemetry distributed tracing, Prometheus metrics exporter, and LLM observability instrumentation.
 
 ---
 
@@ -64,6 +65,7 @@ Base-Agent/
 │   ├── main.py                 # FastAPI application factory, lifespan, CORS, rate limiting & routes
 │   ├── core/                   # Infrastructure & singleton configurations
 │   │   ├── config.py           # Pydantic settings & postgres environment sync
+│   │   ├── crypto.py           # Symmetric Fernet encryption & secret masking
 │   │   ├── database.py         # Async SQLAlchemy engine, session dependency & auto-migrations
 │   │   ├── auth.py             # Swappable UserContext, get_current_user & require_admin
 │   │   ├── rate_limit.py       # slowapi Limiter configuration
@@ -89,7 +91,8 @@ Base-Agent/
 │   │           ├── storage.py  # Admin-only raw Cloudflare R2 object storage operations
 │   │           ├── agents.py   # Agent Builder CRUD, clone & promotion endpoints
 │   │           ├── structured_schemas.py # JSON Schema registration & validation endpoints
-│   │           └── workflows.py# Dynamic Workflow Engine CRUD, compilation & execution endpoints
+│   │           ├── workflows.py# Dynamic Workflow Engine CRUD, compilation & execution endpoints
+│   │           └── tools.py    # Dynamic Tool CRUD, test-execution & system tool listing
 │   ├── models/                 # Database persistence models
 │   │   ├── base.py             # Declarative Base & UTC TimestampMixin
 │   │   ├── user.py             # User model (root user auto-seeded)
@@ -97,7 +100,8 @@ Base-Agent/
 │   │   ├── document.py         # Document & DocumentChunk persistence models
 │   │   ├── agent.py            # Agent persistence model with JSONB configuration
 │   │   ├── structured_schema.py# Structured JSON schema definition model
-│   │   └── workflow.py         # Workflow & WorkflowRun state persistence models
+│   │   ├── workflow.py         # Workflow & WorkflowRun state persistence models
+│   │   └── tool.py             # Dynamic Tool model with JSONB config and input schema
 │   ├── schemas/                # Request & response Pydantic contracts
 │   │   ├── chat.py             # ChatRequest, ChatResponse, StreamEvent, ThreadAssetItem
 │   │   ├── document.py         # Knowledge Base documents, chunks, reindex schemas
@@ -105,7 +109,8 @@ Base-Agent/
 │   │   ├── storage.py          # StorageObjectListResponse, PresignedUrlRequest
 │   │   ├── agent.py            # AgentConfig, AgentCreate, AgentUpdate, AgentResponse
 │   │   ├── structured_schema.py# StructuredSchemaCreate, StructuredSchemaResponse
-│   │   └── workflow.py         # Discriminated WorkflowNode, WorkflowEdge, execution contracts
+│   │   ├── workflow.py         # Discriminated WorkflowNode, WorkflowEdge, execution contracts
+│   │   └── tool.py             # Discriminated tool configurations, schemas, and execution payloads
 │   ├── services/               # Core business logic
 │   │   ├── agent.py            # LangGraph conversational agent (retrieve -> chat)
 │   │   ├── agent_service.py    # Agent CRUD, cloning, default resolution & LRU config cache
@@ -117,6 +122,9 @@ Base-Agent/
 │   │   │   ├── compiler.py     # StateGraph compiler (JSON -> LangGraph StateGraph)
 │   │   │   ├── middleware/     # Curated middleware pipeline (ModelRetry, ModelFallback)
 │   │   │   └── nodes/          # Node builders (chat, retrieve, conditional, code, human, tool)
+│   │   ├── tool_service.py     # Dynamic tool CRUD, secret masking & test execution
+│   │   ├── tool_registry.py    # Dynamic tool compiler (BaseTool + runtime Pydantic schema) & cache
+│   │   ├── tool_executors/     # Specialized tool execution engines (http, code, database)
 │   │   ├── memory.py           # PostgreSQL checkpointer service (AsyncPostgresSaver)
 │   │   ├── thread_service.py   # Thread persistence, root user, and asset management
 │   │   ├── tools.py            # LangChain agent tool factory & backwards-compatible re-exports
@@ -140,7 +148,7 @@ Base-Agent/
 │   ├── test_workflow_live.py        # Live Workflow Engine + Graph Compiler verification
 │   ├── test_multi_agent_structured_workflow.py # Live multi-agent advisory council workflow
 │   └── test_rag_research_tools_live.py # Live Modular RAG Research Tool Suite verification
-└── tests/                           # Complete pytest suite (129 tests passing)
+└── tests/                           # Complete pytest suite (148 tests passing)
 ```
 
 ---
@@ -337,7 +345,7 @@ docker compose logs -f
 
 ## 🧪 Testing & Verification
 
-### Running Automated Test Suite (120 Tests)
+### Running Automated Test Suite (148 Tests)
 
 ```bash
 uv run pytest
@@ -345,7 +353,7 @@ uv run pytest
 
 Output:
 ```text
-======================= 120 passed, 6 warnings in 74.12s =======================
+======================= 148 passed, 6 warnings in 85.55s =======================
 ```
 
 ### Running Live Interactive Verification Scripts

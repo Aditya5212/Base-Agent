@@ -38,6 +38,7 @@ Base-Agent/
 │   │   ├── database.py         # Async SQLAlchemy engine, session dependency & programmatic migrations
 │   │   ├── auth.py             # Swappable UserContext, get_current_user & require_admin
 │   │   ├── rate_limit.py       # slowapi Limiter configuration
+│   │   ├── crypto.py           # Symmetric Fernet encryption & secret masking
 │   │   ├── taskiq.py           # Taskiq PostgreSQL broker & lifecycle hooks
 │   │   ├── llm.py              # DeepSeek LLM configuration, model registry & client factory
 │   │   ├── embedding.py        # Decoupled OpenAI embedding factory (1536 dims)
@@ -63,7 +64,8 @@ Base-Agent/
 │   │           ├── storage.py  # Admin-only raw Cloudflare R2 object storage operations
 │   │           ├── agents.py   # Agent Builder CRUD, clone & promotion endpoints
 │   │           ├── structured_schemas.py # JSON Schema registration & validation endpoints
-│   │           └── workflows.py# Dynamic Workflow Engine CRUD, compilation & execution endpoints
+│   │           ├── workflows.py# Dynamic Workflow Engine CRUD, compilation & execution endpoints
+│   │           └── tools.py    # Dynamic Tool CRUD, test-execution & system tool listing
 │   ├── models/                 # Database persistence models
 │   │   ├── __init__.py
 │   │   ├── base.py             # Declarative Base & UTC TimestampMixin
@@ -72,7 +74,8 @@ Base-Agent/
 │   │   ├── document.py         # Document & DocumentChunk persistence models
 │   │   ├── agent.py            # Agent persistence model with JSONB configuration
 │   │   ├── structured_schema.py# Structured JSON schema definition model
-│   │   └── workflow.py         # Workflow & WorkflowRun state persistence models
+│   │   ├── workflow.py         # Workflow & WorkflowRun state persistence models
+│   │   └── tool.py             # Dynamic Tool model with JSONB config and input schema
 │   ├── schemas/                # Request & response Pydantic contracts
 │   │   ├── __init__.py
 │   │   ├── health.py           # Health response models
@@ -81,7 +84,8 @@ Base-Agent/
 │   │   ├── document.py         # DocumentUploadResponse, RAGSearchRequest/Response
 │   │   ├── agent.py            # AgentConfig, AgentCreate, AgentUpdate, AgentResponse
 │   │   ├── structured_schema.py# StructuredSchemaCreate, StructuredSchemaResponse
-│   │   └── workflow.py         # Discriminated WorkflowNode, WorkflowEdge, execution contracts
+│   │   ├── workflow.py         # Discriminated WorkflowNode, WorkflowEdge, execution contracts
+│   │   └── tool.py             # Discriminated tool configurations, schemas, and execution payloads
 │   ├── services/               # Business logic & agent workflows
 │   │   ├── __init__.py
 │   │   ├── agent.py            # LangGraph agent topology (retrieve -> chat) & state schema
@@ -94,6 +98,13 @@ Base-Agent/
 │   │   │   ├── compiler.py     # StateGraph compiler (JSON -> LangGraph StateGraph)
 │   │   │   ├── middleware/     # Curated middleware pipeline (ModelRetry, ModelFallback)
 │   │   │   └── nodes/          # Node builders (chat, retrieve, conditional, code, human, tool)
+│   │   ├── tool_service.py     # Dynamic tool CRUD, secret masking & test execution
+│   │   ├── tool_registry.py    # Dynamic tool compiler (BaseTool + runtime Pydantic schema) & cache
+│   │   ├── tool_executors/     # Specialized tool execution engines
+│   │   │   ├── __init__.py     # Executor exports
+│   │   │   ├── http_executor.py# Async httpx client with template interpolation & auth
+│   │   │   ├── code_executor.py# AST-sandboxed Python executor with timeout & whitelist
+│   │   │   └── database_executor.py # Read-only parameterized SQL query runner
 │   │   ├── memory.py           # PostgreSQL checkpointer service (AsyncPostgresSaver)
 │   │   ├── thread_service.py   # Thread persistence, root user, and asset management
 │   │   ├── tools.py            # LangChain agent tool factory & backwards-compatible re-exports
@@ -137,6 +148,7 @@ Base-Agent/
     ├── test_rag_agent.py       # RAG-augmented agent execution and streaming tests
     ├── test_rag_providers.py   # Pluggable RAG framework and provider tests
     ├── test_rag_tools.py       # Modular RAG research tools unit and integration tests
+    ├── test_tools_api.py       # Tool Builder platform, executors, CRUD & workflow execution tests
     ├── test_taskiq.py          # Taskiq task queue and broker lifecycle tests
     ├── test_workflow_compiler.py# Workflow topological validation & compiler tests
     ├── test_workflow_nodes.py  # Node builder unit tests (code sandboxing, chat, retrieval)
@@ -421,6 +433,18 @@ Real-time token and reasoning event streaming over HTTP via **Server-Sent Events
 | `GET` | `/api/v1/workflows/{workflow_id}/runs` | List Runs | Lists historical runs and outcomes for a workflow |
 | `GET` | `/api/v1/workflows/runs/{run_id}` | Run Details | Inspects status, execution traces, node history, and error logs |
 | `POST` | `/api/v1/workflows/runs/{run_id}/resume` | Resume Run | Resumes an INTERRUPTED workflow with human decision input |
+| `POST` | `/api/v1/workflows/{workflow_id}/nodes/{node_id}/knowledge` | Attach Node Knowledge | Dynamically configures or overrides per-node RAG provider settings |
+
+### Dynamic Tool Builder & Registry (`/api/v1/tools`)
+| Method | Path | Summary | Description |
+| ------ | ---- | ------- | ----------- |
+| `POST` | `/api/v1/tools` | Create Tool | Registers custom tool (`api`, `code`, `database`) with encrypted secrets |
+| `GET` | `/api/v1/tools` | List Tools | Lists tenant tools (and system tools) with search and pagination |
+| `GET` | `/api/v1/tools/built-in` | List Built-in Tools | Discovers global system tools (calculator, modular RAG research suite) |
+| `GET` | `/api/v1/tools/{tool_id}` | Get Tool | Retrieves tool definition with masked secret credentials |
+| `PUT` | `/api/v1/tools/{tool_id}` | Update Tool | Updates configuration, re-encrypts updated secrets, increments version |
+| `DELETE` | `/api/v1/tools/{tool_id}` | Delete Tool | Removes tool and purges cached instances from `ToolRegistry` |
+| `POST` | `/api/v1/tools/{tool_id}/execute` | Test Execute Tool | Directly executes a tool in isolation with test arguments |
 
 ---
 
@@ -600,13 +624,87 @@ Workflows can assemble collaborative multi-agent teams. Verified via [`scripts/t
 
 ---
 
-## 16. Future Roadmap: Phase 3 Tool Builder & Beyond
+## 16. Tool Builder Platform & Dynamic Tool Registry (Phase 3)
 
-- **Phase 3 (Tool Builder & Knowledge Integration)**:
-  - Custom HTTP/REST API tool builder with authentication and response mapping.
-  - Code tool executor with subprocess isolation.
-  - Read-only SQL database query executor.
-  - Per-node dynamic knowledge base attachment.
+Base Agent provides an enterprise-grade **Tool Builder Platform** (`app/services/tool_service.py`) and dynamic execution registry (`app/services/tool_registry.py`) that empowers users and workflows to create, manage, validate, and execute custom tools at runtime:
+
+```mermaid
+flowchart TD
+    subgraph Ingestion["Tool Definition & Persistence"]
+        User["User / Admin API"] -->|POST /api/v1/tools| Router["FastAPI Tools Router"]
+        Router --> ToolService["ToolService (CRUD & Isolation)"]
+        ToolService --> FernetCrypto["Fernet Symmetric Encryptor (app/core/crypto.py)"]
+        FernetCrypto --> ToolsDB[(PostgreSQL tools table)]
+    end
+
+    subgraph RuntimeCompilation["Dynamic Tool Registry & Compilation"]
+        ToolsDB --> Registry["ToolRegistry (LRU Cached BaseTool Compiler)"]
+        Registry --> SchemaCompiler["Dynamic Pydantic Model Generator (json_schema_to_pydantic_model)"]
+    end
+
+    subgraph ExecutionEngines["Specialized Tool Executors (app/services/tool_executors/)"]
+        Registry --> HttpExec["HttpToolExecutor\n(httpx + templates + auth + JSONPath)"]
+        Registry --> CodeExec["CodeToolExecutor\n(AST Sandbox + Whitelist + Timeout)"]
+        Registry --> DbExec["DatabaseToolExecutor\n(Read-Only SQL + Parameterized + max_rows)"]
+        Registry --> BuiltIns["Built-in & Modular RAG Tools\n(Calculator, Hybrid Search, LightRAG, MultiQuery)"]
+    end
+
+    subgraph Consumers["Multi-Tier Execution Consumers"]
+        HttpExec --> ExternalAPIs["External REST Services"]
+        CodeExec --> PythonScope["Restricted Python Runtime"]
+        DbExec --> ExternalDBs[(External SQL Databases)]
+        
+        T1["Tier 1: Conversational Chatbot (/api/v1/chat)"] -.-> Registry
+        T2["Tier 2: Agent Node (AgentConfig.tools)"] -.-> Registry
+        T3["Tier 3: Workflow ToolCallNode"] -.-> Registry
+    end
+```
+
+### 1. Persistence Model & Secret Encryption at Rest
+Custom tools are persisted in PostgreSQL (`tools` table) via [`app/models/tool.py`](file:///c:/Users/Aditya/Desktop/Base-Agent/app/models/tool.py):
+- **Columns**: `id` (UUID), `user_id` (FK to `users.id`), `name`, `description`, `type` (`api`, `code`, `database`, `built_in`), `input_schema` (JSONB), `output_schema` (JSONB), `config` (JSONB), `is_system` (Boolean), `version` (Integer).
+- **Composite Unique Constraint**: `(user_id, name)` ensures uniqueness per tenant.
+- **Symmetric Secret Encryption (`app/core/crypto.py`)**:
+  - Sensitive configuration parameters (`auth_token`, `connection_string`, sensitive header values) are encrypted at rest using AES-128-CBC + HMAC-SHA256 (`cryptography.fernet`).
+  - Read endpoints automatically decrypt configuration internally for execution while masking credentials (`***...***`) in client HTTP responses.
+
+### 2. Specialized Execution Engines (`app/services/tool_executors/`)
+- **`HttpToolExecutor`**:
+  - Executes asynchronous HTTP requests via `httpx.AsyncClient`.
+  - Supports URL, header, and query parameter template string interpolation (`{variable_name}`).
+  - Built-in authentication handlers: `Bearer`, `ApiKey` (header or query), and `Basic` auth.
+  - Automatic exponential backoff retries on transient 5xx/network errors via `tenacity`.
+  - Optional JSONPath extraction for isolating target response payloads.
+- **`CodeToolExecutor`**:
+  - Sandboxed Python execution engine with dual-layer safety verification.
+  - **Static AST Analysis**: Rejects forbidden AST nodes (`Import`, `ImportFrom`, `Global`, `Nonlocal`, `Yield`) and blocks private/dunder attribute access (`__subclasses__`, `__globals__`, etc.).
+  - **Execution Sandbox**: Restricted execution scope with safe built-ins, enforced runtime module whitelist (`math`, `datetime`, `json`, `re`, `random`, `collections`, `itertools`, `typing`), and strict timeout guards (`asyncio.wait_for`).
+- **`DatabaseToolExecutor`**:
+  - Read-only SQL query execution engine for reporting and analytical workflows.
+  - **SQL Safety Guard**: Validates that statements are strictly `SELECT` or CTE `WITH` queries; unconditionally blocks mutations (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `TRUNCATE`, `EXEC`).
+  - **Parameterized Query Execution**: Sanitizes inputs via bound parameter dictionaries to eliminate SQL injection vulnerabilities.
+  - Dynamic routing for SQLite (`sqlite3` in worker thread) and PostgreSQL (`asyncpg/psycopg`) database connection URIs with strict `max_rows` truncation caps.
+
+### 3. Dynamic Tool Registry (`ToolRegistry`)
+Located in [`app/services/tool_registry.py`](file:///c:/Users/Aditya/Desktop/Base-Agent/app/services/tool_registry.py):
+- **Runtime Pydantic Model Generation**: `json_schema_to_pydantic_model(schema, model_name)` dynamically compiles arbitrary JSON Schema definitions into strongly-typed Pydantic classes at runtime, supplying LangChain and LLM providers with valid tool call signatures.
+- **Dynamic Compilation**: Converts database `Tool` records into LangChain `BaseTool` instances (`_compile_tool`).
+- **LRU In-Memory Caching**: Caches compiled tool instances per tenant with fine-grained invalidation hooks (`invalidate(user_id, tool_name)`).
+- **Unified Tool Resolution**: `resolve_tools(tool_names, user_id, db)` resolves custom tools from PostgreSQL, seamlessly falling back to global built-ins (`calculator`) and modular RAG research tools (`hybrid_document_search`, `graph_rag_search`, `multi_query_search`).
+
+### 4. Workflow Engine & Node Knowledge Attachment
+- **`ToolCallNode` Integration**: Dynamically compiles and executes tools by name at workflow runtime. Supports flexible argument mapping via state template interpolation.
+- **Knowledge Attachment API (`POST /api/v1/workflows/{id}/nodes/{node_id}/knowledge`)**:
+  - Allows declarative attachment and tuning of RAG retrieval settings (`provider_name`, `workspace_type`, `top_k`, `preset`) directly to individual workflow nodes.
+  - Automatically flags SQLAlchemy JSONB node mutations (`flag_modified`) to ensure atomic database persistence.
+
+---
+
+## 17. Future Roadmap: Phase 3.2 & Beyond
+
+- **Phase 3.2 (Observability & Production Monitoring)**:
+  - OpenTelemetry tracing and Prometheus metrics exporter.
+  - Langfuse / Arize Phoenix LLM trace instrumentation.
 - **Phase 4 (Orchestration & Advanced Primitives)**:
   - Subgraph nesting and cross-workflow invocation.
   - Dynamic map-reduce over large datasets.
@@ -615,7 +713,7 @@ Workflows can assemble collaborative multi-agent teams. Verified via [`scripts/t
 
 ---
 
-## 17. Design Principles
+## 18. Design Principles
 
 1. **Stateless API, Stateful Graph**: FastAPI endpoints remain stateless; conversation and workflow states are persisted across turns via the checkpointer.
 2. **Unified Driver Ecosystem**: Single `psycopg3` engine and pool for ORM, LangGraph, and PGVector.

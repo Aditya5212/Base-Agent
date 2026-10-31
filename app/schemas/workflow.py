@@ -144,6 +144,23 @@ class RetrieveNodeConfig(BaseModel):
     )
 
 
+class WorkflowNodeKnowledgeConfig(BaseModel):
+    """Payload for configuring or attaching knowledge retrieval to a workflow node."""
+    model_config = ConfigDict(extra="ignore")
+    provider_name: str = Field(
+        default="hybrid",
+        description="Knowledge retrieval provider ('hybrid', 'lightrag', 'multi_query')",
+    )
+    workspace_type: Literal["user", "thread", "agent", "global"] = Field(
+        default="user",
+        description="Knowledge isolation boundary",
+    )
+    top_k: int = Field(default=5, ge=1, le=50, description="Passages/entities to retrieve")
+    query_template: str = Field(default="{{input}}", description="Query template")
+    output_variable: str = Field(default="knowledge_context", description="Variable key for context")
+    sources_variable: str = Field(default="knowledge_sources", description="Variable key for sources")
+
+
 class ConditionBranch(BaseModel):
     """A conditional branch rule evaluated by a ConditionalNode."""
     model_config = ConfigDict(extra="ignore")

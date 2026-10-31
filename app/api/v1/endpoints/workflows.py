@@ -14,6 +14,7 @@ from app.schemas.workflow import (
     GraphValidationResponse,
     WorkflowCreate,
     WorkflowListResponse,
+    WorkflowNodeKnowledgeConfig,
     WorkflowResponse,
     WorkflowResumeRequest,
     WorkflowRunListResponse,
@@ -23,6 +24,7 @@ from app.schemas.workflow import (
 )
 from app.services.workflow.validator import validate_workflow_graph
 from app.services.workflow_service import (
+    attach_node_knowledge,
     create_workflow,
     delete_workflow,
     execute_workflow,
@@ -264,4 +266,31 @@ async def list_workflow_runs_endpoint(
         page=page,
         page_size=page_size,
     )
+
+
+@router.post(
+    "/{workflow_id}/nodes/{node_id}/knowledge",
+    response_model=WorkflowResponse,
+    summary="Attach or configure knowledge for a workflow node",
+    description="Configures knowledge provider (hybrid, lightrag, multi_query) and retrieval parameters for a node.",
+)
+@limiter.limit("30/minute")
+async def attach_node_knowledge_endpoint(
+    request: Request,
+    workflow_id: uuid.UUID,
+    node_id: str,
+    knowledge_config: WorkflowNodeKnowledgeConfig,
+    current_user: UserContext = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WorkflowResponse:
+    """Configures knowledge provider and retrieval settings for a specific workflow node."""
+    workflow = await attach_node_knowledge(
+        session=db,
+        workflow_id=workflow_id,
+        user_id=current_user.user_id,
+        node_id=node_id,
+        knowledge_config=knowledge_config,
+    )
+    return WorkflowResponse.model_validate(workflow)
+
 

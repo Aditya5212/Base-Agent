@@ -405,6 +405,12 @@ def resolve_agent_tools(agent_config: AgentConfig, user_id: str) -> list[Any]:
             if t.name not in seen_names:
                 resolved_tools.append(t)
                 seen_names.add(t.name)
+        elif tool_id in ("calculator", "calc", "math"):
+            from app.services.tool_registry import _make_calculator_tool
+            t = _make_calculator_tool()
+            if t.name not in seen_names:
+                resolved_tools.append(t)
+                seen_names.add(t.name)
 
     return resolved_tools
 

@@ -20,6 +20,18 @@ from app.schemas.structured_schema import (
     StructuredSchemaResponse,
     StructuredSchemaUpdate,
 )
+from app.schemas.tool import (
+    HttpToolConfig,
+    CodeToolConfig,
+    DatabaseToolConfig,
+    ToolCreate,
+    ToolExecutionRequest,
+    ToolExecutionResponse,
+    ToolListResponse,
+    ToolResponse,
+    ToolType,
+    ToolUpdate,
+)
 from app.schemas.workflow import (
     ChatNodeConfig,
     CodeNodeConfig,
@@ -85,5 +97,15 @@ __all__ = [
     "WorkflowRunListResponse",
     "WorkflowResumeRequest",
     "GraphValidationResponse",
+    "ToolType",
+    "HttpToolConfig",
+    "CodeToolConfig",
+    "DatabaseToolConfig",
+    "ToolCreate",
+    "ToolUpdate",
+    "ToolResponse",
+    "ToolListResponse",
+    "ToolExecutionRequest",
+    "ToolExecutionResponse",
 ]
 

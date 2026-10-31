@@ -112,7 +112,14 @@ capability areas, while adding open-source flexibility:
 | Background Task Queue | ✅ Complete | Taskiq (0.12.6) + PostgreSQL broker (`taskiq-pg` 0.2.0) with dual dispatch |
 | Rate Limiting | ✅ Complete | slowapi endpoint protection (`/chat`, `/chat/stream`, `/documents/upload`) |
 | Containerization | ✅ Complete | Multi-stage Dockerfile + docker-compose orchestration (api + worker) |
-| Test Suite | ✅ Complete | 15 test modules covering API, RAG, agents, config, storage, auth, taskiq, rate limiting |
+| Agent Builder Core | ✅ Complete | Dynamic agent CRUD, JSONB config, clone & promote, LRU cache |
+| JSON Schema Registry | ✅ Complete | Draft 2020-12 validation and persistence for structured agent outputs |
+| Workflow Engine | ✅ Complete | Declarative JSON graph compiler to LangGraph StateGraph, 10 node types |
+| Multi-Agent Council | ✅ Complete | Specialized evaluation workflows with Pydantic structured output extraction |
+| Modular RAG Research Suite | ✅ Complete | Exploitation (Hybrid, LightRAG) & Exploration (MultiQuery) across 3 tiers |
+| Tool Builder Platform | ✅ Complete | HTTP, sandboxed Python code, read-only SQL executors with Fernet encryption |
+| Dynamic Tool Registry | ✅ Complete | Runtime Pydantic model compilation, LangChain BaseTool cache, knowledge attachment |
+| Test Suite | ✅ Complete | 20 test modules covering API, RAG, agents, workflows, tools, storage (148 tests) |
 | Interactive Test Scripts | ✅ Complete | Live RAG, DeepSeek, streaming, LightRAG validation scripts |
 
 ### 3.2 Technical Debt & Prerequisites for Next Phases
@@ -495,22 +502,22 @@ attach knowledge bases to specific workflow nodes.
 
 #### 3.1 Implementation Tasks
 
-| # | Task | Details | Priority |
-|---|---|---|---|
-| 3.1.1 | Create `tools` table | id, user_id, name, description, type, input_schema, output_schema, config | P0 |
-| 3.1.2 | Define ToolType enum | `built_in`, `api`, `code`, `database` | P0 |
-| 3.1.3 | Build ToolRegistry | Dynamic LangChain tool creation from Tool models. Cache compiled tools. | P0 |
-| 3.1.4 | HTTP/API tool executor | Async httpx client with auth, retries, timeout, response mapping | P0 |
-| 3.1.5 | Code tool executor | Sandboxed Python execution (RestrictedPython or subprocess isolation) | P1 |
-| 3.1.6 | Database tool executor | Read-only SQL execution against connected databases | P2 |
-| 3.1.7 | Tool CRUD endpoints | Create, read, update, delete, list, test-execute | P0 |
-| 3.1.8 | Built-in tool library | Web search (Tavily), calculator, datetime, file reader | P1 |
-| 3.1.9 | Knowledge attachment API | `POST /workflows/{id}/nodes/{node_id}/knowledge` — attach provider config to retrieve node | P0 |
-| 3.1.10 | Retrieval strategy config | Per-node provider selection, top_k, reranking toggle, metadata filters | P0 |
-| 3.1.11 | Migrate BackgroundTasks to Taskiq | Replace FastAPI BackgroundTasks with Taskiq + Redis for distributed processing | P1 |
-| 3.1.12 | Tool execution timeout | Per-tool timeout with graceful error handling | P1 |
-| 3.1.13 | Tool result caching | Cache tool results for identical inputs (TTL-based) | P2 |
-| 3.1.14 | Tool Execution Middleware | Hook ToolErrorMiddleware and ToolRetryMiddleware into dynamic tool node invocation to catch tool errors and retry transient network failures | P0 |
+| # | Task | Details | Priority | Status |
+|---|---|---|---|---|
+| 3.1.1 | Create 	ools table | id, user_id, name, description, type, input_schema, output_schema, config | P0 | ✅ Complete |
+| 3.1.2 | Define ToolType enum | uilt_in, pi, code, database | P0 | ✅ Complete |
+| 3.1.3 | Build ToolRegistry | Dynamic LangChain tool creation from Tool models. Cache compiled tools. | P0 | ✅ Complete |
+| 3.1.4 | HTTP/API tool executor | Async httpx client with auth, retries, timeout, response mapping | P0 | ✅ Complete |
+| 3.1.5 | Code tool executor | Sandboxed Python execution (AST safety analysis & module whitelist) | P1 | ✅ Complete |
+| 3.1.6 | Database tool executor | Read-only SQL execution against connected databases | P2 | ✅ Complete |
+| 3.1.7 | Tool CRUD endpoints | Create, read, update, delete, list, test-execute | P0 | ✅ Complete |
+| 3.1.8 | Built-in tool library | Calculator, modular RAG research suite (hybrid, LightRAG, multi-query) | P1 | ✅ Complete |
+| 3.1.9 | Knowledge attachment API | POST /workflows/{id}/nodes/{node_id}/knowledge — attach provider config to retrieve node | P0 | ✅ Complete |
+| 3.1.10 | Retrieval strategy config | Per-node provider selection, top_k, reranking toggle, metadata filters | P0 | ✅ Complete |
+| 3.1.11 | Migrate BackgroundTasks to Taskiq | Replace FastAPI BackgroundTasks with Taskiq + Redis for distributed processing | P1 | Pending |
+| 3.1.12 | Tool execution timeout | Per-tool timeout with graceful error handling | P1 | ✅ Complete |
+| 3.1.13 | Tool result caching | Cache tool results for identical inputs (TTL-based) | P2 | Pending |
+| 3.1.14 | Tool Execution Middleware | Hook ToolErrorMiddleware and ToolRetryMiddleware into dynamic tool node invocation | P0 | ✅ Complete |
 
 #### 3.2 Tool Type Specifications
 
