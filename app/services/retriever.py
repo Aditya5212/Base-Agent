@@ -23,6 +23,11 @@ from app.services.vector_store import get_vector_store
 logger = logging.getLogger(__name__)
 
 
+def _visible_chunk_filter(filters):
+    visible = {"$or": [{"_base_active": {"$eq": True}}, {"_base_active": {"$exists": False}}]}
+    return {"$and": [filters, visible]} if filters else visible
+
+
 def _compute_chunk_fingerprint(doc: Document) -> str:
     """Computes a unique deduplication key for a document chunk."""
     chunk_id = doc.metadata.get("id") or doc.metadata.get("chunk_id")
@@ -47,12 +52,12 @@ async def _dense_search(
         results = await vector_store.asimilarity_search_with_score(
             query=query,
             k=top_k,
-            filter=filter_dict,
+            filter=_visible_chunk_filter(filter_dict),
         )
         return results
     except Exception as exc:
         logger.error("Dense vector search failed: %s", exc, exc_info=True)
-        return []
+        raise RuntimeError("Dense retrieval is unavailable") from exc
 
 
 async def _sparse_search(
@@ -65,6 +70,7 @@ async def _sparse_search(
     try:
         # Build query filtering over langchain_pg_embedding
         conditions = [
+            "COALESCE(cmetadata->>'_base_active', 'true') = 'true'",
             "to_tsvector('english', document) @@ plainto_tsquery('english', :query)",
             "collection_id = (SELECT uuid FROM langchain_pg_collection WHERE name = :col_name)",
         ]
@@ -110,7 +116,7 @@ async def _sparse_search(
         return sparse_docs
     except Exception as exc:
         logger.error("Sparse PostgreSQL FTS search failed: %s", exc, exc_info=True)
-        return []
+        raise RuntimeError("Sparse retrieval is unavailable") from exc
 
 
 def apply_reciprocal_rank_fusion(

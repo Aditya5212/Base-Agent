@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.structured_schema import StructuredSchema
 from app.schemas.structured_schema import StructuredSchemaCreate, StructuredSchemaUpdate
 from app.services.thread_service import get_or_create_user
+from app.core.json_validation import validate_schema
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +28,7 @@ def validate_json_schema(schema_dict: dict[str, Any]) -> None:
         )
 
     try:
-        Draft202012Validator.check_schema(schema_dict)
+        validate_schema(schema_dict)
     except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,

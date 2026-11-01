@@ -1,7 +1,7 @@
 import json
-from typing import Any
+from typing import Any, Literal
 import uuid
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class ChatRequest(BaseModel):
@@ -25,18 +25,25 @@ class ChatRequest(BaseModel):
         default=False,
         description="Whether to retrieve relevant passages from user documents via hybrid search",
     )
-    rag_preset: str = Field(
-        default="balanced",
+    rag_preset: Literal["balanced", "high_precision", "high_recall"] | None = Field(
+        default=None,
         description="RAG precision/recall preset: high_precision, balanced, high_recall",
     )
-    retrieval_mode: str = Field(
-        default="hybrid",
+    retrieval_mode: Literal["hybrid", "lightrag", "multi_query"] | None = Field(
+        default=None,
         description="RAG retrieval strategy: hybrid (dense+sparse), lightrag (graph), multi_query (parallel queries)",
     )
     agent_id: str | None = Field(
         default=None,
         description="Optional agent UUID. If omitted, the user's default agent is resolved.",
     )
+
+    @field_validator("thread_id")
+    @classmethod
+    def reject_reserved_namespace(cls, value: str) -> str:
+        if value.startswith("workflow:"):
+            raise ValueError("Reserved workflow checkpoint namespace")
+        return value
 
 
 class ChatMessage(BaseModel):

@@ -52,6 +52,8 @@ async def get_or_create_thread(
     If the thread already exists, verifies ownership so one tenant cannot post into
     another tenant's thread.
     """
+    if thread_id.startswith("workflow:"):
+        raise HTTPException(status_code=422, detail="Reserved workflow checkpoint namespace")
     # Ensure user exists first to satisfy foreign key
     await get_or_create_user(db, user_id=user_id)
 
@@ -90,6 +92,8 @@ async def verify_thread_ownership(
         HTTPException(404) if the thread does not exist (unless is_admin or allow_missing is True).
         HTTPException(403) if the thread belongs to another user.
     """
+    if thread_id.startswith("workflow:"):
+        raise HTTPException(status_code=422, detail="Reserved workflow checkpoint namespace")
     thread = await db.get(Thread, thread_id)
     if not thread:
         if allow_missing or is_admin:

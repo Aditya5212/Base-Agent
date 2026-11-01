@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 
 from app.schemas.workflow import ChatNodeConfig
 from app.services.workflow.middleware.pipeline import invoke_chat_model_with_middlewares
@@ -23,8 +23,8 @@ def build_chat_node(node_id: str, config_dict: dict[str, Any]):
         rendered_system = render_template(config.system_prompt, state)
         system_msg = SystemMessage(content=rendered_system)
 
-        llm_input_messages = [system_msg]
-        new_messages = []
+        llm_input_messages: list[BaseMessage] = [system_msg]
+        new_messages: list[BaseMessage] = []
 
         # Existing conversation messages
         existing_msgs = list(state.get("messages") or [])

@@ -10,6 +10,7 @@ import logging
 
 from langchain_core.embeddings import DeterministicFakeEmbedding, Embeddings
 from langchain_openai import OpenAIEmbeddings
+from pydantic import SecretStr
 
 from app.core.config import settings
 
@@ -41,10 +42,12 @@ def get_embeddings(
         logger.info("Initializing OpenAIEmbeddings with model=%s, dimensions=%d", model_name, dims)
         return OpenAIEmbeddings(
             model=model_name,
-            api_key=api_key,
+            api_key=SecretStr(api_key),
             dimensions=dims,
         )
 
+    if settings.ENVIRONMENT == "production":
+        raise ValueError("Embedding credentials are required in production")
     logger.warning(
         "OPENAI_API_KEY not configured. Falling back to DeterministicFakeEmbedding(size=%d) "
         "for development / testing.",

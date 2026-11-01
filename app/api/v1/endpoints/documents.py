@@ -36,6 +36,7 @@ from app.services.r2_storage import r2_storage_service
 from app.services.retriever import hybrid_search
 from app.services.text_splitter import split_markdown_document
 from app.services.vector_store import delete_documents_by_metadata, index_documents
+from app.services.document_lock import document_lock
 
 logger = logging.getLogger(__name__)
 
@@ -100,11 +101,14 @@ async def upload_document(
     file: UploadFile = File(..., description="Document file (PDF, DOCX, XLSX, HTML, TXT, MD)"),
     user_id: str | None = Form(default=None, description="Owner user ID (admin only)"),
     preset: str = Form(default="balanced", description="Chunking preset (high_precision, balanced, high_recall)"),
+    index_graph: bool = Form(default=False, description="Also index the document in LightRAG"),
     current_user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> DocumentUploadResponse:
     """Processes document upload, object storage, and queues background parsing & dual-indexing."""
     effective_user_id = user_id if (current_user.is_admin and user_id and user_id != "root") else current_user.user_id
+    if preset not in {"balanced", "high_precision", "high_recall"}:
+        raise HTTPException(status_code=422, detail="Unsupported chunking preset")
     file_name = file.filename or "uploaded_file"
     content_type = file.content_type or "application/octet-stream"
 
@@ -148,6 +152,8 @@ async def upload_document(
         mime_type=content_type,
         file_size=file_size,
         status=DocumentStatus.PARSING,
+        indexing_config={"preset": preset, "index_graph": index_graph},
+        provider_status={"hybrid": "PARSING", **({"lightrag": "PARSING"} if index_graph else {})},
     )
     db.add(doc_record)
     try:
@@ -310,6 +316,8 @@ async def get_document_details(
         formatted_size=format_bytes(doc.file_size),
         status=doc.status.value,
         error_message=doc.error_message,
+        indexing_config=doc.indexing_config,
+        provider_status=doc.provider_status,
         chunks_count=len(doc.chunks),
         r2_key=doc.r2_key,
         download_url=download_url,
@@ -404,6 +412,17 @@ async def reindex_document(
     current_user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> ReindexDocumentResponse:
+    try:
+        parsed_id = uuid.UUID(document_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid UUID format") from exc
+    async with document_lock(str(parsed_id)) as acquired:
+        if not acquired:
+            raise HTTPException(status_code=409, detail="Document is currently being processed")
+        return await _reindex_document_locked(document_id, request, background_tasks, user_id, current_user, db)
+
+
+async def _reindex_document_locked(document_id, request, background_tasks, user_id, current_user, db):
     """Re-chunks and re-indexes an existing document from its R2 stored raw content in the background."""
     effective_user_id = user_id if (current_user.is_admin and user_id and user_id != "root") else current_user.user_id
     try:
@@ -429,6 +448,12 @@ async def reindex_document(
     # Mark document as PARSING during re-indexing
     doc.status = DocumentStatus.PARSING
     doc.error_message = None
+    config = dict(doc.indexing_config or {})
+    config["purge_graph"] = config.get("index_graph", False)
+    config["preset"] = request.preset
+    if request.index_graph is not None:
+        config["index_graph"] = request.index_graph
+    doc.indexing_config = config
     await db.commit()
 
     # Dispatch asynchronous re-indexing pipeline via Taskiq (with BackgroundTasks fallback)
@@ -539,6 +564,17 @@ async def delete_document(
     current_user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> DeleteDocumentResponse:
+    try:
+        parsed_id = uuid.UUID(document_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid UUID format") from exc
+    async with document_lock(str(parsed_id)) as acquired:
+        if not acquired:
+            raise HTTPException(status_code=409, detail="Document is currently being processed")
+        return await _delete_document_locked(document_id, user_id, current_user, db)
+
+
+async def _delete_document_locked(document_id, user_id, current_user, db):
     """Cascade deletes document from storage and database."""
     effective_user_id = user_id if (current_user.is_admin and user_id and user_id != "root") else current_user.user_id
     try:

@@ -49,6 +49,8 @@ class Document(Base, TimestampMixin):
     )
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    indexing_config: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+    provider_status: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
 
     chunks: Mapped[list["DocumentChunk"]] = relationship(
         "DocumentChunk",

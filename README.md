@@ -1,14 +1,18 @@
 # Base Agent
 
-A production-grade, extensible AI agent platform and **declarative workflow engine** built with FastAPI and LangGraph. Starting as a persistent conversational chatbot, Base Agent has evolved into a complete **Agent Builder & Dynamic Workflow Engine** (Phases 1 & 2) that compiles declarative JSON graphs into stateful, persistent LangGraph state machines.
+An extensible AI agent backend and **declarative workflow engine** built with FastAPI and LangGraph. Base Agent combines persistent conversations, agent configuration, tools, and declarative JSON graphs compiled into stateful LangGraph state machines.
+
+Current execution support and outstanding release gates are tracked in [Audit remediation — 2026-11-01](AUDIT_REMEDIATION_2026-11-01.md). The workflow compiler supports eight node types; parallel/subgraph execution remains planned. Code execution is for trusted transformations and is terminated on timeout.
+
+Tests run offline by default. To include database tests, set `TEST_DATABASE_URL` to a **disposable** PostgreSQL/pgvector database and run `pytest --run-integration`; this applies migrations to that test database. Apply the new Alembic revision before using the changed application models. Existing LightRAG workspaces with punctuation or long identities require reindexing under the new workspace names.
 
 ---
 
 ## 🧠 Platform Vision & Milestones
 
-- **Phase 0.5 (Infrastructure & Prerequisites — ✅ Complete):** Async Alembic database migrations, Taskiq PostgreSQL background task queue, multi-tenant auth & ownership enforcement, slowapi rate limiting, and production Docker containerization.
+- **Phase 0.5 (Infrastructure baseline):** Async Alembic migrations, Taskiq PostgreSQL background task queue, development identity and ownership checks, rate limiting, and Docker packaging. Verified authentication and remaining deployment gates are deferred.
 - **Phase 1 (Agent Configuration Core & Schemas — ✅ Complete):** Database-persisted custom agents with JSONB configs, auto-seeded default assistant, in-memory LRU config caching, and JSON Schema Draft 2020-12 registry.
-- **Phase 2 (Dynamic Workflow Engine & Graph Compiler — ✅ Complete):** Declarative workflow engine compiling JSON graphs into executable LangGraph `StateGraph(WorkflowState)` state machines with 10 node types, safe AST condition routing, curated middlewares (`ModelRetry`, `ModelFallback`), persistent checkpointing, and multi-agent structured evaluation pipelines.
+- **Phase 2 (Workflow execution baseline):** Eight executable node types, conditional routing, retry/fallback wrappers, isolated persistent checkpoints, approval/resume, payload validation, and graph snapshots. Two additional schema node types (`parallel`, `subgraph`) are reserved and rejected until implemented.
 - **Phase 3 (Tool Builder & Knowledge Integration — ✅ Complete):** Dynamic tool builder supporting HTTP/REST APIs, AST-sandboxed Python code execution, and read-only SQL queries with symmetric Fernet encryption at rest; runtime dynamic Pydantic schema compilation and LangChain `BaseTool` registry; per-node knowledge attachment; modular RAG research suite (Exploitation vs Exploration).
 - **Phase 3.2 (Observability & Production Monitoring — 🚧 In Progress):** OpenTelemetry distributed tracing, Prometheus metrics exporter, and LLM observability instrumentation.
 
@@ -148,7 +152,7 @@ Base-Agent/
 │   ├── test_workflow_live.py        # Live Workflow Engine + Graph Compiler verification
 │   ├── test_multi_agent_structured_workflow.py # Live multi-agent advisory council workflow
 │   └── test_rag_research_tools_live.py # Live Modular RAG Research Tool Suite verification
-└── tests/                           # Complete pytest suite (148 tests passing)
+└── tests/                           # Offline and explicitly enabled database regression suites
 ```
 
 ---
@@ -326,7 +330,7 @@ Interactive Swagger API documentation is available at `http://localhost:8000/doc
 uv run taskiq worker app.core.taskiq:broker app.tasks.document_tasks
 ```
 
-*(Note: If the background worker is not running, the application automatically falls back to in-process `BackgroundTasks`.)*
+*(Note: Dispatch failures fall back to in-process `BackgroundTasks`. A successful enqueue does not establish that a worker is running.)*
 
 ### Running with Docker Compose
 
@@ -345,16 +349,18 @@ docker compose logs -f
 
 ## 🧪 Testing & Verification
 
-### Running Automated Test Suite (148 Tests)
+### Running Automated Tests
 
 ```bash
 uv run pytest
 ```
 
-Output:
+Offline result (service-backed tests are explicitly skipped):
 ```text
-======================= 148 passed, 6 warnings in 85.55s =======================
+129 passed, 81 skipped
 ```
+
+With `TEST_DATABASE_URL` set to a disposable PostgreSQL/pgvector database, `uv run pytest --run-integration` includes all service-backed tests. The PostgreSQL stabilization run on 2026-11-01 passed **204 tests** before subsequent type corrections and six additional regression tests. See the remediation report for verification scope and migration compatibility notes.
 
 ### Running Live Interactive Verification Scripts
 

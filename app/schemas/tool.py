@@ -16,6 +16,7 @@ from typing import Any, Literal
 import uuid
 
 import jsonschema
+from app.core.json_validation import validate_schema
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
@@ -142,17 +143,11 @@ class DatabaseToolConfig(BaseModel):
     @field_validator("query_template")
     @classmethod
     def validate_readonly_query(cls, v: str) -> str:
-        trimmed = v.strip().lower()
-        if not (trimmed.startswith("select") or trimmed.startswith("with")):
-            raise ValueError("Only read-only queries ('SELECT' or 'WITH ... SELECT') are permitted.")
-        
-        forbidden = [
-            "insert ", "update ", "delete ", "drop ", "alter ",
-            "truncate ", "grant ", "revoke ", "create ", "exec ", "execute "
-        ]
-        for word in forbidden:
-            if word in trimmed:
-                raise ValueError(f"Dangerous SQL statement detected: '{word.strip().upper()}'. Only read queries are allowed.")
+        from app.services.tool_executors.database_executor import validate_readonly_sql, DatabaseToolExecutionError
+        try:
+            validate_readonly_sql(v)
+        except DatabaseToolExecutionError as exc:
+            raise ValueError(str(exc)) from exc
         return v
 
 
@@ -168,9 +163,9 @@ def validate_json_schema(schema_dict: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(schema_dict, dict):
         raise ValueError("input_schema must be a dictionary representing a valid JSON Schema object.")
     try:
-        jsonschema.Draft202012Validator.check_schema(schema_dict)
-    except jsonschema.SchemaError as err:
-        raise ValueError(f"Invalid JSON Schema: {err.message}") from err
+        validate_schema(schema_dict)
+    except (jsonschema.SchemaError, ValueError) as err:
+        raise ValueError(f"Invalid JSON Schema: {err}") from err
     return schema_dict
 
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import operator
 import re
+from copy import deepcopy
 from typing import Annotated, Any, Sequence, TypedDict
 
 from langchain_core.messages import BaseMessage
@@ -74,6 +75,35 @@ def render_template(template: str, state: WorkflowState) -> str:
         return str(val) if val is not None else ""
 
     return _TEMPLATE_REGEX.sub(_replace, template)
+
+
+def render_template_value(value: Any, state: WorkflowState) -> Any:
+    """An exact variable reference preserves JSON types; mixed templates stay text."""
+    if isinstance(value, dict):
+        return {key: render_template_value(item, state) for key, item in value.items()}
+    if isinstance(value, list):
+        return [render_template_value(item, state) for item in value]
+    if not isinstance(value, str):
+        return value
+    match = _TEMPLATE_REGEX.fullmatch(value.strip())
+    if match is None:
+        return render_template(value, state)
+    parts = match.group(1).split(".")
+    if parts[0] in {"variables", "state"}:
+        current = state.get("variables", {})
+        parts = parts[1:]
+    elif parts[0] in state:
+        current = state
+    else:
+        current = state.get("variables", {})
+    for part in parts:
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        elif isinstance(current, list) and part.isdigit() and int(part) < len(current):
+            current = current[int(part)]
+        else:
+            raise ValueError(f"Missing workflow variable '{match.group(1)}'")
+    return deepcopy(current)
 
 
 # ---------------------------------------------------------------------------

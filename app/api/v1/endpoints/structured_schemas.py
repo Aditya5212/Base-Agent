@@ -44,7 +44,8 @@ async def create_schema_endpoint(
     db: AsyncSession = Depends(get_db),
 ) -> StructuredSchemaResponse:
     """Creates a new structured schema definition."""
-    return await create_structured_schema(db, user_id=current_user.user_id, schema_in=schema_in)
+    schema = await create_structured_schema(db, user_id=current_user.user_id, schema_in=schema_in)
+    return StructuredSchemaResponse.model_validate(schema)
 
 
 @router.get(
@@ -70,7 +71,7 @@ async def list_schemas_endpoint(
         page_size=page_size,
         search=search,
     )
-    return StructuredSchemaListResponse(items=items, total=total, page=page, page_size=page_size)
+    return StructuredSchemaListResponse(items=[StructuredSchemaResponse.model_validate(item) for item in items], total=total, page=page, page_size=page_size)
 
 
 @router.get(
@@ -86,12 +87,13 @@ async def get_schema_endpoint(
     db: AsyncSession = Depends(get_db),
 ) -> StructuredSchemaResponse:
     """Retrieves a schema by ID."""
-    return await get_structured_schema_by_id(
+    schema = await get_structured_schema_by_id(
         db,
         schema_id=schema_id,
         user_id=current_user.user_id,
         is_admin=current_user.is_admin,
     )
+    return StructuredSchemaResponse.model_validate(schema)
 
 
 @router.put(
@@ -109,13 +111,14 @@ async def update_schema_endpoint(
     db: AsyncSession = Depends(get_db),
 ) -> StructuredSchemaResponse:
     """Updates a schema and increments its version."""
-    return await update_structured_schema(
+    schema = await update_structured_schema(
         db,
         schema_id=schema_id,
         user_id=current_user.user_id,
         schema_in=schema_in,
         is_admin=current_user.is_admin,
     )
+    return StructuredSchemaResponse.model_validate(schema)
 
 
 @router.delete(

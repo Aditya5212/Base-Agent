@@ -27,7 +27,8 @@ from app.core.rag.workspace import agent_workspace, user_workspace
 from app.core.rag_config import RAGPreset, get_rag_config
 from app.schemas.agent import AgentConfig
 from app.schemas.chat import StreamEvent
-from app.services.memory import get_checkpointer
+from app.services.memory import get_checkpointer, validate_chat_thread_id
+from app.services.agent_execution import invoke_agent, validate_runtime_config, check_agent_input
 from app.services.multi_query import multi_query_hybrid_search
 from app.services.r2_storage import r2_storage_service
 from app.services.retriever import hybrid_search
@@ -46,10 +47,7 @@ def _normalize_agent_config(cfg: Any) -> AgentConfig:
     if isinstance(cfg, AgentConfig):
         return cfg
     if isinstance(cfg, dict):
-        try:
-            return AgentConfig.model_validate(cfg)
-        except Exception:
-            pass
+        return AgentConfig.model_validate(cfg)
     return AgentConfig()
 
 
@@ -72,6 +70,8 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
     user_id = state.get("user_id") or configurable.get("user_id", "root")
     agent_id = configurable.get("agent_id")
     agent_config = _normalize_agent_config(configurable.get("agent_config"))
+    validate_runtime_config(agent_config)
+    check_agent_input(list(state.get("messages", [])), agent_config)
 
     # 1. Fetch thread assets (uploaded images, documents) with signed URLs
     thread_assets = []
@@ -91,6 +91,11 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
             "thread_assets": thread_assets,
             "thread_assets_context": thread_assets_context,
         }
+
+    active_providers = [provider for provider in agent_config.knowledge_providers if provider.enabled]
+    if not active_providers:
+        raise ValueError("No knowledge provider is enabled for this agent")
+    selected_provider = active_providers[0]
 
     messages = state.get("messages", [])
     last_human_msg = next(
@@ -124,7 +129,8 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
                 preset = p.mode
                 break
     preset = preset or RAGPreset.BALANCED
-    rag_cfg = get_rag_config(preset)
+    rag_cfg = get_rag_config(preset, top_k_final=selected_provider.top_k,
+                             top_k_dense=max(20, selected_provider.top_k), top_k_sparse=max(20, selected_provider.top_k))
 
     retrieval_mode = configurable.get("retrieval_mode")
     if not retrieval_mode and agent_config and agent_config.knowledge_providers:
@@ -144,7 +150,7 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
             workspace = user_workspace(user_id)
             rag_provider = await get_provider("lightrag", workspace=workspace)
             graph_res = await rag_provider.query(
-                RetrievalQuery(query=query_text, mode="mix", top_k=5)
+                RetrievalQuery(query=query_text, mode=selected_provider.mode if selected_provider.mode in {"mix", "local", "global", "hybrid", "naive"} else "mix", top_k=selected_provider.top_k)
             )
             if not graph_res.context:
                 return {
@@ -176,12 +182,7 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
             }
         except Exception as exc:
             logger.error("Error during LightRAG retrieval in retrieve_node: %s", exc, exc_info=True)
-            return {
-                "rag_context": None,
-                "rag_sources": [],
-                "thread_assets": thread_assets,
-                "thread_assets_context": thread_assets_context,
-            }
+            raise RuntimeError("Graph retrieval is unavailable") from exc
 
     # 2. Multi-Query or Standard Hybrid Search
     try:
@@ -190,6 +191,7 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
                 queries=[query_text],
                 user_id=user_id,
                 preset=preset,
+                top_k_final=selected_provider.top_k,
             )
         else:
             # Search documents indexed under this user's user_id
@@ -200,12 +202,7 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
             )
     except Exception as exc:
         logger.error("Error during RAG retrieval in retrieve_node: %s", exc, exc_info=True)
-        return {
-            "rag_context": None,
-            "rag_sources": [],
-            "thread_assets": thread_assets,
-            "thread_assets_context": thread_assets_context,
-        }
+        raise RuntimeError("Knowledge retrieval is unavailable") from exc
 
     if not fused_docs:
         return {
@@ -265,6 +262,8 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]
     messages = list(state.get("messages", []))
     configurable = config.get("configurable", {})
     agent_config = _normalize_agent_config(configurable.get("agent_config"))
+    validate_runtime_config(agent_config)
+    check_agent_input(messages, agent_config)
 
     # Resolve model: configurable override > agent_config.model > settings
     if configurable.get("model"):
@@ -281,7 +280,11 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]
     # Context window slicing based on agent memory configuration
     context_window = agent_config.memory.context_window_messages if agent_config.memory else 20
     if len(messages) > context_window:
-        messages = messages[-context_window:]
+        start = len(messages) - context_window
+        # Keep a complete turn so a tool reply never loses its originating call.
+        while start > 0 and not isinstance(messages[start], HumanMessage):
+            start -= 1
+        messages = messages[start:]
 
     rag_context = state.get("rag_context")
     thread_assets_context = state.get("thread_assets_context")
@@ -291,9 +294,13 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]
         temperature=temperature,
         max_tokens=max_tokens,
         base_url=base_url,
+        max_retries=agent_config.advanced.max_retries,
+        extra_body={"thinking": {"type": "enabled" if agent_config.model.enable_thinking else "disabled"}},
     )
 
     if llm is None:
+        if agent_config.structured_output.enabled or any(t.enabled for t in agent_config.tools) or agent_config.identity.response_format == "json":
+            raise ValueError("A configured model API key is required for tools and structured output")
         last_human = "Hello"
         for m in reversed(messages):
             if isinstance(m, HumanMessage):
@@ -314,6 +321,9 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]
             f"[Development Mode - No DEEPSEEK_API_KEY configured (Model: {model_name})]: "
             f"I received your message: '{last_human}'.{rag_note}{assets_note} Conversation history has been saved to PostgreSQL."
         )
+        if agent_config.guardrails.output_filtering:
+            import re
+            mock_response = re.sub(agent_config.guardrails.output_filtering, "[REDACTED]", mock_response)
         return {"messages": [AIMessage(content=mock_response)]}
 
     # Dynamic system persona prompt from agent_config
@@ -322,6 +332,7 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]
         if agent_config and agent_config.identity and agent_config.identity.system_prompt
         else DEFAULT_SYSTEM_PROMPT
     )
+    system_prompt += f"\nRespond in {agent_config.identity.locale}; output style: {agent_config.identity.response_format}."
     if thread_assets_context:
         system_prompt += f"\n\n{thread_assets_context}"
 
@@ -349,8 +360,8 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]
     start_idx = 1 if messages and isinstance(messages[0], SystemMessage) else 0
     input_messages.extend(messages[start_idx:])
 
-    response = await llm.ainvoke(input_messages, config=config)
-    return {"messages": [response]}
+    responses = await invoke_agent(llm, input_messages, agent_config, state.get("user_id", "root"), config)
+    return {"messages": responses}
 
 
 def build_agent_graph() -> StateGraph:
@@ -401,7 +412,7 @@ async def _build_human_message(
     if not images:
         return HumanMessage(content=message)
 
-    content: list[dict[str, Any]] = [{"type": "text", "text": message}]
+    content: list[str | dict[Any, Any]] = [{"type": "text", "text": message}]
     for img in images:
         if img.startswith(("http://", "https://", "data:")):
             content.append({"type": "image_url", "image_url": {"url": img}})
@@ -455,7 +466,7 @@ async def execute_agent(
     model: str | None = None,
     use_rag: bool = False,
     rag_preset: str | RAGPreset | None = None,
-    retrieval_mode: str = "hybrid",
+    retrieval_mode: str | None = None,
     agent_id: str | None = None,
     agent_config: AgentConfig | dict[str, Any] | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
@@ -478,6 +489,7 @@ async def execute_agent(
     Returns:
         A tuple of (updated_agent_state, resolved_model_name).
     """
+    validate_chat_thread_id(thread_id)
     if checkpointer is None:
         checkpointer = await get_checkpointer()
 
@@ -497,7 +509,7 @@ async def execute_agent(
             "user_id": user_id,
             "model": resolved_model,
             "use_rag": use_rag,
-            "rag_preset": rag_preset or RAGPreset.BALANCED,
+            "rag_preset": rag_preset,
             "retrieval_mode": retrieval_mode,
             "agent_id": agent_id,
             "agent_config": norm_cfg,
@@ -529,7 +541,7 @@ async def stream_agent_events(
     model: str | None = None,
     use_rag: bool = False,
     rag_preset: str | RAGPreset | None = None,
-    retrieval_mode: str = "hybrid",
+    retrieval_mode: str | None = None,
     agent_id: str | None = None,
     agent_config: AgentConfig | dict[str, Any] | None = None,
     checkpointer: BaseCheckpointSaver | None = None,
@@ -552,6 +564,27 @@ async def stream_agent_events(
     Yields:
         StreamEvent objects (token, reasoning, end, or error).
     """
+    cfg = _normalize_agent_config(agent_config)
+    validate_chat_thread_id(thread_id)
+    # Protected/tool turns buffer their final validated answer. Raw model deltas
+    # could otherwise expose an unfiltered result or intermediate tool reasoning.
+    if (any(t.enabled for t in cfg.tools) or cfg.structured_output.enabled
+            or cfg.guardrails.output_filtering or cfg.identity.response_format == "json"
+            or not cfg.advanced.enable_streaming):
+        try:
+            result, resolved_model = await execute_agent(
+                message=message, thread_id=thread_id, user_id=user_id, images=images,
+                model=model, use_rag=use_rag, rag_preset=rag_preset,
+                retrieval_mode=retrieval_mode, agent_id=agent_id,
+                agent_config=cfg, checkpointer=checkpointer,
+            )
+            messages = result.get("messages", [])
+            text = messages[-1].text if messages else ""
+            yield StreamEvent.token(text)
+            yield StreamEvent.end(thread_id, user_id, text, resolved_model, len(messages), result.get("rag_sources"), agent_id)
+        except Exception as exc:
+            yield StreamEvent.error(str(exc))
+        return
     if checkpointer is None:
         checkpointer = await get_checkpointer()
 
@@ -571,7 +604,7 @@ async def stream_agent_events(
             "user_id": user_id,
             "model": resolved_model,
             "use_rag": use_rag,
-            "rag_preset": rag_preset or RAGPreset.BALANCED,
+            "rag_preset": rag_preset,
             "retrieval_mode": retrieval_mode,
             "agent_id": agent_id,
             "agent_config": norm_cfg,

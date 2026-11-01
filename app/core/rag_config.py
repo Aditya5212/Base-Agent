@@ -85,7 +85,7 @@ class RAGConfig(BaseModel):
     top_k_final: int = Field(
         default=5,
         ge=1,
-        le=30,
+        le=50,
         description="Final number of re-ordered chunks after RRF fusion",
     )
     vector_weight: float = Field(

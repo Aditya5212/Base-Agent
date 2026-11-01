@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 from app.schemas.workflow import StartNodeConfig
+from app.core.json_validation import validate_payload
 from app.services.workflow.state import WorkflowState
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,8 @@ def build_start_node(node_id: str, config_dict: dict[str, Any]):
         for k, v in config.initial_variables.items():
             if k not in variables:
                 variables[k] = v
+
+        validate_payload(variables, config.input_schema, "Start input")
 
         history = list(state.get("node_history") or [])
         history.append(node_id)

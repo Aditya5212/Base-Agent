@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 from typing import Any
 import uuid
 
@@ -18,22 +19,26 @@ from app.services.thread_service import get_or_create_user
 logger = logging.getLogger(__name__)
 
 # In-memory LRU cache for resolved agent configs: key is (agent_id_str, version_int)
-_AGENT_CONFIG_CACHE: dict[tuple[str, int], AgentConfig] = {}
+_AGENT_CONFIG_CACHE: OrderedDict[tuple[str, int], AgentConfig] = OrderedDict()
 _MAX_CACHE_SIZE = 256
 
 
 def get_cached_agent_config(agent_id: str, version: int) -> AgentConfig | None:
     """Retrieves an AgentConfig from the in-memory cache if present."""
-    return _AGENT_CONFIG_CACHE.get((str(agent_id), version))
+    key = (str(agent_id), version)
+    value = _AGENT_CONFIG_CACHE.get(key)
+    if value is not None:
+        _AGENT_CONFIG_CACHE.move_to_end(key)
+    return value
 
 
 def set_cached_agent_config(agent_id: str, version: int, config: AgentConfig) -> None:
     """Stores an AgentConfig in the in-memory cache, evicting the oldest if full."""
-    if len(_AGENT_CONFIG_CACHE) >= _MAX_CACHE_SIZE:
-        # Simple FIFO/LRU eviction: remove first key
-        oldest_key = next(iter(_AGENT_CONFIG_CACHE))
-        _AGENT_CONFIG_CACHE.pop(oldest_key, None)
-    _AGENT_CONFIG_CACHE[(str(agent_id), version)] = config
+    key = (str(agent_id), version)
+    _AGENT_CONFIG_CACHE[key] = config
+    _AGENT_CONFIG_CACHE.move_to_end(key)
+    while len(_AGENT_CONFIG_CACHE) > _MAX_CACHE_SIZE:
+        _AGENT_CONFIG_CACHE.popitem(last=False)
 
 
 def invalidate_agent_cache(agent_id: str) -> None:
@@ -57,6 +62,11 @@ def validate_agent_config(config_data: dict[str, Any] | AgentConfig) -> AgentCon
             ) from exc
 
     # Verify that enabled knowledge providers are registered
+    from app.services.agent_execution import validate_runtime_config
+    try:
+        validate_runtime_config(cfg)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     for prov in cfg.knowledge_providers:
         if prov.enabled and prov.name not in PROVIDER_REGISTRY:
             raise HTTPException(

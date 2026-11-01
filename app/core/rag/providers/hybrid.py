@@ -51,7 +51,7 @@ class HybridProvider:
             display_name="Hybrid Search (pgvector + FTS + RRF)",
             description=(
                 "Dense embeddings fused with native PostgreSQL Full-Text Search via Reciprocal Rank Fusion. "
-                "Sub-millisecond retrieval, low compute overhead, optimal for exact facts and direct lookup."
+                "Combines semantic and keyword matches for factual document lookup."
             ),
             supports_graph=False,
             supports_multimodal=False,
@@ -90,6 +90,8 @@ class HybridProvider:
 
         # Apply user/workspace filters if provided
         filters = dict(q.filters) if q.filters else None
+        if not filters or not filters.get("user_id"):
+            raise ValueError("Hybrid provider queries require an explicit user_id filter")
 
         docs = await hybrid_search(
             query=q.query,

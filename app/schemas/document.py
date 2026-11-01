@@ -1,7 +1,7 @@
 """Pydantic schemas for document ingestion, storage, and RAG search."""
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
@@ -85,6 +85,8 @@ class DocumentDetailResponse(BaseModel):
     formatted_size: str = Field(..., description="Human-readable size string")
     status: str = Field(..., description="Lifecycle status: PENDING, PARSING, INDEXED, FAILED")
     error_message: str | None = Field(default=None, description="Ingestion error if failed")
+    indexing_config: dict[str, Any] = Field(default_factory=dict)
+    provider_status: dict[str, Any] = Field(default_factory=dict)
     chunks_count: int = Field(..., description="Number of chunks currently indexed")
     r2_key: str = Field(..., description="Object key in Cloudflare R2")
     download_url: str | None = Field(default=None, description="Presigned download URL")
@@ -116,10 +118,11 @@ class DocumentChunksListResponse(BaseModel):
 class ReindexDocumentRequest(BaseModel):
     """Request payload to re-index an existing document from R2 storage."""
 
-    preset: str = Field(
+    preset: Literal["balanced", "high_precision", "high_recall"] = Field(
         default="balanced",
         description="Chunking preset (high_precision, balanced, high_recall)",
     )
+    index_graph: bool | None = Field(default=None, description="Override optional graph indexing; otherwise preserve the document setting")
 
 
 class ReindexDocumentResponse(BaseModel):

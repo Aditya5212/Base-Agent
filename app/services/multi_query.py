@@ -110,13 +110,15 @@ async def multi_query_hybrid_search(
 
     query_results: list[tuple[str, list[Document]]] = []
     for q, res in zip(cleaned_queries, results):
-        if isinstance(res, Exception):
+        if isinstance(res, BaseException):
+            if not isinstance(res, Exception):
+                raise res
             logger.warning("Query '%s' failed during hybrid retrieval: %s", q, res)
             continue
         query_results.append((q, res))
 
     if not query_results:
-        return []
+        raise RuntimeError("All multi-query retrieval requests failed")
 
     return cross_query_reciprocal_rank_fusion(
         query_results=query_results,

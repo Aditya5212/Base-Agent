@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import re
+from typing import TYPE_CHECKING
 
 from sqlalchemy import DateTime
 from sqlalchemy.ext.asyncio import AsyncAttrs
@@ -17,10 +18,15 @@ class Base(AsyncAttrs, DeclarativeBase):
     Includes automatic plural/snake_case table naming convention.
     """
 
-    @declared_attr.directive
-    def __tablename__(cls) -> str:
-        name = _to_snake_case(cls.__name__)
-        return f"{name}s" if not name.endswith("s") else name
+    if TYPE_CHECKING:
+        # Declarative resolves this directive to a class-level string. Expose
+        # that resolved type so explicit names can override it in subclasses.
+        __tablename__: str
+    else:
+        @declared_attr.directive
+        def __tablename__(cls) -> str:
+            name = _to_snake_case(cls.__name__)
+            return f"{name}s" if not name.endswith("s") else name
 
 
 class TimestampMixin:

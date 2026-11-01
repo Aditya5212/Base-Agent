@@ -83,15 +83,15 @@ class ToolService:
             version=1,
         )
 
+        # A tool must be executable before it becomes a persisted usable definition.
+        try:
+            ToolRegistry.compile_tool(tool, cache=False)
+        except Exception as exc:
+            raise HTTPException(status_code=422, detail=f"Invalid tool: {exc}") from exc
+
         db.add(tool)
         await db.commit()
         await db.refresh(tool)
-
-        # Pre-compile into cache to warm up and validate
-        try:
-            ToolRegistry.compile_tool(tool)
-        except Exception as exc:
-            logger.warning("Tool '%s' saved to DB but failed immediate compilation: %s", tool.name, exc)
 
         return tool
 
@@ -195,6 +195,11 @@ class ToolService:
             tool.config = _encrypt_sensitive_config(tool.type, tool_in.config)
 
         tool.version += 1
+        try:
+            ToolRegistry.compile_tool(tool, cache=False)
+        except Exception as exc:
+            await db.rollback()
+            raise HTTPException(status_code=422, detail=f"Invalid tool update: {exc}") from exc
         await db.commit()
         await db.refresh(tool)
 
@@ -240,13 +245,12 @@ class ToolService:
             )
 
         start_time = time.perf_counter()
-        compiled_tool = ToolRegistry.compile_tool(tool)
-
         success = True
         output: Any = None
         error_msg: str | None = None
 
         try:
+            compiled_tool = ToolRegistry.compile_tool(tool)
             output = await compiled_tool.ainvoke(arguments or {})
         except Exception as exc:
             logger.error("Execution of tool '%s' failed: %s", tool.name, exc, exc_info=True)

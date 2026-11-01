@@ -1,6 +1,7 @@
 from unittest.mock import AsyncMock, patch
 import pytest
 from langchain_core.documents import Document
+from app.core.rag_config import get_rag_config
 
 from app.services.workflow.nodes.chat import build_chat_node
 from app.services.workflow.nodes.code import build_code_node
@@ -104,6 +105,7 @@ async def test_retrieve_node_execution():
         mock_search.assert_awaited_once_with(
             query="Explain architecture",
             filter_dict={"user_id": "test_user"},
+            config=get_rag_config(top_k_final=2, top_k_dense=20, top_k_sparse=20),
         )
         assert "Antigravity architecture guide" in res["variables"]["rag_context"]
         assert len(res["variables"]["rag_sources"]) == 2

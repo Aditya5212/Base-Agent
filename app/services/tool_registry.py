@@ -6,17 +6,19 @@ into LangChain BaseTool instances with dynamic Pydantic argument schemas and ten
 
 from __future__ import annotations
 
-import json
 import logging
-from typing import Any, Callable, Coroutine
+from collections import OrderedDict
+from copy import deepcopy
+from typing import Any
 import uuid
 
 from langchain_core.tools import BaseTool, StructuredTool
-from pydantic import BaseModel, Field, create_model
+from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.tool import Tool
+from app.core.json_validation import validate_payload, validate_schema
 from app.schemas.tool import (
     CodeToolConfig,
     DatabaseToolConfig,
@@ -31,32 +33,41 @@ from app.services.tool_executors.http_executor import HttpToolExecutor
 logger = logging.getLogger(__name__)
 
 # In-memory compiled tool cache: (user_id, tool_id_str, version) -> BaseTool
-_COMPILED_TOOL_CACHE: dict[tuple[str, str, int], BaseTool] = {}
+_COMPILED_TOOL_CACHE: OrderedDict[tuple[str, str, int], BaseTool] = OrderedDict()
+_MAX_COMPILED_TOOLS = 256
 
 
 def json_schema_to_pydantic_model(schema: dict[str, Any], model_name: str) -> type[BaseModel]:
     """Dynamically converts a JSON Schema properties dictionary into a Pydantic model class."""
+    validate_schema(schema)
+    if schema.get("type", "object") != "object":
+        raise ValueError("Tool arguments must use an object JSON Schema")
     properties = schema.get("properties") or {}
     required_fields = set(schema.get("required") or [])
 
-    type_mapping: dict[str, Any] = {
-        "string": str,
-        "integer": int,
-        "number": float,
-        "boolean": bool,
-        "array": list,
-        "object": dict,
-    }
+    class SchemaArguments(BaseModel):
+        model_config = ConfigDict(extra="allow")
 
-    fields: dict[str, tuple[Any, Any]] = {}
+        @model_validator(mode="before")
+        @classmethod
+        def validate_schema(cls, value: Any) -> Any:
+            validate_payload(value, schema, "Tool arguments")
+            return value
+
+        @classmethod
+        def model_json_schema(cls, *args: Any, **kwargs: Any) -> dict[str, Any]:
+            return deepcopy(schema)
+
+    # create_model mixes named control keywords with dynamic field keywords.
+    fields: dict[str, Any] = {}
 
     for prop_name, prop_spec in properties.items():
         if not isinstance(prop_spec, dict):
             fields[prop_name] = (Any, Field(default=None))
             continue
 
-        raw_type = prop_spec.get("type", "string")
-        py_type = type_mapping.get(raw_type, Any)
+        # JSON Schema is authoritative; Any avoids coercing or losing nested values.
+        py_type = Any
         description = prop_spec.get("description", "")
         default_val = prop_spec.get("default", None)
 
@@ -67,9 +78,9 @@ def json_schema_to_pydantic_model(schema: dict[str, Any], model_name: str) -> ty
 
     if not fields:
         # Fallback empty model
-        return create_model(model_name)
+        return create_model(model_name, __base__=SchemaArguments)
 
-    return create_model(model_name, **fields)
+    return create_model(model_name, __base__=SchemaArguments, **fields)
 
 
 def _make_calculator_tool() -> BaseTool:
@@ -123,14 +134,17 @@ class ToolRegistry:
     """Manages compilation, tenant-scoping, and dynamic execution of tools."""
 
     @classmethod
-    def compile_tool(cls, tool_orm: Tool) -> BaseTool:
+    def compile_tool(cls, tool_orm: Tool, *, cache: bool = True) -> BaseTool:
         """Compiles a persisted Tool ORM entity into an executable LangChain BaseTool."""
         cache_key = (tool_orm.user_id, str(tool_orm.id), tool_orm.version)
-        if cache_key in _COMPILED_TOOL_CACHE:
+        if cache and cache_key in _COMPILED_TOOL_CACHE:
+            _COMPILED_TOOL_CACHE.move_to_end(cache_key)
             return _COMPILED_TOOL_CACHE[cache_key]
 
         tool_type = ToolType(tool_orm.type)
         tool_config = tool_orm.config or {}
+        if tool_orm.output_schema is not None:
+            validate_schema(tool_orm.output_schema)
 
         # 1. Instantiate the appropriate executor
         executor: Any
@@ -155,15 +169,11 @@ class ToolRegistry:
         args_schema = json_schema_to_pydantic_model(tool_orm.input_schema or {}, clean_model_name)
 
         # 3. Create async execution handler
-        async def _execute_coroutine(**kwargs: Any) -> str:
-            try:
-                res = await executor.execute(kwargs)
-                if isinstance(res, (dict, list)):
-                    return json.dumps(res, default=str)
-                return str(res)
-            except Exception as exc:
-                logger.error("Error executing tool '%s': %s", tool_orm.name, exc, exc_info=True)
-                return f"Error executing tool '{tool_orm.name}': {exc}"
+        async def _execute_coroutine(**kwargs: Any) -> Any:
+            validate_payload(kwargs, tool_orm.input_schema, "Tool arguments")
+            res = await executor.execute(kwargs)
+            validate_payload(res, tool_orm.output_schema, "Tool output")
+            return res
 
         compiled = StructuredTool.from_function(
             coroutine=_execute_coroutine,
@@ -172,7 +182,10 @@ class ToolRegistry:
             args_schema=args_schema,
         )
 
-        _COMPILED_TOOL_CACHE[cache_key] = compiled
+        if cache:
+            _COMPILED_TOOL_CACHE[cache_key] = compiled
+            while len(_COMPILED_TOOL_CACHE) > _MAX_COMPILED_TOOLS:
+                _COMPILED_TOOL_CACHE.popitem(last=False)
         return compiled
 
     @classmethod
@@ -214,6 +227,7 @@ class ToolRegistry:
         resolved: list[BaseTool] = []
         rag_tools_map = get_user_rag_tool_map(user_id=user_id)
         db_tool_names_or_ids: list[str] = []
+        found_identifiers: set[str] = set()
 
         for name in tool_names:
             normalized = name.lower().strip()
@@ -254,11 +268,15 @@ class ToolRegistry:
                 db_tools = result.scalars().all()
 
                 for tool_record in db_tools:
+                    found_identifiers.update((tool_record.name, str(tool_record.id)))
                     try:
                         compiled_tool = cls.compile_tool(tool_record)
                         resolved.append(compiled_tool)
                     except Exception as exc:
-                        logger.error("Failed to compile tool '%s': %s", tool_record.name, exc)
+                        raise ValueError(f"Cannot compile tool '{tool_record.name}': {exc}") from exc
 
-        return resolved
+        missing = set(db_tool_names_or_ids) - found_identifiers
+        if missing:
+            raise ValueError(f"Unknown or inaccessible tools: {', '.join(sorted(missing))}")
+        return list({tool.name: tool for tool in resolved}.values())
 

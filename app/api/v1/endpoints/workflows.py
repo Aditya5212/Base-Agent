@@ -41,6 +41,21 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/workflows", tags=["Workflow Engine"])
 
 
+@router.get("/capabilities", summary="Supported execution capabilities")
+async def execution_capabilities(current_user: UserContext = Depends(get_current_user)) -> dict[str, Any]:
+    from app.services.workflow.validator import SUPPORTED_NODE_TYPES
+    return {
+        "node_types": sorted(SUPPORTED_NODE_TYPES),
+        "knowledge_providers": ["hybrid", "lightrag", "multi_query"],
+        "knowledge_scopes": ["user"],
+        "knowledge_attachment_node_types": ["retrieve"],
+        "parallel_execution": False, "subgraph_execution": False,
+        "agent_tools": True, "structured_output_validation": True,
+        "long_term_memory": False, "automatic_summarization": False,
+        "streaming": {"text": "tokens", "tools_or_output_validation": "buffered"},
+    }
+
+
 @router.post(
     "",
     response_model=WorkflowResponse,

@@ -8,6 +8,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import time
+from urllib.parse import quote
 from typing import Any
 
 from sqlalchemy import text
@@ -32,13 +35,13 @@ FORBIDDEN_SQL_KEYWORDS: tuple[str, ...] = (
 def validate_readonly_sql(query: str) -> None:
     """Verifies that the SQL query is strictly read-only."""
     cleaned = query.strip().lower()
-    if not (cleaned.startswith("select") or cleaned.startswith("with")):
+    if not re.match(r"^(select|with)\b", cleaned):
         raise DatabaseToolExecutionError(
             "Security restriction: Only read-only queries ('SELECT' or 'WITH ... SELECT') are permitted."
         )
 
     for word in FORBIDDEN_SQL_KEYWORDS:
-        if word in cleaned:
+        if re.search(r"\b" + word.strip() + r"\b", cleaned):
             raise DatabaseToolExecutionError(
                 f"Security restriction: Forbidden SQL command '{word.strip().upper()}' detected."
             )
@@ -54,11 +57,10 @@ class DatabaseToolExecutor:
     async def execute(self, arguments: dict[str, Any]) -> list[dict[str, Any]]:
         """Executes the query with parameterized inputs and returns rows as dictionaries."""
         raw_conn = self.config.connection_string
-        try:
-            decrypted = decrypt_secret(raw_conn)
-            connection_url = decrypted or raw_conn
-        except Exception:
-            connection_url = raw_conn
+        resolved_connection = decrypt_secret(raw_conn) if raw_conn.startswith("gAAAAA") else raw_conn
+        if not resolved_connection:
+            raise DatabaseToolExecutionError("Database connection string is empty")
+        connection_url: str = resolved_connection
 
         validate_readonly_sql(self.config.query_template)
 
@@ -66,7 +68,7 @@ class DatabaseToolExecutor:
         args = dict(arguments or {})
 
         # 1. Standard SQLite execution via standard library
-        if connection_url.startswith("sqlite:"):
+        if connection_url.startswith(("sqlite:", "sqlite+aiosqlite:")):
             import sqlite3
 
             db_path = (
@@ -77,9 +79,12 @@ class DatabaseToolExecutor:
 
             def _run_sqlite() -> list[dict[str, Any]]:
                 target_path = ":memory:" if db_path in (":memory:", "") else db_path
-                conn = sqlite3.connect(target_path)
+                conn = sqlite3.connect(":memory:") if target_path == ":memory:" else sqlite3.connect(f"file:{quote(target_path, safe='/!:')}?mode=ro", uri=True)
                 conn.row_factory = sqlite3.Row
                 try:
+                    conn.execute("PRAGMA query_only = ON")
+                    deadline = time.monotonic() + self.config.timeout_seconds
+                    conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
                     cur = conn.cursor()
                     cur.execute(self.config.query_template, args)
                     rows = cur.fetchmany(max_rows)
@@ -110,7 +115,9 @@ class DatabaseToolExecutor:
                 echo=False,
             )
             try:
-                async with temp_engine.connect() as conn:
+                async with temp_engine.begin() as conn:
+                    await conn.execute(text("SET TRANSACTION READ ONLY"))
+                    await conn.execute(text("SELECT set_config('statement_timeout', :timeout, true)"), {"timeout": str(int(self.config.timeout_seconds * 1000))})
                     stmt = text(self.config.query_template)
                     result = await conn.execute(stmt, args)
                     rows = result.fetchmany(max_rows)

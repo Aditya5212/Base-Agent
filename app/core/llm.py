@@ -71,6 +71,7 @@ def get_llm(
     base_url: str | None = None,
     api_key: str | None = None,
     extra_body: dict[str, Any] | None = None,
+    max_retries: int | None = None,
 ) -> ChatOpenAI | None:
     """Returns a configured ChatOpenAI client pointing to DeepSeek.
 
@@ -87,6 +88,8 @@ def get_llm(
     """
     resolved_api_key = settings.effective_llm_api_key if api_key is None else api_key
     if not resolved_api_key or not resolved_api_key.strip():
+        if settings.ENVIRONMENT == "production":
+            raise ValueError("Model credentials are required in production")
         logger.warning("No DEEPSEEK_API_KEY configured. Running in mock fallback mode.")
         return None
 
@@ -113,6 +116,8 @@ def get_llm(
 
     if extra_body:
         client_kwargs["extra_body"] = extra_body
+    if max_retries is not None:
+        client_kwargs["max_retries"] = max_retries
 
 
     logger.debug(

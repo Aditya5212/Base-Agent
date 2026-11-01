@@ -116,8 +116,7 @@ class WorkflowCompiler:
                 if b_target:
                     target_ids.add(str(b_target))
 
-            target_mapping = {t: t for t in target_ids}
-            builder.add_conditional_edges(cond_node_id, router_fn, target_mapping)
+            builder.add_conditional_edges(cond_node_id, router_fn, sorted(target_ids))
 
         # 5. Connect Static Edges (excluding edges originating from conditional nodes)
         for edge in edges:

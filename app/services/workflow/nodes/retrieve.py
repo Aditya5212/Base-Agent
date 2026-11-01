@@ -14,6 +14,7 @@ from app.core.rag.workspace import (
 from app.schemas.workflow import RetrieveNodeConfig
 from app.services.multi_query import multi_query_hybrid_search
 from app.services.retriever import hybrid_search
+from app.core.rag_config import get_rag_config
 from app.services.workflow.state import WorkflowState, render_template
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,10 @@ def build_retrieve_node(node_id: str, config_dict: dict[str, Any]) -> Any:
     - 'deep_research': Dual-engine vector exploration + graph traversal
     """
     config = RetrieveNodeConfig.model_validate(config_dict or {})
+    if config.provider_name not in ("hybrid", "lightrag", "multi_query"):
+        raise ValueError(f"Unsupported retrieval provider '{config.provider_name}'")
+    if config.workspace_type != "user":
+        raise ValueError("Only user knowledge scope has an ingestion path; other scopes are not available yet")
 
     async def retrieve_handler(state: WorkflowState) -> dict[str, Any]:
         logger.debug(
@@ -139,6 +144,7 @@ def build_retrieve_node(node_id: str, config_dict: dict[str, Any]) -> Any:
                 documents = await hybrid_search(
                     query=rendered_query,
                     filter_dict=filter_dict,
+                    config=get_rag_config(top_k_final=config.top_k, top_k_dense=max(20, config.top_k), top_k_sparse=max(20, config.top_k)),
                 )
 
                 selected_docs = documents[:config.top_k]
@@ -162,8 +168,7 @@ def build_retrieve_node(node_id: str, config_dict: dict[str, Any]) -> Any:
 
         except Exception as exc:
             logger.error("Retrieve node '%s' error during search: %s", node_id, exc, exc_info=True)
-            variables[config.output_variable] = f"Error retrieving knowledge context: {str(exc)}"
-            variables[config.sources_variable] = []
+            raise RuntimeError(f"Knowledge retrieval failed at node '{node_id}'") from exc
 
         return {
             "variables": variables,

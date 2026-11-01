@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 from app.schemas.workflow import EndNodeConfig
+from app.core.json_validation import validate_payload
 from app.services.workflow.state import WorkflowState
 
 logger = logging.getLogger(__name__)
@@ -19,10 +20,9 @@ def build_end_node(node_id: str, config_dict: dict[str, Any]):
 
         # If response_variable is configured, ensure it is recorded
         if config.response_variable and config.response_variable not in variables:
-            logger.warning(
-                "Configured response_variable '%s' not found in variables",
-                config.response_variable,
-            )
+            raise ValueError(f"Response variable '{config.response_variable}' is missing")
+        output = {config.response_variable: variables[config.response_variable]} if config.response_variable else variables
+        validate_payload(output, config.output_schema, "End output")
 
         history = list(state.get("node_history") or [])
         history.append(node_id)

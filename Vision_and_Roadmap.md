@@ -3,7 +3,9 @@
 > **Document Type:** Product Vision & Engineering Roadmap
 > **Project:** Base Agent → Base Agent Builder Platform
 > **Status:** Living Document — Updated per phase completion
-> **Last Updated:** 2026-10-25
+> **Last Updated:** 2026-11-01
+
+> **Audit correction:** Historical completion labels below describe implementation milestones, not verified release readiness. [Current remediation status](AUDIT_REMEDIATION_2026-11-01.md) and `/api/v1/workflows/capabilities` take precedence for current support. Parallel/subgraph execution, thread/agent/global knowledge ingestion, automatic summarization, and weighted provider fusion remain unavailable and are explicitly rejected. Authentication remains a later deployment milestone.
 
 ---
 

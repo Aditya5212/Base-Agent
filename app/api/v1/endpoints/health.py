@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Response, status
+from fastapi import APIRouter, Request, Response, status
 
 from app.core.config import settings
 from app.core.database import check_db_connection
@@ -13,11 +13,12 @@ router = APIRouter(tags=["Health"])
     summary="System Health & Readiness Check",
     description="Checks the health of the application and its connection to PostgreSQL.",
 )
-async def health_check(response: Response) -> HealthResponse:
+async def health_check(response: Response, request: Request) -> HealthResponse:
     """Returns application health and database connection status."""
     db_connected, error_message = await check_db_connection()
 
-    if not db_connected:
+    initialized = getattr(request.app.state, "startup_ready", settings.ENVIRONMENT != "production")
+    if not db_connected or not initialized:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
         overall_status = "degraded"
     else:

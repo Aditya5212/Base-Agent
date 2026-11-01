@@ -3,7 +3,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 import logging
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -24,6 +24,13 @@ logging.basicConfig(
 logger = logging.getLogger("app.main")
 
 
+def _handle_rate_limit_exceeded(request: Request, exc: Exception) -> Response:
+    """Adapt SlowAPI's specialized callback to Starlette's handler contract."""
+    if not isinstance(exc, RateLimitExceeded):
+        raise exc
+    return _rate_limit_exceeded_handler(request, exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Lifespan event handler for startup and shutdown procedures."""
@@ -36,9 +43,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     sweeper_task = None
+    app.state.startup_ready = False
 
     # Check database connectivity during startup
     db_connected, err = await check_db_connection()
+    initialization_ok = db_connected
     if db_connected:
         logger.info("Database connection successfully established.")
         try:
@@ -46,20 +55,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             await init_db()
             logger.info("Application database tables verified/created successfully.")
         except Exception as init_err:
+            initialization_ok = False
             logger.warning("Failed to initialize database tables: %s", init_err)
+            if settings.ENVIRONMENT == "production":
+                raise
 
         try:
             await setup_checkpointer()
             logger.info("PostgreSQL checkpointer initialized successfully.")
         except Exception as checkpointer_err:
+            initialization_ok = False
             logger.warning("Failed to initialize checkpointer tables: %s", checkpointer_err)
+            if settings.ENVIRONMENT == "production":
+                raise
 
         try:
             from app.services.vector_store import setup_vector_store
             await setup_vector_store()
             logger.info("PostgreSQL vector store and FTS indexes initialized successfully.")
         except Exception as vs_err:
+            initialization_ok = False
             logger.warning("Failed to initialize vector store indexes: %s", vs_err)
+            if settings.ENVIRONMENT == "production":
+                raise
 
         try:
             from app.services.document_processor import recover_stuck_documents, start_document_sweeper
@@ -78,7 +96,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             logger.warning("Failed to initialize Taskiq broker: %s", tq_err)
     else:
         logger.warning("Database connection failed during startup: %s", err)
+        if settings.ENVIRONMENT == "production":
+            raise RuntimeError("Required database is unavailable")
 
+    app.state.startup_ready = initialization_ok
     yield
 
     # Graceful shutdown
@@ -97,6 +118,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await shutdown_taskiq_broker()
     except Exception as tq_err:
         logger.warning("Error shutting down Taskiq broker: %s", tq_err)
+
+    from app.services.document_processor import stop_document_recovery_tasks
+    await stop_document_recovery_tasks()
 
     try:
         from app.core.rag import shutdown_all_providers
@@ -123,7 +147,7 @@ def create_application() -> FastAPI:
 
     # Attach slowapi rate limiter
     app.state.limiter = limiter
-    app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+    app.add_exception_handler(RateLimitExceeded, _handle_rate_limit_exceeded)
 
     # Configure CORS
     if settings.CORS_ORIGINS:

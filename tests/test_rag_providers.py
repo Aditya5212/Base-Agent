@@ -29,8 +29,8 @@ def test_workspace_sanitization():
 
 def test_workspace_derivation():
     assert user_workspace("root") == "u_root"
-    assert thread_workspace("root", "thread-123") == "u_root_t_thread_123"
-    assert agent_workspace("root", "agent-456") == "u_root_a_agent_456"
+    assert thread_workspace("root", "thread-123") != thread_workspace("root", "thread_123")
+    assert agent_workspace("root", "agent-456") != agent_workspace("root", "agent_456")
     assert global_workspace() == "global_kb"
 
 

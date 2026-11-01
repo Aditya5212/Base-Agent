@@ -78,6 +78,8 @@ class WorkflowRun(Base, TimestampMixin):
         index=True,
     )
     thread_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    checkpoint_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    definition_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     status: Mapped[str] = mapped_column(String(50), default="PENDING", nullable=False, index=True)
     input_data: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
     output_data: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)

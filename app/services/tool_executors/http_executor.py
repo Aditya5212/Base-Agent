@@ -105,12 +105,8 @@ class HttpToolExecutor:
         # Decrypt auth token if configured
         auth_token = self.config.auth_token
         if auth_token:
-            try:
-                decrypted = decrypt_secret(auth_token)
-                auth_token = decrypted or auth_token
-            except Exception:
-                # If not encrypted (e.g. mock test), use raw
-                pass
+            if auth_token.startswith("gAAAAA"):
+                auth_token = decrypt_secret(auth_token)
 
         if auth_token:
             if self.config.auth_type == HttpAuthType.BEARER:
@@ -157,6 +153,7 @@ class HttpToolExecutor:
                     resp.raise_for_status()
                 return resp
 
+        response: httpx.Response | None = None
         try:
             if retry_count > 0:
                 async for attempt in AsyncRetrying(
@@ -175,6 +172,8 @@ class HttpToolExecutor:
             raise HttpToolExecutionError(f"HTTP request failed: {exc}") from exc
 
         # 5. Process and extract response
+        if response is None:
+            raise HttpToolExecutionError("HTTP retry loop completed without a response")
         status = response.status_code
         content_type = response.headers.get("content-type", "").lower()
 

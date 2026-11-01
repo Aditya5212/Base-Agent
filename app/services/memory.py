@@ -9,7 +9,10 @@ import logging
 from typing import Any
 
 from langchain_core.messages import BaseMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+from psycopg import AsyncConnection
+from psycopg.rows import DictRow, dict_row
 from psycopg_pool import AsyncConnectionPool
 
 from app.core.config import settings
@@ -17,20 +20,26 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 
 # Global connection pool and checkpointer instances
-_pool: AsyncConnectionPool | None = None
+_pool: AsyncConnectionPool[AsyncConnection[DictRow]] | None = None
 _checkpointer: AsyncPostgresSaver | None = None
 
 
-async def get_checkpointer_pool() -> AsyncConnectionPool:
+def validate_chat_thread_id(thread_id: str) -> None:
+    if thread_id.startswith("workflow:"):
+        raise ValueError("The workflow: prefix is reserved for internal execution checkpoints")
+
+
+async def get_checkpointer_pool() -> AsyncConnectionPool[AsyncConnection[DictRow]]:
     """Returns the active AsyncConnectionPool for the checkpointer."""
     global _pool
     if _pool is None or _pool.closed:
         logger.info("Initializing PostgreSQL checkpointer connection pool...")
-        _pool = AsyncConnectionPool(
+        _pool = AsyncConnectionPool[AsyncConnection[DictRow]](
             conninfo=settings.raw_database_url,
             max_size=settings.DATABASE_POOL_SIZE,
             min_size=1,
             open=False,
+            kwargs={"autocommit": True, "prepare_threshold": 0, "row_factory": dict_row},
         )
         await _pool.open()
     return _pool
@@ -72,8 +81,9 @@ async def close_checkpointer_pool() -> None:
 
 async def get_thread_messages(thread_id: str) -> list[BaseMessage]:
     """Retrieves all persisted messages for a given thread_id."""
+    validate_chat_thread_id(thread_id)
     checkpointer = await get_checkpointer()
-    config = {"configurable": {"thread_id": thread_id}}
+    config: RunnableConfig = {"configurable": {"thread_id": thread_id}}
     tuple_result = await checkpointer.aget_tuple(config)
     if not tuple_result or not tuple_result.checkpoint:
         return []
@@ -87,6 +97,7 @@ async def get_thread_messages(thread_id: str) -> list[BaseMessage]:
 
 async def delete_thread_memory(thread_id: str) -> bool:
     """Deletes all checkpoint memory records for a given thread_id."""
+    validate_chat_thread_id(thread_id)
     try:
         checkpointer = await get_checkpointer()
         await checkpointer.adelete_thread(thread_id)

@@ -474,6 +474,8 @@ class WorkflowRunResponse(BaseModel):
     workflow_id: uuid.UUID
     user_id: str
     thread_id: str
+    checkpoint_id: str | None = None
+    definition_snapshot: dict[str, Any] | None = None
     status: str
     input_data: dict[str, Any]
     output_data: dict[str, Any] | None

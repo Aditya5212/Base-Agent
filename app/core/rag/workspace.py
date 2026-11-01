@@ -1,4 +1,6 @@
 import re
+import hashlib
+import json
 
 _VALID = re.compile(r"[^a-zA-Z0-9_]")
 
@@ -17,17 +19,26 @@ def sanitize(raw: str) -> str:
 
 def user_workspace(user_id: str) -> str:
     """User-level knowledge graph bucket (global to all user documents)."""
-    return sanitize(f"u_{user_id}")
+    return _workspace("u", [user_id])
 
 
 def thread_workspace(user_id: str, thread_id: str) -> str:
     """Thread-isolated knowledge graph bucket (per-session precision graph)."""
-    return sanitize(f"u_{user_id}_t_{thread_id}")
+    return _workspace("t", [user_id, thread_id])
 
 
 def agent_workspace(user_id: str, agent_id: str) -> str:
     """Isolated knowledge base per custom agent for the Agent Builder platform."""
-    return sanitize(f"u_{user_id}_a_{agent_id}")
+    return _workspace("a", [user_id, agent_id])
+
+
+def _workspace(kind: str, parts: list[str]) -> str:
+    raw = f"u_{parts[0]}" if kind == "u" else f"u_{parts[0]}_{kind}_{parts[1]}"
+    # Preserve short, unambiguous legacy names (including u_root).
+    if all(re.fullmatch(r"[A-Za-z0-9]+", part) for part in parts) and len(raw) <= 60:
+        return raw
+    digest = hashlib.sha256(json.dumps([kind, *parts], ensure_ascii=False).encode()).hexdigest()[:24]
+    return f"{sanitize(raw)[:34]}_{digest}"
 
 
 def global_workspace() -> str:

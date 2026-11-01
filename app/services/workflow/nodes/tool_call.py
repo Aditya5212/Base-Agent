@@ -7,10 +7,11 @@ import logging
 from typing import Any
 
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
+from langgraph.types import interrupt
 
 from app.schemas.workflow import ToolCallNodeConfig
 from app.services.rag_tools import get_user_rag_tool_map
-from app.services.workflow.state import WorkflowState, render_template
+from app.services.workflow.state import WorkflowState, render_template_value
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +63,8 @@ def build_tool_call_node(node_id: str, config_dict: dict[str, Any]):
         resolved_args: dict[str, Any] = {}
         input_mapping = config.input_mapping or (config_dict or {}).get("arguments_template") or (config_dict or {}).get("arguments") or {}
         for arg_key, arg_val in input_mapping.items():
-            if isinstance(arg_val, str):
-                rendered = render_template(arg_val, state)
+            rendered = render_template_value(arg_val, state)
+            if isinstance(rendered, str):
                 # Try JSON deserialization if string looks like JSON
                 if rendered.startswith(("{", "[")) and rendered.endswith(("}", "]")):
                     try:
@@ -73,7 +74,15 @@ def build_tool_call_node(node_id: str, config_dict: dict[str, Any]):
                         pass
                 resolved_args[arg_key] = rendered
             else:
-                resolved_args[arg_key] = arg_val
+                resolved_args[arg_key] = rendered
+
+        # Outside the error/retry wrapper: interrupts must reach the graph runtime.
+        if config.requires_approval:
+            decision = interrupt({"type": "tool_approval", "node_id": node_id,
+                                  "tool": config.tool_name, "arguments": resolved_args,
+                                  "timeout_seconds": 86400})
+            if not isinstance(decision, dict) or decision.get("approved") is not True:
+                raise PermissionError(f"Approval denied for tool '{config.tool_name}'")
 
         variables = dict(state.get("variables") or {})
         history = list(state.get("node_history") or [])
@@ -112,11 +121,9 @@ def build_tool_call_node(node_id: str, config_dict: dict[str, Any]):
                 if custom_tools:
                     return await custom_tools[0].ainvoke(resolved_args)
 
-            # Fallback for unrecognized test/mock tools
-            return f"[Tool '{config.tool_name}' executed with args: {resolved_args}]"
+            raise ValueError(f"Unknown or inaccessible tool '{config.tool_name}'")
 
-        # 2. Execute with ToolRetryMiddleware and ToolErrorMiddleware
-        try:
+        async def _execute_with_retries() -> Any:
             if config.retry_count > 0:
                 retryer = AsyncRetrying(
                     stop=stop_after_attempt(config.retry_count + 1),
@@ -126,11 +133,14 @@ def build_tool_call_node(node_id: str, config_dict: dict[str, Any]):
                 )
                 async for attempt in retryer:
                     with attempt:
-                        result = await _execute()
+                        return await _execute()
             else:
-                result = await _execute()
+                return await _execute()
+            raise RuntimeError("Tool retry loop completed without a result")
 
-            variables[config.output_variable] = result
+        # 2. Execute with ToolRetryMiddleware and ToolErrorMiddleware
+        try:
+            variables[config.output_variable] = await _execute_with_retries()
         except Exception as exc:
             logger.error("Tool execution node '%s' failed: %s", node_id, exc, exc_info=True)
             if config.catch_errors:

@@ -2,6 +2,17 @@
 
 This document serves as the comprehensive architectural specification for **Base Agent**, detailing the conversational agent implementation, persistence layer, LLM provider integration, repository structure, and the **Agent Builder & Dynamic Workflow Engine** platform (Phases 1 & 2).
 
+## Verified execution scope — 2026-11-01
+
+The current supported capabilities are exposed by `GET /api/v1/workflows/capabilities`. See [audit remediation status](AUDIT_REMEDIATION_2026-11-01.md) for implementation, verification, migration requirements, and remaining work.
+
+- Eight node types execute today. `parallel`, `subgraph`, static fan-out, and JSONPath routing are rejected before saving/running; their schemas reserve future features.
+- Runs use internal `workflow:` checkpoint identities and immutable graph snapshots. Chat cannot use this reserved namespace. Approval payloads are persisted; deadlines are checked on resume. Legacy paused runs without snapshots must be restarted.
+- Agent tools execute in a bounded model/tool loop. Structured JSON and guardrail output checks run before protected SSE responses are emitted; these responses buffer the final answer. Unsupported provider, memory, fusion, and tool-override settings fail explicitly.
+- Knowledge ingestion and retrieval currently support **user scope only**. Knowledge attaches only to retrieve nodes. Upload `index_graph=true` to request LightRAG indexing, with provider readiness exposed in document details.
+- Code runs in a killable child process with a server-controlled module policy. This is **trusted-code execution**, not an operating-system sandbox for hostile code.
+- Run tests offline with `pytest`. Service-backed tests require `pytest --run-integration` and a disposable `TEST_DATABASE_URL`. Tests never initialize the configured application database implicitly.
+
 ---
 
 ## 1. Repository & Codebase Structure
@@ -450,7 +461,7 @@ Real-time token and reasoning event streaming over HTTP via **Server-Sent Events
 
 ## 9. Authentication & Tenant Isolation
 
-Base Agent implements a swappable authentication and multi-tenant isolation layer in [`app/core/auth.py`](file:///c:/Users/Aditya/Desktop/Base-Agent/app/core/auth.py):
+Base Agent implements a swappable authentication and multi-tenant isolation layer in [`app/core/auth.py`](app/core/auth.py):
 
 ### Identity Model (`UserContext`)
 ```python
@@ -508,10 +519,10 @@ API Request (upload/reindex)
 Database schema evolution is managed via async **Alembic** (`alembic/`):
 
 ### Architecture & Isolation:
-- **Unified Driver**: Uses `postgresql+psycopg://` with an async SQLAlchemy engine inside [`alembic/env.py`](file:///c:/Users/Aditya/Desktop/Base-Agent/alembic/env.py).
+- **Migration Driver**: Uses `postgresql+psycopg://` with an async SQLAlchemy engine inside [`alembic/env.py`](alembic/env.py).
 - **Target Metadata Isolation (`include_name`)**: Only tables registered in application ORM `Base.metadata` (`users`, `threads`, `thread_assets`, `documents`, `document_chunks`, `agents`, `structured_schemas`, `workflows`, `workflow_runs`) and `alembic_version` are managed by Alembic. External tables managed by other subsystems (`lightrag_*`, `checkpoint_*`, `langchain_pg_*`, `taskiq_*`) are strictly excluded from autogeneration diffs.
 - **Transaction Safety**: `run_async_migrations()` executes `await connection.commit()` to ensure DDL changes are persisted cleanly on serverless PostgreSQL (Neon).
-- **Programmatic Startup Migration**: [`app/core/database.py`](file:///c:/Users/Aditya/Desktop/Base-Agent/app/core/database.py) executes `run_migrations()` (`alembic upgrade head`) automatically inside the FastAPI `lifespan` handler before incoming requests are accepted.
+- **Programmatic Startup Migration**: [`app/core/database.py`](app/core/database.py) executes `run_migrations()` (`alembic upgrade head`) automatically inside the FastAPI `lifespan` handler before incoming requests are accepted.
 
 ---
 
@@ -598,8 +609,8 @@ All nodes inherit from `BaseNodeModel` and deserialize via a discriminated union
 | **`code`** | `CodeNodeConfig` | Python execution. Runs code in an AST-inspected restricted sandbox with forbidden call/import guards and timeouts. |
 | **`human_approval`** | `HumanApprovalNodeConfig` | HITL review. Triggers LangGraph `interrupt()`, moves run to `INTERRUPTED` until resumed via API. |
 | **`tool_call`** | `ToolCallNodeConfig` | Executes built-in tools (`calculator`, `datetime`) or hybrid search with retry and error catching. |
-| **`subgraph`** | `SubgraphNodeConfig` | Sub-workflow execution. Invokes nested workflow and maps returned state. |
-| **`parallel`** | `ParallelNodeConfig` | Concurrently dispatches multiple nodes with `wait_all` synchronization. |
+| **`subgraph`** | `SubgraphNodeConfig` | Reserved; rejected by validation until implemented. |
+| **`parallel`** | `ParallelNodeConfig` | Reserved; rejected by validation until implemented. |
 
 ### 3. Graph Compiler (`WorkflowCompiler`)
 - **Topological Validation (`validate_workflow_graph`)**:
@@ -616,7 +627,7 @@ All nodes inherit from `BaseNodeModel` and deserialize via a discriminated union
 - **`ToolErrorMiddleware` & `ToolRetryMiddleware`**: Catches tool execution exceptions and retries transient failures.
 
 ### 5. Multi-Agent Orchestration & Structured Output
-Workflows can assemble collaborative multi-agent teams. Verified via [`scripts/test_multi_agent_structured_workflow.py`](file:///c:/Users/Aditya/Desktop/Base-Agent/scripts/test_multi_agent_structured_workflow.py):
+Workflows can assemble collaborative multi-agent teams. An interactive example is [`scripts/test_multi_agent_structured_workflow.py`](scripts/test_multi_agent_structured_workflow.py):
 - **Retrieval Agent** fetches factual context.
 - **Technical Architect, Security Officer, and Business Specialist Agents** perform domain-specific evaluations.
 - **Lead Evaluator Agent** synthesizes specialist findings into an executive summary.
@@ -661,11 +672,11 @@ flowchart TD
 ```
 
 ### 1. Persistence Model & Secret Encryption at Rest
-Custom tools are persisted in PostgreSQL (`tools` table) via [`app/models/tool.py`](file:///c:/Users/Aditya/Desktop/Base-Agent/app/models/tool.py):
+Custom tools are persisted in PostgreSQL (`tools` table) via [`app/models/tool.py`](app/models/tool.py):
 - **Columns**: `id` (UUID), `user_id` (FK to `users.id`), `name`, `description`, `type` (`api`, `code`, `database`, `built_in`), `input_schema` (JSONB), `output_schema` (JSONB), `config` (JSONB), `is_system` (Boolean), `version` (Integer).
 - **Composite Unique Constraint**: `(user_id, name)` ensures uniqueness per tenant.
 - **Symmetric Secret Encryption (`app/core/crypto.py`)**:
-  - Sensitive configuration parameters (`auth_token`, `connection_string`, sensitive header values) are encrypted at rest using AES-128-CBC + HMAC-SHA256 (`cryptography.fernet`).
+  - Designated `auth_token` and `connection_string` fields are encrypted using Fernet. Custom header secrets are not automatically encrypted; use the designated auth configuration.
   - Read endpoints automatically decrypt configuration internally for execution while masking credentials (`***...***`) in client HTTP responses.
 
 ### 2. Specialized Execution Engines (`app/services/tool_executors/`)
@@ -676,9 +687,9 @@ Custom tools are persisted in PostgreSQL (`tools` table) via [`app/models/tool.p
   - Automatic exponential backoff retries on transient 5xx/network errors via `tenacity`.
   - Optional JSONPath extraction for isolating target response payloads.
 - **`CodeToolExecutor`**:
-  - Sandboxed Python execution engine with dual-layer safety verification.
-  - **Static AST Analysis**: Rejects forbidden AST nodes (`Import`, `ImportFrom`, `Global`, `Nonlocal`, `Yield`) and blocks private/dunder attribute access (`__subclasses__`, `__globals__`, etc.).
-  - **Execution Sandbox**: Restricted execution scope with safe built-ins, enforced runtime module whitelist (`math`, `datetime`, `json`, `re`, `random`, `collections`, `itertools`, `typing`), and strict timeout guards (`asyncio.wait_for`).
+  - Trusted Python transformations in child processes; timeout and cancellation terminate and reap the process. Hostile code requires additional operating-system isolation.
+  - **Static AST Analysis**: Checks imports against a server-owned permitted module set and rejects private attribute access and forbidden calls.
+  - **Process Lifecycle**: JSON input/output, a minimal environment, and process termination on timeout/cancellation. This does not replace operating-system resource and access controls for untrusted code.
 - **`DatabaseToolExecutor`**:
   - Read-only SQL query execution engine for reporting and analytical workflows.
   - **SQL Safety Guard**: Validates that statements are strictly `SELECT` or CTE `WITH` queries; unconditionally blocks mutations (`INSERT`, `UPDATE`, `DELETE`, `DROP`, `ALTER`, `TRUNCATE`, `EXEC`).
@@ -686,8 +697,8 @@ Custom tools are persisted in PostgreSQL (`tools` table) via [`app/models/tool.p
   - Dynamic routing for SQLite (`sqlite3` in worker thread) and PostgreSQL (`asyncpg/psycopg`) database connection URIs with strict `max_rows` truncation caps.
 
 ### 3. Dynamic Tool Registry (`ToolRegistry`)
-Located in [`app/services/tool_registry.py`](file:///c:/Users/Aditya/Desktop/Base-Agent/app/services/tool_registry.py):
-- **Runtime Pydantic Model Generation**: `json_schema_to_pydantic_model(schema, model_name)` dynamically compiles arbitrary JSON Schema definitions into strongly-typed Pydantic classes at runtime, supplying LangChain and LLM providers with valid tool call signatures.
+Located in [`app/services/tool_registry.py`](app/services/tool_registry.py):
+- **Runtime Tool Contracts**: Pydantic supplies tool argument signatures; JSON Schema Draft 2020-12 validates arguments and outputs without scalar coercion. Argument roots must be objects; schema references must be local.
 - **Dynamic Compilation**: Converts database `Tool` records into LangChain `BaseTool` instances (`_compile_tool`).
 - **LRU In-Memory Caching**: Caches compiled tool instances per tenant with fine-grained invalidation hooks (`invalidate(user_id, tool_name)`).
 - **Unified Tool Resolution**: `resolve_tools(tool_names, user_id, db)` resolves custom tools from PostgreSQL, seamlessly falling back to global built-ins (`calculator`) and modular RAG research tools (`hybrid_document_search`, `graph_rag_search`, `multi_query_search`).
@@ -716,14 +727,14 @@ Located in [`app/services/tool_registry.py`](file:///c:/Users/Aditya/Desktop/Bas
 ## 18. Design Principles
 
 1. **Stateless API, Stateful Graph**: FastAPI endpoints remain stateless; conversation and workflow states are persisted across turns via the checkpointer.
-2. **Unified Driver Ecosystem**: Single `psycopg3` engine and pool for ORM, LangGraph, and PGVector.
+2. **Database Connections**: SQLAlchemy/PGVector share an engine; checkpointing has a dedicated psycopg pool. Taskiq uses asyncpg, LightRAG manages its own connections, and document operation locks use dedicated nonpooled connections.
 3. **Decoupled Embedding and LLM Providers**: Independent OpenAI embeddings and DeepSeek conversational reasoning.
 4. **No In-Memory Production Traps**: Multi-worker persistence via PostgreSQL native FTS and PGVector.
 5. **Cross-Platform Compatibility**: Automatic selector loop policy for Windows and standard selector on POSIX.
 6. **Async First**: Fully async database queries, network calls, and agent invocations for maximum throughput.
 7. **Singleton Caching**: PGVector instance and compiled StateGraph are cached per collection/checkpointer at module level; hybrid dense+sparse searches run in parallel via `asyncio.gather` to minimise RAG latency.
 8. **User-Scoped Tool Security**: Agent tools never expose `user_id` as an LLM-callable argument. `make_search_tool(user_id)` closes over the caller-supplied identity so the model cannot escalate to another tenant's documents.
-9. **Zero Cross-Tenant Data Leakage**: User context is enforced at dependency injection boundaries; thread assets, conversation history, custom agents, workflows, and document embeddings are strictly tenant-isolated.
+9. **Tenant Boundaries**: Enforce ownership checks and internal checkpoint identities independently of authentication. Workspace naming includes a digest for ambiguous/long identities. Production identity verification remains deferred.
 10. **Worker-Decoupled Large Payloads**: High-volume binary files are stored in S3/R2 and referenced by key rather than transmitted across database task queues.
 11. **Explicit Schema Migrations**: All production schema changes are version-controlled via Alembic migrations, never ad-hoc DDL.
 12. **Compile-Time & Ingestion Safety**: Graphs are topologically validated and node configs validated with Pydantic discriminated unions before persistence or execution.

@@ -6,6 +6,7 @@ Stores Document objects in PostgreSQL with:
 """
 
 import logging
+import uuid
 from typing import Any
 
 from langchain_core.documents import Document
@@ -74,7 +75,8 @@ async def setup_vector_store() -> None:
     """Ensures HNSW and GIN indexes exist on the underlying langchain_pg_embedding table."""
     try:
         # Trigger table initialization
-        get_vector_store()
+        store = get_vector_store()
+        await store.acreate_collection()
         # Ping collection creation if not yet present
         async with engine.begin() as conn:
             # Create extension if not present
@@ -95,6 +97,7 @@ async def setup_vector_store() -> None:
         logger.info("PGVector HNSW and GIN indexes verified successfully.")
     except Exception as exc:
         logger.error("Failed to setup PGVector indexes: %s", exc, exc_info=True)
+        raise
 
 
 async def index_documents(
@@ -114,7 +117,7 @@ async def index_documents(
         return []
 
     store = get_vector_store(collection_name=collection_name)
-    ids = await store.aadd_documents(documents)
+    ids = await store.aadd_documents(documents, ids=[doc.metadata.get("chunk_id") or str(uuid.uuid4()) for doc in documents])
     logger.info("Indexed %d documents into PGVector collection '%s'", len(ids), store.collection_name)
     return ids
 

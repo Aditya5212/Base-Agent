@@ -48,7 +48,8 @@ async def create_agent_endpoint(
     db: AsyncSession = Depends(get_db),
 ) -> AgentResponse:
     """Creates a new agent owned by the authenticated user."""
-    return await create_agent(db, user_id=current_user.user_id, agent_in=agent_in)
+    agent = await create_agent(db, user_id=current_user.user_id, agent_in=agent_in)
+    return AgentResponse.model_validate(agent)
 
 
 @router.get(
@@ -76,7 +77,7 @@ async def list_agents_endpoint(
         search=search,
         is_default=is_default,
     )
-    return AgentListResponse(items=items, total=total, page=page, page_size=page_size)
+    return AgentListResponse(items=[AgentResponse.model_validate(item) for item in items], total=total, page=page, page_size=page_size)
 
 
 @router.get(
@@ -91,7 +92,8 @@ async def get_default_agent_endpoint(
     db: AsyncSession = Depends(get_db),
 ) -> AgentResponse:
     """Returns the user's default agent, creating one if not yet provisioned."""
-    return await get_or_create_default_agent(db, user_id=current_user.user_id)
+    agent = await get_or_create_default_agent(db, user_id=current_user.user_id)
+    return AgentResponse.model_validate(agent)
 
 
 @router.get(
@@ -107,12 +109,13 @@ async def get_agent_endpoint(
     db: AsyncSession = Depends(get_db),
 ) -> AgentResponse:
     """Retrieves an agent by ID with ownership verification."""
-    return await get_agent_by_id(
+    agent = await get_agent_by_id(
         db,
         agent_id=agent_id,
         user_id=current_user.user_id,
         is_admin=current_user.is_admin,
     )
+    return AgentResponse.model_validate(agent)
 
 
 @router.put(
@@ -130,13 +133,14 @@ async def update_agent_endpoint(
     db: AsyncSession = Depends(get_db),
 ) -> AgentResponse:
     """Updates an agent and increments its version counter."""
-    return await update_agent(
+    agent = await update_agent(
         db,
         agent_id=agent_id,
         user_id=current_user.user_id,
         agent_in=agent_in,
         is_admin=current_user.is_admin,
     )
+    return AgentResponse.model_validate(agent)
 
 
 @router.delete(
@@ -176,13 +180,14 @@ async def clone_agent_endpoint(
     db: AsyncSession = Depends(get_db),
 ) -> AgentResponse:
     """Duplicates an agent config."""
-    return await clone_agent(
+    agent = await clone_agent(
         db,
         agent_id=agent_id,
         user_id=current_user.user_id,
         clone_in=clone_in,
         is_admin=current_user.is_admin,
     )
+    return AgentResponse.model_validate(agent)
 
 
 @router.post(
@@ -198,9 +203,10 @@ async def set_default_agent_endpoint(
     db: AsyncSession = Depends(get_db),
 ) -> AgentResponse:
     """Sets an agent as default."""
-    return await set_default_agent(
+    agent = await set_default_agent(
         db,
         agent_id=agent_id,
         user_id=current_user.user_id,
         is_admin=current_user.is_admin,
     )
+    return AgentResponse.model_validate(agent)

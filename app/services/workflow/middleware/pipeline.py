@@ -61,6 +61,7 @@ async def invoke_chat_model_with_middlewares(
                 )
                 response = await llm.ainvoke(messages)
                 return response
+        raise RuntimeError("Model retry loop completed without a response")
     except Exception as primary_exc:
         logger.warning(
             "Primary model '%s' failed after %d attempts: %s",

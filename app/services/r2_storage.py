@@ -6,7 +6,7 @@ Includes development/fallback storage when R2 credentials are not configured.
 """
 
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 import io
 import logging
 from typing import Any, BinaryIO
@@ -25,11 +25,12 @@ def _is_transient_r2_error(exc: BaseException) -> bool:
     exc_name = exc.__class__.__name__
     if any(k in exc_name for k in ("Timeout", "Connection", "EndpointConnection", "IncompleteRead")):
         return True
-    if hasattr(exc, "response") and isinstance(exc.response, dict):
-        status_code = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0)
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        status_code = response.get("ResponseMetadata", {}).get("HTTPStatusCode", 0)
         if status_code in (429, 500, 502, 503, 504):
             return True
-        code = exc.response.get("Error", {}).get("Code", "")
+        code = response.get("Error", {}).get("Code", "")
         if code in ("RequestTimeout", "ThrottlingException", "SlowDown", "InternalError", "ServiceUnavailable"):
             return True
     return False
@@ -69,14 +70,17 @@ class R2StorageService:
     @asynccontextmanager
     async def get_client(self) -> AsyncGenerator[Any, None]:
         """Context manager providing an initialized async S3 client."""
-        async with self.session.client(
+        client_context = self.session.client(
             "s3",
             endpoint_url=self.endpoint_url,
             aws_access_key_id=self.access_key,
             aws_secret_access_key=self.secret_key,
             config=Config(signature_version="s3v4"),
             region_name=self.region_name,
-        ) as client:
+        )
+        if not isinstance(client_context, AbstractAsyncContextManager):
+            raise TypeError("The storage SDK did not provide an asynchronous client context")
+        async with client_context as client:
             yield client
 
     async def file_exists(self, file_key: str) -> bool:
@@ -90,8 +94,9 @@ class R2StorageService:
                     await s3.head_object(Bucket=self.bucket_name, Key=file_key)
                     return True
                 except Exception as exc:
-                    if hasattr(exc, "response") and isinstance(exc.response, dict):
-                        code = exc.response.get("Error", {}).get("Code")
+                    response = getattr(exc, "response", None)
+                    if isinstance(response, dict):
+                        code = response.get("Error", {}).get("Code")
                         if code in ("404", "NoSuchKey", "NotFound"):
                             return False
                     if "404" in str(exc) or "NotFound" in str(exc):
@@ -200,8 +205,8 @@ class R2StorageService:
             filename: Optional clean filename for Content-Disposition header.
         """
         if not self.is_configured:
-            params = "?inline=true" if inline else ""
-            return f"/api/v1/storage/dev-download/{file_key}{params}"
+            query_string = "?inline=true" if inline else ""
+            return f"/api/v1/storage/dev-download/{file_key}{query_string}"
 
         params: dict[str, Any] = {"Bucket": self.bucket_name, "Key": file_key}
         if inline:

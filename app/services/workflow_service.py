@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+import hashlib
 import logging
 from typing import Any
 import uuid
@@ -8,6 +10,7 @@ import uuid
 from fastapi import HTTPException, status
 from langgraph.errors import GraphInterrupt
 from langgraph.types import Command
+from langchain_core.runnables import RunnableConfig
 from sqlalchemy import func, select
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,6 +24,7 @@ from app.schemas.workflow import (
     WorkflowUpdate,
 )
 from app.services.memory import get_checkpointer
+from app.core.json_validation import validate_payload
 from app.services.schema_service import validate_json_schema
 from app.services.thread_service import get_or_create_user
 from app.services.workflow.compiler import WorkflowCompiler
@@ -58,6 +62,11 @@ async def create_workflow(
         validate_json_schema(payload.input_schema)
     if payload.output_schema is not None:
         validate_json_schema(payload.output_schema)
+
+    try:
+        WorkflowCompiler.compile(raw_nodes, raw_edges)
+    except (ValueError, PermissionError, GraphValidationError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     workflow = Workflow(
         user_id=user_id,
@@ -171,6 +180,11 @@ async def update_workflow(
         validate_json_schema(payload.output_schema)
         workflow.output_schema = payload.output_schema
 
+    try:
+        WorkflowCompiler.compile(workflow.nodes, workflow.edges)
+    except (ValueError, PermissionError, GraphValidationError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
     workflow.version += 1
     await session.commit()
     await session.refresh(workflow)
@@ -188,6 +202,8 @@ async def attach_node_knowledge(
     """Configures or attaches knowledge retrieval parameters to a specific workflow node."""
     workflow = await get_workflow_by_id(session, workflow_id, user_id)
 
+    if knowledge_config.workspace_type != "user" or knowledge_config.provider_name not in {"hybrid", "lightrag", "multi_query"}:
+        raise HTTPException(status_code=422, detail="Select a supported provider with user knowledge scope")
     nodes = list(workflow.nodes or [])
     node_found = False
     updated_nodes = []
@@ -209,7 +225,7 @@ async def attach_node_knowledge(
                 if knowledge_config.sources_variable:
                     node_cfg["sources_variable"] = knowledge_config.sources_variable
             else:
-                node_cfg["knowledge"] = knowledge_config.model_dump(mode="json")
+                raise HTTPException(status_code=422, detail="Knowledge attachment is supported only on retrieve nodes")
 
             node["config"] = node_cfg
         updated_nodes.append(node)
@@ -245,6 +261,43 @@ async def delete_workflow(
 # Workflow Execution Service Functions
 # ---------------------------------------------------------------------------
 
+def _record_execution_result(run: WorkflowRun, state: dict[str, Any], definition: dict[str, Any], resumed: bool = False) -> None:
+    """Interpret LangGraph's returned interrupts before declaring completion."""
+    entry: dict[str, Any] = {"node_history": state.get("node_history", [])}
+    if resumed:
+        entry["resumed"] = True
+    interrupts = state.get("__interrupt__") or ()
+    if interrupts:
+        now = datetime.now(timezone.utc)
+        entry["interrupts"] = []
+        for item in interrupts:
+            value = getattr(item, "value", item)
+            timeout = value.get("timeout_seconds", 86400) if isinstance(value, dict) else 86400
+            entry["interrupts"].append({
+                "id": getattr(item, "id", None), "value": value,
+                "expires_at": (now + timedelta(seconds=timeout)).isoformat(),
+            })
+        run.status = "INTERRUPTED"
+        run.output_data = None
+        run.completed_at = None
+    else:
+        variables = dict(state.get("variables") or {})
+        output: dict[str, Any] = {}
+        executed = set(state.get("node_history") or [])
+        for node in definition["nodes"]:
+            if node.get("type") == "end" and node["id"] in executed:
+                key = (node.get("config") or {}).get("response_variable")
+                if key:
+                    output[key] = variables[key]
+        if not output:
+            output = variables
+        validate_payload(output, definition.get("output_schema"), "Workflow output")
+        run.status = "COMPLETED"
+        run.output_data = output
+        run.completed_at = datetime.now(timezone.utc)
+    run.error_message = None
+    run.execution_log = list(run.execution_log or []) + [entry]
+
 async def execute_workflow(
     session: AsyncSession,
     workflow_id: uuid.UUID,
@@ -253,8 +306,26 @@ async def execute_workflow(
 ) -> WorkflowRun:
     """Executes a workflow state graph with persistent checkpointing."""
     workflow = await get_workflow_by_id(session, workflow_id, user_id)
+    definition = deepcopy({
+        "nodes": workflow.nodes, "edges": workflow.edges,
+        "input_schema": workflow.input_schema, "output_schema": workflow.output_schema,
+        "recursion_limit": workflow.recursion_limit, "version": workflow.version,
+    })
+    try:
+        validate_payload(payload.input_data, definition["input_schema"], "Workflow input")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    # Do not run a supposedly resumable workflow without durable checkpointing.
+    try:
+        checkpointer = await get_checkpointer()
+        if checkpointer is None:
+            raise RuntimeError("Persistence is unavailable")
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="Workflow checkpointing is unavailable") from exc
     run_id = uuid.uuid4()
     thread_id = payload.thread_id or f"wf_run_{run_id}"
+    owner_key = hashlib.sha256(f"{user_id}:{workflow_id}".encode()).hexdigest()
+    checkpoint_id = f"workflow:{owner_key}:{run_id}"
 
     # 1. Initialize run record
     run = WorkflowRun(
@@ -262,6 +333,9 @@ async def execute_workflow(
         workflow_id=workflow_id,
         user_id=user_id,
         thread_id=thread_id,
+        checkpoint_id=checkpoint_id,
+        definition_snapshot=definition,
+        execution_log=[],
         status="RUNNING",
         input_data=payload.input_data,
         started_at=datetime.now(timezone.utc),
@@ -272,15 +346,9 @@ async def execute_workflow(
 
     # 2. Compile graph with checkpointer
     try:
-        checkpointer = await get_checkpointer()
-    except Exception as cp_err:
-        logger.warning("Checkpointer unavailable, compiling without persistence: %s", cp_err)
-        checkpointer = None
-
-    try:
         compiled_graph = WorkflowCompiler.compile(
-            nodes=workflow.nodes,
-            edges=workflow.edges,
+            nodes=definition["nodes"],
+            edges=definition["edges"],
             checkpointer=checkpointer,
             validate=True,
         )
@@ -295,35 +363,19 @@ async def execute_workflow(
             "error": None,
         }
 
-        exec_config: dict[str, Any] = {
-            "configurable": {"thread_id": thread_id},
-            "recursion_limit": workflow.recursion_limit,
+        exec_config: RunnableConfig = {
+            "configurable": {"thread_id": checkpoint_id},
+            "recursion_limit": definition["recursion_limit"],
         }
 
         # Execute StateGraph
         final_state = await compiled_graph.ainvoke(initial_state, config=exec_config)
 
-        # 3. Determine output data
-        # Check if an END node designated a specific response_variable
-        output_data: dict[str, Any] = {}
-        for n in workflow.nodes:
-            if str(n.get("type", "")).lower() == "end":
-                resp_var = n.get("config", {}).get("response_variable")
-                if resp_var and resp_var in final_state.get("variables", {}):
-                    output_data[resp_var] = final_state["variables"][resp_var]
-
-        if not output_data:
-            output_data = dict(final_state.get("variables") or {})
-
-        run.status = "COMPLETED"
-        run.output_data = output_data
-        run.execution_log = [{"node_history": final_state.get("node_history", [])}]
-        run.completed_at = datetime.now(timezone.utc)
+        _record_execution_result(run, final_state, definition)
 
     except GraphInterrupt as interrupt_exc:
         logger.info("Workflow run '%s' was paused by human-in-the-loop interrupt", run_id)
-        run.status = "INTERRUPTED"
-        run.execution_log = [{"interrupt": str(interrupt_exc)}]
+        _record_execution_result(run, {"__interrupt__": interrupt_exc.args[0]}, definition)
     except Exception as exc:
         logger.error("Workflow run '%s' execution failed: %s", run_id, exc, exc_info=True)
         run.status = "FAILED"
@@ -342,14 +394,23 @@ async def resume_workflow_run(
     payload: WorkflowResumeRequest,
 ) -> WorkflowRun:
     """Resumes an interrupted workflow execution run."""
-    run = await get_workflow_run(session, run_id, user_id)
+    run = await get_workflow_run(session, run_id, user_id, for_update=True)
     if run.status != "INTERRUPTED":
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Workflow run is in status '{run.status}', only 'INTERRUPTED' runs can be resumed.",
         )
 
-    workflow = await get_workflow_by_id(session, run.workflow_id, user_id)
+    if not run.definition_snapshot or not run.checkpoint_id:
+        raise HTTPException(status_code=409, detail="This legacy run has no pinned definition or isolated checkpoint. Start a new run.")
+    definition = run.definition_snapshot
+    pending = (run.execution_log or [{}])[-1].get("interrupts", [])
+    if any(datetime.fromisoformat(item["expires_at"]) <= datetime.now(timezone.utc) for item in pending):
+        run.status = "EXPIRED"
+        run.completed_at = datetime.now(timezone.utc)
+        run.error_message = "Approval deadline expired"
+        await session.commit()
+        return run
 
     try:
         checkpointer = await get_checkpointer()
@@ -360,16 +421,19 @@ async def resume_workflow_run(
         )
 
     compiled_graph = WorkflowCompiler.compile(
-        nodes=workflow.nodes,
-        edges=workflow.edges,
+        nodes=definition["nodes"],
+        edges=definition["edges"],
         checkpointer=checkpointer,
-        validate=False,
+        validate=True,
     )
 
-    exec_config = {
-        "configurable": {"thread_id": run.thread_id},
-        "recursion_limit": workflow.recursion_limit,
+    exec_config: RunnableConfig = {
+        "configurable": {"thread_id": run.checkpoint_id},
+        "recursion_limit": definition["recursion_limit"],
     }
+
+    run.status = "RUNNING"
+    await session.commit()
 
     try:
         # Resume LangGraph execution with human decision payload
@@ -378,14 +442,10 @@ async def resume_workflow_run(
             config=exec_config,
         )
 
-        run.status = "COMPLETED"
-        run.output_data = dict(final_state.get("variables") or {})
-        run.execution_log = run.execution_log + [{"resumed": True, "node_history": final_state.get("node_history", [])}]
-        run.completed_at = datetime.now(timezone.utc)
+        _record_execution_result(run, final_state, definition, resumed=True)
     except GraphInterrupt as interrupt_exc:
         logger.info("Workflow run '%s' interrupted again", run_id)
-        run.status = "INTERRUPTED"
-        run.execution_log = run.execution_log + [{"interrupt": str(interrupt_exc)}]
+        _record_execution_result(run, {"__interrupt__": interrupt_exc.args[0]}, definition, resumed=True)
     except Exception as exc:
         logger.error("Error resuming workflow run '%s': %s", run_id, exc, exc_info=True)
         run.status = "FAILED"
@@ -401,9 +461,12 @@ async def get_workflow_run(
     session: AsyncSession,
     run_id: uuid.UUID,
     user_id: str,
+    for_update: bool = False,
 ) -> WorkflowRun:
     """Retrieves a workflow execution run by ID enforcing tenant isolation."""
     stmt = select(WorkflowRun).where(WorkflowRun.id == run_id)
+    if for_update:
+        stmt = stmt.with_for_update().execution_options(populate_existing=True)
     result = await session.execute(stmt)
     run = result.scalar_one_or_none()
 

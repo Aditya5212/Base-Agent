@@ -554,6 +554,13 @@ async def test_workflow_attach_node_knowledge_endpoint():
             json=knowledge_payload,
             headers=headers,
         )
+        assert attach_resp.status_code == 422  # Thread ingestion/scoping is not implemented.
+        knowledge_payload["workspace_type"] = "user"
+        attach_resp = await ac.post(
+            f"/api/v1/workflows/{wf_id}/nodes/ret_1/knowledge",
+            json=knowledge_payload,
+            headers=headers,
+        )
         assert attach_resp.status_code == 200
         updated_wf = attach_resp.json()
         assert updated_wf["version"] == 2
@@ -562,7 +569,7 @@ async def test_workflow_attach_node_knowledge_endpoint():
         ret_node = next(n for n in updated_wf["nodes"] if n["id"] == "ret_1")
         assert ret_node["config"]["provider_name"] == "multi_query"
         assert ret_node["config"]["top_k"] == 8
-        assert ret_node["config"]["workspace_type"] == "thread"
+        assert ret_node["config"]["workspace_type"] == "user"
         assert ret_node["config"]["output_variable"] == "multi_context"
 
         # Clean up

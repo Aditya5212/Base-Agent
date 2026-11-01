@@ -166,7 +166,7 @@ class LightRAGProvider:
             display_name="LightRAG (Knowledge Graph)",
             description=(
                 "Extracts structured entities and relationships into an interconnected knowledge graph. "
-                "Delivers zero-hallucination multi-hop reasoning, thematic summaries, and relationship traversal."
+                "Provides context for multi-hop reasoning, thematic summaries, and relationship traversal."
             ),
             supports_graph=True,
             supports_multimodal=False,

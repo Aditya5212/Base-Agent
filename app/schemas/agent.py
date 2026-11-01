@@ -181,6 +181,8 @@ class AdvancedConfig(BaseModel):
         le=300,
         description="Per-turn generation timeout in seconds.",
     )
+    max_model_calls: int = Field(default=8, ge=1, le=30)
+    max_tool_calls: int = Field(default=12, ge=1, le=50)
 
 
 class AgentConfig(BaseModel):
