@@ -28,6 +28,83 @@ def _visible_chunk_filter(filters):
     return {"$and": [filters, visible]} if filters else visible
 
 
+def build_rag_filter(
+    user_id: str | None = None,
+    thread_id: str | None = None,
+    thread_scoped_only: bool = False,
+) -> dict[str, Any] | None:
+    """Builds a structured metadata filter compatible with both PGVector and sparse search.
+
+    If thread_id is provided and thread_scoped_only is False (default for chat turns),
+    it allows retrieving both thread-scoped documents and user-global documents
+    (documents where thread_id does not exist).
+    If thread_id is None, it scopes retrieval to user_id (or returns None).
+    """
+    clauses: list[dict[str, Any]] = []
+    if user_id:
+        clauses.append({"user_id": {"$eq": user_id}})
+
+    if thread_id:
+        if thread_scoped_only:
+            clauses.append({"thread_id": {"$eq": thread_id}})
+        else:
+            clauses.append({
+                "$or": [
+                    {"thread_id": {"$eq": thread_id}},
+                    {"thread_id": {"$exists": False}},
+                ]
+            })
+
+    if not clauses:
+        return None
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"$and": clauses}
+
+
+def _build_sparse_filter_clause(
+    filter_spec: dict[str, Any],
+    params: dict[str, Any],
+    counter: list[int],
+) -> str:
+    """Recursively converts filter specifications into PostgreSQL JSONB SQL conditions."""
+    if not filter_spec:
+        return ""
+    if "$and" in filter_spec:
+        parts = [_build_sparse_filter_clause(item, params, counter) for item in filter_spec["$and"]]
+        valid_parts = [p for p in parts if p]
+        return f"({' AND '.join(valid_parts)})" if valid_parts else ""
+    if "$or" in filter_spec:
+        parts = [_build_sparse_filter_clause(item, params, counter) for item in filter_spec["$or"]]
+        valid_parts = [p for p in parts if p]
+        return f"({' OR '.join(valid_parts)})" if valid_parts else ""
+
+    field_conds = []
+    for field, val in filter_spec.items():
+        if field.startswith("$"):
+            continue
+        if isinstance(val, dict):
+            if "$eq" in val:
+                c = counter[0]
+                counter[0] += 1
+                param_key = f"sparse_p_{c}"
+                field_conds.append(f"cmetadata->>'{field}' = :{param_key}")
+                params[param_key] = str(val["$eq"])
+            elif "$exists" in val:
+                if val["$exists"]:
+                    field_conds.append(f"(cmetadata ? '{field}' AND cmetadata->>'{field}' IS NOT NULL)")
+                else:
+                    field_conds.append(f"(NOT (cmetadata ? '{field}') OR cmetadata->>'{field}' IS NULL)")
+        else:
+            c = counter[0]
+            counter[0] += 1
+            param_key = f"sparse_p_{c}"
+            field_conds.append(f"cmetadata->>'{field}' = :{param_key}")
+            params[param_key] = str(val)
+
+    return " AND ".join(field_conds)
+
+
 def _compute_chunk_fingerprint(doc: Document) -> str:
     """Computes a unique deduplication key for a document chunk."""
     chunk_id = doc.metadata.get("id") or doc.metadata.get("chunk_id")
@@ -80,14 +157,12 @@ async def _sparse_search(
             "limit": top_k,
         }
 
-        # Apply metadata filters if provided (e.g. user_id or document_id)
+        # Apply metadata filters if provided (supports both simple dicts and complex $and/$or clauses)
         if filter_dict:
-            for idx, (k, v) in enumerate(filter_dict.items()):
-                param_key = f"filter_val_{idx}"
-                param_field = f"filter_field_{idx}"
-                conditions.append(f"cmetadata->>:{param_field} = :{param_key}")
-                params[param_field] = str(k)
-                params[param_key] = str(v)
+            counter = [0]
+            sparse_clause = _build_sparse_filter_clause(filter_dict, params, counter)
+            if sparse_clause:
+                conditions.append(sparse_clause)
 
         where_clause = " AND ".join(conditions)
         sql = f"""
@@ -183,6 +258,8 @@ async def hybrid_search(
     config: RAGConfig | None = None,
     collection_name: str | None = None,
     filter_dict: dict[str, Any] | None = None,
+    thread_id: str | None = None,
+    thread_scoped_only: bool = False,
 ) -> list[Document]:
     """Executes end-to-end hybrid search (dense pgvector + sparse PostgreSQL FTS) with RRF fusion.
 
@@ -191,6 +268,8 @@ async def hybrid_search(
         config: Optional RAGConfig tuning precision vs recall, chunk sizes, and RRF weights.
         collection_name: Optional collection name override.
         filter_dict: Optional metadata filter dict (e.g. {'user_id': 'aditya'}).
+        thread_id: Optional thread ID to apply thread scoping (thread + global fallback).
+        thread_scoped_only: If True, search strictly thread-scoped documents without global fallback.
 
     Returns:
         Ranked list of top-K fused Document objects.
@@ -198,19 +277,28 @@ async def hybrid_search(
     rag_cfg = config or get_rag_config()
     target_collection = collection_name or settings.RAG_COLLECTION_NAME
 
+    effective_filter = dict(filter_dict) if filter_dict else None
+    if thread_id and (not effective_filter or "thread_id" not in effective_filter):
+        user_id = effective_filter.get("user_id") if effective_filter else None
+        effective_filter = build_rag_filter(
+            user_id=user_id,
+            thread_id=thread_id,
+            thread_scoped_only=thread_scoped_only,
+        )
+
     # Execute dense and sparse retrieval in parallel to minimise wall-clock latency
     dense_candidates, sparse_candidates = await asyncio.gather(
         _dense_search(
             query=query,
             top_k=rag_cfg.top_k_dense,
             collection_name=target_collection,
-            filter_dict=filter_dict,
+            filter_dict=effective_filter,
         ),
         _sparse_search(
             query=query,
             top_k=rag_cfg.top_k_sparse,
             collection_name=target_collection,
-            filter_dict=filter_dict,
+            filter_dict=effective_filter,
         ),
     )
 

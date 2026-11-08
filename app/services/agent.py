@@ -23,7 +23,7 @@ from app.core.config import settings
 from app.core.llm import DEFAULT_MODEL, get_llm
 from app.core.rag.factory import get_provider
 from app.core.rag.protocols import RetrievalQuery
-from app.core.rag.workspace import agent_workspace, user_workspace
+from app.core.rag.workspace import agent_workspace, thread_workspace, user_workspace
 from app.core.rag_config import RAGPreset, get_rag_config
 from app.schemas.agent import AgentConfig
 from app.schemas.chat import StreamEvent
@@ -64,18 +64,30 @@ class AgentState(TypedDict, total=False):
     knowledge_base_context: str | None
 
 
-async def get_user_knowledge_base_context(user_id: str) -> str:
+async def get_user_knowledge_base_context(user_id: str, thread_id: str | None = None) -> str:
     """Queries user's indexed documents and formats an informative context string for the LLM."""
     try:
         from app.core.database import AsyncSessionLocal
         from app.models.document import Document, DocumentStatus
         from app.schemas.storage import format_bytes
-        from sqlalchemy import select
+        from sqlalchemy import or_, select
 
         async with AsyncSessionLocal() as session:
+            if thread_id:
+                conditions = or_(
+                    Document.thread_id == thread_id,
+                    Document.thread_id.is_(None),
+                )
+            else:
+                conditions = Document.thread_id.is_(None)
+
             stmt = (
                 select(Document)
-                .where(Document.user_id == user_id, Document.status == DocumentStatus.INDEXED)
+                .where(
+                    Document.user_id == user_id,
+                    Document.status == DocumentStatus.INDEXED,
+                    conditions,
+                )
                 .order_by(Document.created_at.desc())
                 .limit(50)
             )
@@ -84,13 +96,21 @@ async def get_user_knowledge_base_context(user_id: str) -> str:
             if not docs:
                 return ""
 
-            lines = [
-                "=== Available Knowledge Base Documents ===",
-                "The user has the following documents uploaded and indexed in their knowledge base:",
-            ]
-            for d in docs:
-                size_str = format_bytes(d.file_size) if d.file_size else ""
-                lines.append(f'- "{d.file_name}" ({size_str})')
+            thread_docs = [d for d in docs if d.thread_id == thread_id] if thread_id else []
+            global_docs = [d for d in docs if not d.thread_id]
+
+            lines = ["=== Available Knowledge Base Documents ==="]
+            if thread_docs:
+                lines.append("Documents uploaded to this conversation thread:")
+                for d in thread_docs:
+                    size_str = format_bytes(d.file_size) if d.file_size else ""
+                    lines.append(f'- [Thread Document] "{d.file_name}" ({size_str})')
+
+            if global_docs:
+                lines.append("Documents in user's global knowledge base:")
+                for d in global_docs:
+                    size_str = format_bytes(d.file_size) if d.file_size else ""
+                    lines.append(f'- [Global Document] "{d.file_name}" ({size_str})')
 
             lines.append(
                 "You have access to RAG research tools (e.g. `hybrid_document_search`, `graph_rag_search`, `multi_query_search`). "
@@ -124,7 +144,7 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
             logger.warning("Could not fetch thread assets for thread %s: %s", thread_id, exc)
 
     # 2. Fetch user knowledge base document inventory for situational awareness
-    kb_context = await get_user_knowledge_base_context(user_id)
+    kb_context = await get_user_knowledge_base_context(user_id, thread_id=thread_id)
 
     use_rag = configurable.get("use_rag", False)
     if not use_rag:
@@ -192,7 +212,7 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
     # 1. Knowledge Graph mode
     if retrieval_mode in ("lightrag", "graph", "knowledge_graph"):
         try:
-            workspace = user_workspace(user_id)
+            workspace = thread_workspace(user_id, thread_id) if thread_id else user_workspace(user_id)
             rag_provider = await get_provider("lightrag", workspace=workspace)
             graph_res = await rag_provider.query(
                 RetrievalQuery(query=query_text, mode=selected_provider.mode if selected_provider.mode in {"mix", "local", "global", "hybrid", "naive"} else "mix", top_k=selected_provider.top_k)
@@ -237,13 +257,15 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
                 user_id=user_id,
                 preset=preset,
                 top_k_final=selected_provider.top_k,
+                thread_id=thread_id,
             )
         else:
-            # Search documents indexed under this user's user_id
+            # Search documents with thread-aware scoping
             fused_docs = await hybrid_search(
                 query=query_text,
                 config=rag_cfg,
                 filter_dict={"user_id": user_id},
+                thread_id=thread_id,
             )
     except Exception as exc:
         logger.error("Error during RAG retrieval in retrieve_node: %s", exc, exc_info=True)

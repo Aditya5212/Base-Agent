@@ -9,6 +9,7 @@ class DocumentUploadResponse(BaseModel):
     """Response returned upon uploading and indexing a document."""
 
     id: str = Field(..., description="Unique document UUID")
+    thread_id: str | None = Field(default=None, description="Associated thread ID if thread-scoped")
     file_name: str = Field(..., description="Original file name")
     file_size: int = Field(..., description="File size in bytes")
     status: str = Field(..., description="Current lifecycle status (PENDING, PARSING, INDEXED, FAILED)")
@@ -21,6 +22,7 @@ class DocumentItemResponse(BaseModel):
     """Representation of an uploaded document record."""
 
     id: str = Field(..., description="Document UUID")
+    thread_id: str | None = Field(default=None, description="Associated thread ID if thread-scoped")
     file_name: str = Field(..., description="Original file name")
     mime_type: str = Field(..., description="MIME content type")
     file_size: int = Field(..., description="File size in bytes")
@@ -53,6 +55,7 @@ class RAGSearchRequest(BaseModel):
     preset: str = Field(default="balanced", description="Precision vs recall preset (high_precision, balanced, high_recall)")
     top_k: int | None = Field(default=None, ge=1, le=30, description="Optional top-k override")
     user_id: str | None = Field(default=None, description="Optional user filter to scope retrieval")
+    thread_id: str | None = Field(default=None, description="Optional thread filter to scope retrieval")
 
 
 class RAGSearchChunkResponse(BaseModel):
@@ -80,6 +83,7 @@ class DocumentDetailResponse(BaseModel):
     """Comprehensive details for an individual document in the knowledge base."""
 
     id: str = Field(..., description="Document UUID")
+    thread_id: str | None = Field(default=None, description="Associated thread ID if thread-scoped")
     file_name: str = Field(..., description="Original file name")
     mime_type: str = Field(..., description="MIME content type")
     file_size: int = Field(..., description="File size in bytes")
@@ -130,6 +134,7 @@ class ReindexDocumentResponse(BaseModel):
     """Response returned upon re-indexing a document."""
 
     document_id: str = Field(..., description="Document UUID")
+    thread_id: str | None = Field(default=None, description="Associated thread ID if thread-scoped")
     file_name: str = Field(..., description="Document file name")
     previous_chunks: int = Field(default=0, description="Number of previous chunks before re-indexing")
     new_chunks: int = Field(default=0, description="Number of new chunks indexed (0 while processing in background)")
@@ -156,6 +161,7 @@ class DocumentRetryResponse(BaseModel):
     """Response returned upon retrying a document indexing task."""
 
     document_id: str = Field(..., description="Document UUID")
+    thread_id: str | None = Field(default=None, description="Associated thread ID if thread-scoped")
     file_name: str = Field(..., description="Document file name")
     status: str = Field(..., description="Updated document status (PARSING)")
     preset: str = Field(..., description="Applied RAG preset profile")

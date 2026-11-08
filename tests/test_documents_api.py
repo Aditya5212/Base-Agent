@@ -1,8 +1,9 @@
 import pytest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 from langchain_core.documents import Document
 
+from app.core.database import get_db
 from app.main import app
 from app.services.document_processor import process_document_pipeline
 
@@ -82,31 +83,45 @@ def test_reindex_document_not_found():
 
 
 def test_upload_document_background_dispatch():
-    with patch("app.api.v1.endpoints.documents.r2_storage_service.upload_file", new_callable=AsyncMock) as mock_r2, \
-         patch("app.api.v1.endpoints.documents.process_document_pipeline", new_callable=AsyncMock) as mock_pipeline:
-        mock_r2.return_value = "documents/test_user/test_guide.md"
+    mock_db = AsyncMock()
+    mock_db.commit = AsyncMock()
+    mock_db.rollback = AsyncMock()
+    mock_db.add = MagicMock()
 
-        files = {"file": ("test_guide.md", b"# LangGraph & RAG Guide\nSample documentation.", "text/markdown")}
-        response = client.post(
-            "/api/v1/documents/upload",
-            files=files,
-            data={"user_id": "test_user_bg", "preset": "balanced"},
-        )
+    async def _override_get_db():
+        yield mock_db
 
-        assert response.status_code == 202
-        data = response.json()
-        assert data["file_name"] == "test_guide.md"
-        assert data["status"] == "PARSING"
-        assert data["chunks_count"] == 0
-        assert "background" in data["message"].lower()
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        with patch("app.api.v1.endpoints.documents.r2_storage_service.upload_file", new_callable=AsyncMock) as mock_r2, \
+             patch("app.tasks.document_tasks.process_document_task.kiq", new_callable=AsyncMock) as mock_kiq, \
+             patch("app.api.v1.endpoints.documents.process_document_pipeline", new_callable=AsyncMock) as mock_pipeline:
+            mock_r2.return_value = "documents/test_user/test_guide.md"
+            mock_kiq.side_effect = RuntimeError("Taskiq broker disabled in offline test")
 
-        # Verify background task was executed
-        mock_pipeline.assert_called_once()
-        call_kwargs = mock_pipeline.call_args.kwargs
-        assert call_kwargs["user_id"] == "test_user_bg"
-        assert call_kwargs["file_name"] == "test_guide.md"
-        assert call_kwargs["preset"] == "balanced"
-        assert call_kwargs["is_reindex"] is False
+            files = {"file": ("test_guide.md", b"# LangGraph & RAG Guide\nSample documentation.", "text/markdown")}
+            response = client.post(
+                "/api/v1/documents/upload",
+                files=files,
+                data={"user_id": "test_user_bg", "preset": "balanced"},
+            )
+
+            assert response.status_code == 202
+            data = response.json()
+            assert data["file_name"] == "test_guide.md"
+            assert data["status"] == "PARSING"
+            assert data["chunks_count"] == 0
+            assert "background" in data["message"].lower()
+
+            # Verify background task was executed
+            mock_pipeline.assert_called_once()
+            call_kwargs = mock_pipeline.call_args.kwargs
+            assert call_kwargs["user_id"] == "test_user_bg"
+            assert call_kwargs["file_name"] == "test_guide.md"
+            assert call_kwargs["preset"] == "balanced"
+            assert call_kwargs["is_reindex"] is False
+    finally:
+        app.dependency_overrides.pop(get_db, None)
 
 
 @pytest.mark.asyncio
@@ -335,6 +350,117 @@ def test_retry_document_not_found_and_unauthorized():
     fake_id = uuid.uuid4()
     res_404 = client.post(f"/api/v1/documents/{fake_id}/retry")
     assert res_404.status_code == 404
+
+
+def test_upload_thread_scoped_document_background_dispatch():
+    """Verifies uploading a thread-scoped document validates ownership, routes R2 key, and passes thread_id."""
+    mock_db = AsyncMock()
+    mock_db.commit = AsyncMock()
+    mock_db.rollback = AsyncMock()
+    mock_db.add = MagicMock()
+
+    async def _override_get_db():
+        yield mock_db
+
+    app.dependency_overrides[get_db] = _override_get_db
+    try:
+        with patch("app.main.check_db_connection", new_callable=AsyncMock, return_value=(False, "offline")), \
+             patch("app.api.v1.endpoints.documents.verify_thread_ownership", new_callable=AsyncMock) as mock_verify, \
+             patch("app.api.v1.endpoints.documents.r2_storage_service.upload_file", new_callable=AsyncMock) as mock_r2, \
+             patch("app.tasks.document_tasks.process_document_task.kiq", new_callable=AsyncMock) as mock_kiq, \
+             patch("app.api.v1.endpoints.documents.process_document_pipeline", new_callable=AsyncMock) as mock_pipeline:
+            mock_r2.return_value = "documents/test_user/threads/thread-abc-123/doc_file.md"
+            mock_kiq.side_effect = RuntimeError("Taskiq broker disabled in offline test")
+
+            files = {"file": ("thread_spec.md", b"# Thread Spec\nSpecific notes.", "text/markdown")}
+            response = client.post(
+                "/api/v1/documents/upload",
+                files=files,
+                data={"user_id": "test_user_th", "thread_id": "thread-abc-123", "preset": "balanced"},
+            )
+
+            assert response.status_code == 202
+            data = response.json()
+            assert data["file_name"] == "thread_spec.md"
+            assert data["thread_id"] == "thread-abc-123"
+            assert data["status"] == "PARSING"
+            assert "threads/thread-abc-123/" in data["r2_key"]
+
+            # Verify thread ownership was verified
+            mock_verify.assert_called_once()
+            assert mock_verify.call_args.kwargs["thread_id"] == "thread-abc-123"
+
+            # Verify background task was executed with thread_id
+            mock_pipeline.assert_called_once()
+            call_kwargs = mock_pipeline.call_args.kwargs
+            assert call_kwargs["user_id"] == "test_user_th"
+            assert call_kwargs["thread_id"] == "thread-abc-123"
+            assert call_kwargs["file_name"] == "thread_spec.md"
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+def test_search_documents_with_thread_filter():
+    """Verifies search endpoint passes thread_id to hybrid_search."""
+    mock_results = [
+        Document(
+            page_content="Thread-scoped knowledge passage.",
+            metadata={
+                "source": "thread_spec.md",
+                "chunk_index": 0,
+                "rrf_score": 0.032,
+                "dense_rank": 1,
+                "sparse_rank": 1,
+            },
+        )
+    ]
+
+    with patch("app.main.check_db_connection", new_callable=AsyncMock, return_value=(False, "offline")), \
+         patch("app.api.v1.endpoints.documents.hybrid_search", new_callable=AsyncMock) as mock_search:
+        mock_search.return_value = mock_results
+
+        payload = {
+            "query": "What is the thread spec?",
+            "preset": "balanced",
+            "user_id": "test_user",
+            "thread_id": "thread-abc-123",
+        }
+        response = client.post("/api/v1/documents/search", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_results"] == 1
+        assert "Thread-scoped" in data["results"][0]["content"]
+
+        mock_search.assert_called_once()
+        assert mock_search.call_args.kwargs["thread_id"] == "thread-abc-123"
+
+
+def test_build_rag_filter_scoping():
+    """Unit test for build_rag_filter and sparse SQL clause generation."""
+    from app.services.retriever import build_rag_filter, _build_sparse_filter_clause
+
+    # 1. Dual-layer filter (thread + global fallback)
+    f_dual = build_rag_filter(user_id="user1", thread_id="thread1", thread_scoped_only=False)
+    assert "$and" in f_dual
+    params = {}
+    counter = [0]
+    sql_dual = _build_sparse_filter_clause(f_dual, params, counter)
+    assert "user_id" in sql_dual
+    assert "thread_id" in sql_dual
+    assert params["sparse_p_0"] == "user1"
+    assert params["sparse_p_1"] == "thread1"
+
+    # 2. Strict thread scoping
+    f_strict = build_rag_filter(user_id="user1", thread_id="thread1", thread_scoped_only=True)
+    params_s = {}
+    counter_s = [0]
+    sql_strict = _build_sparse_filter_clause(f_strict, params_s, counter_s)
+    assert "cmetadata->>'thread_id' = :sparse_p_1" in sql_strict
+
+    # 3. User only (no thread)
+    f_user = build_rag_filter(user_id="user1", thread_id=None)
+    assert f_user == {"user_id": {"$eq": "user1"}}
+
 
 
 

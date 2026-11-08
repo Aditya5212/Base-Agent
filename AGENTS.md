@@ -9,7 +9,7 @@ The current supported capabilities are exposed by `GET /api/v1/workflows/capabil
 - Eight node types execute today. `parallel`, `subgraph`, static fan-out, and JSONPath routing are rejected before saving/running; their schemas reserve future features.
 - Runs use internal `workflow:` checkpoint identities and immutable graph snapshots. Chat cannot use this reserved namespace. Approval payloads are persisted; deadlines are checked on resume. Legacy paused runs without snapshots must be restarted.
 - Agent tools execute in a bounded model/tool loop. Structured JSON and guardrail output checks run before protected SSE responses are emitted; these responses buffer the final answer. Unsupported provider, memory, fusion, and tool-override settings fail explicitly.
-- Knowledge ingestion and retrieval currently support **user scope only**. Knowledge attaches only to retrieve nodes. Upload `index_graph=true` to request LightRAG indexing, with provider readiness exposed in document details.
+- Knowledge ingestion, storage, and retrieval support both **User Global Scope** and **Thread Scoped Isolation**. Documents can be uploaded globally or scoped to a conversation thread (`threads/{thread_id}/`). Retrieval employs dual-layer scoping (thread documents + user global documents fallback) with strict cross-thread isolation. Knowledge attaches to retrieve nodes and is available to agent models via modular RAG research tools (`hybrid_document_search`, `graph_rag_search`, `multi_query_search`) with available document inventory injected into prompt context. Upload `index_graph=true` to request LightRAG indexing, with provider readiness exposed in document details.
 - Code runs in a killable child process with a server-controlled module policy. This is **trusted-code execution**, not an operating-system sandbox for hostile code.
 - Run tests offline with `pytest`. Service-backed tests require `pytest --run-integration` and a disposable `TEST_DATABASE_URL`. Tests never initialize the configured application database implicitly.
 
@@ -184,15 +184,17 @@ class AgentState(TypedDict, total=False):
     rag_sources: list[dict[str, Any]]
     thread_assets: list[dict[str, Any]]
     thread_assets_context: str | None
+    knowledge_base_context: str | None
 ```
 
 - **`messages`**: Chronological sequence of messages (`HumanMessage`, `AIMessage`, `SystemMessage`), supporting multimodal text and image content blocks.
 - **`user_id`**: Identifier of the current user (scopes document retrieval, thread ownership, and memory; defaults to `"root"`).
-- **`thread_id`**: Unique conversation session identifier ensuring memory isolation.
+- **`thread_id`**: Unique conversation session identifier ensuring memory and document isolation.
 - **`rag_context`**: Formatted passage text retrieved from PostgreSQL for the current turn.
 - **`rag_sources`**: Structured metadata for retrieved document chunks (filenames, sections, citations).
 - **`thread_assets`**: Structured records of uploaded media files (images, documents) associated with the thread, populated with fresh SigV4 presigned download URLs.
 - **`thread_assets_context`**: Formatted prompt context listing all uploaded thread assets and presigned URLs for LLM awareness.
+- **`knowledge_base_context`**: Formatted prompt context listing available indexed documents in user's knowledge base, distinguishing `[Thread Document]` from `[Global Document]`.
 
 ### Graph Topology
 
@@ -203,16 +205,18 @@ START ──► [retrieve_node] ──► [chat_node] ──► END
 - **`retrieve_node`**:
   1. Resolves thread assets from PostgreSQL and generates fresh presigned download URLs for all uploaded images and documents.
   2. Formats `thread_assets_context` for system prompt injection.
-  3. Checks `configurable.use_rag`. When false, passes through immediately with thread assets.
-  4. Extracts the user's latest message text (handling both raw strings and multimodal content blocks).
-  5. Executes hybrid retrieval (dense + sparse + RRF) scoped to the user's documents.
-  6. Returns `rag_context`, `rag_sources`, `thread_assets`, and `thread_assets_context`.
+  3. Queries user knowledge base inventory via `get_user_knowledge_base_context(user_id, thread_id)` and attaches `knowledge_base_context` for LLM situational awareness.
+  4. Checks `configurable.use_rag`. When false, passes through immediately with thread assets and KB context.
+  5. Extracts the user's latest message text (handling both raw strings and multimodal content blocks).
+  6. Executes dual-layer hybrid retrieval (dense + sparse + RRF) or LightRAG knowledge graph traversal scoped to `thread_workspace(user_id, thread_id)` (with user global fallback).
+  7. Returns `rag_context`, `rag_sources`, `thread_assets`, `thread_assets_context`, and `knowledge_base_context`.
 - **`chat_node`**:
   1. Reads conversation history from the checkpointer.
-  2. Injects system instructions combining dynamic persona from the resolved agent config, knowledge grounding (if `rag_context` is present), and thread asset context with presigned URLs.
+  2. Injects system instructions combining dynamic persona from the resolved agent config, knowledge grounding (if `rag_context` is present), thread asset context, and knowledge base document inventory.
   3. Formats human input into OpenAI-compatible multimodal vision blocks (`image_url`) if image URLs or R2 keys are provided.
-  4. Invokes the DeepSeek model asynchronously (or streams via SSE) with model overrides and max token settings.
-  5. Appends the model response to state.
+  4. Resolves and binds dynamic agent tools as well as pre-bound RAG research tools (`hybrid_document_search`, `graph_rag_search`, `multi_query_search` capturing `user_id` and `thread_id` in closures).
+  5. Invokes the bounded model/tool execution loop (`invoke_agent`) asynchronously (or streams via SSE) with model overrides and max token settings.
+  6. Appends the model response to state.
 
 ---
 
@@ -230,6 +234,12 @@ To avoid running duplicate connection pools and mismatched database drivers, bot
   - `execute_agent()` / `execute_workflow()`: Resumes state, executes nodes, writes new checkpoint.
   - `get_thread_messages()`: Fetches full message history directly from storage.
   - `delete_thread_memory()`: Drops all checkpoints for a thread upon user request.
+  - `delete_thread_cascade(db, thread_id, user_id)`: Atomic cascade purges all thread-scoped resources:
+    1. Vector chunks in PGVector (`delete_documents_by_metadata("document_id", ...)`)
+    2. LightRAG thread workspace (`thread_workspace(user_id, thread_id)`)
+    3. R2 raw files for thread documents and thread media assets
+    4. LangGraph checkpoint memory records
+    5. Thread database record (with SQL `ON DELETE CASCADE` to child tables)
 
 ---
 
@@ -342,18 +352,21 @@ Rather than a rigid monolithic tool, **Deep Research** is an agentic pattern orc
 ## 6. Cloudflare R2 & Document Lifecycle Pipeline
 
 ### Ingestion Flow & Fault-Tolerant Recovery
-1. **Upload**: User uploads document (`PDF`, `DOCX`, `TXT`, `MD`) via `POST /api/v1/documents/upload`.
-2. **Object Storage**: Stored in Cloudflare R2 (S3-compatible) via async `aioboto3` with `tenacity` exponential backoff retries on transient network/5xx errors.
+1. **Upload**: User uploads document (`PDF`, `DOCX`, `XLSX`, `HTML`, `TXT`, `MD`) via `POST /api/v1/documents/upload`, optionally supplying a `thread_id` for conversation-isolated scoping.
+2. **Object Storage**: Stored in Cloudflare R2 (S3-compatible) via async `aioboto3` under partitioned keys:
+   - **Thread-scoped documents**: `documents/{user_id}/threads/{thread_id}/{doc_id}_{file_name}`
+   - **Global documents**: `documents/{user_id}/global/{doc_id}_{file_name}`
+   Storage operations use `tenacity` exponential backoff retries on transient network/5xx errors.
 3. **Atomic Rollback**: If PostgreSQL metadata commitment fails after upload, the raw R2 object is automatically deleted to prevent orphaned files.
 4. **Immediate 202 Response**: Document record is initialized with status `PARSING`, and an HTTP 202 Accepted response is returned immediately to prevent client timeouts.
 5. **Asynchronous Background Processing**: Dispatched to Taskiq worker (with fallback to FastAPI `BackgroundTasks`) executing `process_document_pipeline` in an isolated database session.
-6. **Parsing**: Converted to structured markdown via Microsoft **MarkItDown** (`markitdown`).
-7. **Chunking**: Structure-aware splitting using `MarkdownHeaderTextSplitter` + `RecursiveCharacterTextSplitter.from_tiktoken_encoder` (`cl100k_base`), preserving section hierarchy.
-8. **Embedding & Indexing**: Vectors indexed into `langchain_pg_embedding` in PostgreSQL with HNSW cosine index and PostgreSQL FTS GIN index. Status updated to `INDEXED` or `FAILED`.
+6. **Parsing**: Converted to structured markdown via Microsoft **MarkItDown** (`markitdown` with `pdfminer.six` PDF dependency).
+7. **Chunking**: Structure-aware splitting using `MarkdownHeaderTextSplitter` + `RecursiveCharacterTextSplitter.from_tiktoken_encoder` (`cl100k_base`), preserving section hierarchy. Chunks for thread-scoped documents are tagged with `thread_id` in chunk metadata.
+8. **Embedding & Indexing**: Vectors indexed into `langchain_pg_embedding` in PostgreSQL with HNSW cosine index and PostgreSQL FTS GIN index. If `index_graph=True`, entities and relationships are indexed into LightRAG using `thread_workspace(user_id, thread_id)` for thread-scoped documents or `user_workspace(user_id)` for global documents. Status is updated to `INDEXED` or `FAILED`.
 9. **Stuck-Document Advisory Lock Sweeper**: Background sweeper running every 5 minutes and on startup uses a PostgreSQL advisory lock (`pg_try_advisory_lock(847291)`) to recover documents stuck in `PARSING`. Documents are retried up to 3 times before transitioning to `FAILED` with actionable guidance for 1-click re-indexing.
 10. **Cascade Delete (Atomic-Safe)**: When a document is deleted via `DELETE /api/v1/documents/{document_id}` or re-indexed via `POST /api/v1/documents/{document_id}/reindex`, the following steps execute in order:
     1. PGVector chunks purged (reversible via re-index).
-    2. LightRAG knowledge graph entities purged (best-effort, logged).
+    2. LightRAG knowledge graph entities purged from the corresponding workspace (best-effort, logged).
     3. R2 raw file deleted — failure raises HTTP 500 and aborts the DB delete to prevent orphan rows.
     4. Database record deleted (cascades to `document_chunks`).
 
@@ -385,19 +398,20 @@ Real-time token and reasoning event streaming over HTTP via **Server-Sent Events
 | `GET` | `/api/v1/chat/{thread_id}/assets` | List Assets | Lists uploaded images & documents in thread with fresh signed URLs |
 | `GET` | `/api/v1/chat/{thread_id}/details` | Thread Details | Retrieves thread metadata, title, and active assets |
 | `GET` | `/api/v1/chat/{thread_id}/history` | Get History | Retrieves full conversation history |
-| `DELETE` | `/api/v1/chat/{thread_id}` | Clear Memory | Deletes stored checkpoints for a thread |
+| `DELETE` | `/api/v1/chat/{thread_id}` | Clear Thread & Memory | Cascade deletes thread checkpoint memory, thread-scoped documents (R2/PGVector/LightRAG), and thread assets |
 
 ### Knowledge Base Management (`/api/v1/documents`)
 | Method | Path | Summary | Description |
 | ------ | ---- | ------- | ----------- |
 | `GET` | `/api/v1/documents/stats` | KB Statistics | Aggregated document, chunk, and storage metrics |
-| `GET` | `/api/v1/documents` | List Documents | Lists user's documents with search filter and pagination |
-| `POST` | `/api/v1/documents/upload` | Upload & Index | Uploads to R2, parses with MarkItDown, chunks & indexes in background |
-| `GET` | `/api/v1/documents/{document_id}` | Document Details | Metadata, status, retry count, chunk count, and presigned download URL |
+| `GET` | `/api/v1/documents` | List Documents | Lists user's documents with search filter, pagination, and optional `thread_id` filter (`'global'` or thread UUID) |
+| `POST` | `/api/v1/documents/upload` | Upload & Index | Uploads to R2, parses with MarkItDown, chunks & indexes in background (supports optional `thread_id` for thread scoping) |
+| `GET` | `/api/v1/documents/{document_id}` | Document Details | Metadata, status, retry count, chunk count, `thread_id`, and presigned download URL |
 | `GET` | `/api/v1/documents/{document_id}/chunks` | Inspect Chunks | Granular inspection of document text chunks & headers |
 | `POST` | `/api/v1/documents/{document_id}/reindex` | Re-index Document | Re-chunks/re-indexes from R2 source with new preset and purges graph |
 | `GET` | `/api/v1/documents/{document_id}/download` | View / Download Document | Streams binary from R2 with `?inline=true` browser preview support |
 | `DELETE` | `/api/v1/documents/{document_id}` | Cascade Delete | Purges from R2, PGVector chunks, LightRAG graph, and database |
+| `POST` | `/api/v1/documents/search` | Direct Hybrid Search | Direct Hybrid Search (Dense HNSW + FTS GIN + RRF fusion) supporting optional `thread_id` scoping |
 | `POST` | `/api/v1/documents/search` | Direct Hybrid Search | Hybrid retrieval (Dense + FTS + RRF) with preset tuning |
 
 ### Object Storage Management (`/api/v1/storage` — Admin Only)

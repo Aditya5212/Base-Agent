@@ -30,11 +30,11 @@ Tests run offline by default. To include database tests, set `TEST_DATABASE_URL`
 | **Task Queue** | Taskiq (0.12.6) + PostgreSQL Broker (`taskiq-pg` 0.2.0) |
 | **Vector Database** | `pgvector` (HNSW Cosine Index) via `langchain-postgres` |
 | **Sparse Keyword Search** | PostgreSQL Full-Text Search (GIN `to_tsvector('english')`) |
-| **Knowledge Graph RAG** | LightRAG (`PGTableGraphStorage` native tables, zero Apache AGE dependency) |
+| **Knowledge Graph RAG** | LightRAG (`PGTableGraphStorage` native tables, zero Apache AGE dependency; user & thread workspaces) |
 | **Hybrid Ranking** | Reciprocal Rank Fusion (RRF) combining dense & sparse scores |
 | **Embeddings** | OpenAI `text-embedding-3-small` (1536 dimensions) |
 | **Conversational LLM** | DeepSeek (`deepseek-flash` & `deepseek-v4-pro`) via OpenAI-compatible API |
-| **Document Parser** | Microsoft MarkItDown (`markitdown`) |
+| **Document Parser** | Microsoft MarkItDown (`markitdown` with `pdfminer.six` PDF support) |
 | **Chunking** | Structure-aware token splitter (`tiktoken` `cl100k_base`) |
 | **Object Storage** | Cloudflare R2 (S3-compatible via `aioboto3` with SigV4 presigned URLs) |
 | **Rate Limiting** | `slowapi` tier-based limiter |
@@ -173,20 +173,20 @@ Interactive Swagger UI is available at `http://localhost:8000/docs`.
 | `GET` | `/api/v1/chat/{thread_id}/assets` | List uploaded images & documents in thread with signed URLs |
 | `GET` | `/api/v1/chat/{thread_id}/details` | Get thread metadata, ownership, and active assets |
 | `GET` | `/api/v1/chat/{thread_id}/history` | Retrieve stored conversation history |
-| `DELETE` | `/api/v1/chat/{thread_id}` | Clear PostgreSQL memory checkpoints for thread |
+| `DELETE` | `/api/v1/chat/{thread_id}` | Cascade clear thread: checkpoints, thread-scoped documents in R2/PGVector/LightRAG, and thread media assets |
 
 ### Knowledge Base Management (`/api/v1/documents`)
 | Method | Endpoint | Description |
 |---|---|---|
 | `GET` | `/api/v1/documents/stats` | Aggregated metrics: documents, chunks, bytes used, statuses |
-| `GET` | `/api/v1/documents` | List knowledge base documents with search filter and pagination |
-| `POST` | `/api/v1/documents/upload` | Upload raw document to R2, parse to Markdown, chunk & index in background |
-| `GET` | `/api/v1/documents/{id}` | Document details with retry count, chunk count, status, and download URL |
+| `GET` | `/api/v1/documents` | List knowledge base documents with search filter, pagination, and optional `thread_id` filter (`'global'` or thread UUID) |
+| `POST` | `/api/v1/documents/upload` | Upload raw document to R2, parse to Markdown, chunk & index in background (supports optional `thread_id` for session-isolated docs) |
+| `GET` | `/api/v1/documents/{id}` | Document details with retry count, chunk count, `thread_id`, status, and download URL |
 | `GET` | `/api/v1/documents/{id}/chunks` | Inspect granular token chunks, section headers, and metadata |
 | `POST` | `/api/v1/documents/{id}/reindex` | Re-index document from R2 with preset (purges chunks & graph entities) |
 | `GET` | `/api/v1/documents/{id}/download` | Stream binary from R2 with `?inline=true` browser preview support |
 | `DELETE` | `/api/v1/documents/{id}` | Cascade delete: R2 storage, PGVector embeddings, LightRAG graph & record |
-| `POST` | `/api/v1/documents/search` | Direct Hybrid Search (Dense HNSW + FTS GIN + RRF fusion) |
+| `POST` | `/api/v1/documents/search` | Direct Hybrid Search (Dense HNSW + FTS GIN + RRF fusion) supporting optional `thread_id` scoping |
 
 ### Agent Management (`/api/v1/agents`)
 | Method | Endpoint | Description |
@@ -421,10 +421,13 @@ uv run python scripts/test_multi_agent_structured_workflow.py
   - [x] Safe template interpolation & AST condition evaluation
   - [x] Curated Agent Middleware Pipeline (`ModelRetryMiddleware`, `ModelFallbackMiddleware`)
   - [x] End-to-end multi-agent orchestration and structured JSON synthesis
-- [ ] **Phase 3: Tool Builder & Knowledge Integration**
-  - [ ] Custom HTTP/REST API tool builder with auth & response mapping
-  - [ ] Subprocess-isolated code execution tools
-  - [ ] Read-only SQL database querying tools
-  - [ ] Dynamic per-node knowledge base attachment
+- [x] **Phase 3: Tool Builder & Knowledge Integration**
+  - [x] Custom HTTP/REST API tool builder with auth & response mapping
+  - [x] AST-sandboxed Python code execution tools with timeout & whitelist
+  - [x] Read-only SQL database querying tools with parameterized inputs
+  - [x] Symmetric Fernet encryption for tool secrets at rest & masked payloads in logs/APIs
+  - [x] Dynamic per-node knowledge base attachment & modular RAG research suite (hybrid, graph, multi-query)
+  - [x] Thread-scoped document upload, dual-layer retrieval scoping, and atomic cascade deletion
+  - [x] MarkItDown parser enhancement with full PDF dependency support (`pdfminer.six`)
 - [ ] **Phase 4: Advanced Orchestration & Cross-Workflow Subgraphs**
 - [ ] **Phase 5: Visual Drag-and-Drop Frontend (Next.js 15 & React Flow)**

@@ -28,6 +28,7 @@ from app.services.memory import delete_thread_memory, get_thread_messages
 from app.services.r2_storage import r2_storage_service
 from app.services.thread_service import (
     add_thread_asset,
+    delete_thread_cascade,
     get_or_create_thread,
     get_thread_assets_with_signed_urls,
     verify_thread_ownership,
@@ -442,15 +443,15 @@ async def get_history(
 @router.delete(
     "/{thread_id}",
     response_model=DeleteThreadResponse,
-    summary="Clear thread memory",
-    description="Deletes all persisted checkpoint memory records for a given thread from PostgreSQL.",
+    summary="Clear thread memory and assets",
+    description="Deletes all persisted checkpoint memory records, thread-scoped documents, and thread media assets.",
 )
 async def clear_memory(
     thread_id: str,
     current_user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> DeleteThreadResponse:
-    """Removes all checkpoint data for the specified thread."""
+    """Removes all checkpoint data, thread-scoped documents, and assets for the specified thread."""
     await verify_thread_ownership(
         db,
         thread_id=thread_id,
@@ -458,15 +459,15 @@ async def clear_memory(
         is_admin=current_user.is_admin,
         allow_missing=True,
     )
-    success = await delete_thread_memory(thread_id)
+    success = await delete_thread_cascade(db, thread_id=thread_id, user_id=current_user.user_id)
     if not success:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Could not delete memory for thread {thread_id}",
+            detail=f"Could not delete memory and assets for thread {thread_id}",
         )
 
     return DeleteThreadResponse(
         thread_id=thread_id,
         deleted=True,
-        message=f"Memory for thread {thread_id} successfully cleared.",
+        message=f"Memory, documents, and assets for thread {thread_id} successfully cleared.",
     )

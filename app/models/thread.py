@@ -8,6 +8,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base, TimestampMixin
 
 if TYPE_CHECKING:
+    from app.models.document import Document
     from app.models.user import User
 
 
@@ -35,6 +36,12 @@ class Thread(Base, TimestampMixin):
     user: Mapped["User"] = relationship("User", back_populates="threads")
     assets: Mapped[list["ThreadAsset"]] = relationship(
         "ThreadAsset",
+        back_populates="thread",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    documents: Mapped[list["Document"]] = relationship(
+        "Document",
         back_populates="thread",
         cascade="all, delete-orphan",
         passive_deletes=True,

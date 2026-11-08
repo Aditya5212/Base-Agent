@@ -20,6 +20,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base, TimestampMixin
 
 if TYPE_CHECKING:
+    from app.models.thread import Thread
     from app.models.user import User
 
 
@@ -46,6 +47,12 @@ class Document(Base, TimestampMixin):
         index=True,
         nullable=False,
     )
+    thread_id: Mapped[str | None] = mapped_column(
+        String(128),
+        ForeignKey("threads.id", ondelete="CASCADE"),
+        index=True,
+        nullable=True,
+    )
     file_name: Mapped[str] = mapped_column(String(255), nullable=False)
     r2_key: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
     mime_type: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -61,6 +68,7 @@ class Document(Base, TimestampMixin):
     provider_status: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
 
     user: Mapped["User"] = relationship("User", back_populates="documents")
+    thread: Mapped["Thread | None"] = relationship("Thread", back_populates="documents")
     chunks: Mapped[list["DocumentChunk"]] = relationship(
         "DocumentChunk",
         back_populates="document",

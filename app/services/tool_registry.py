@@ -213,6 +213,7 @@ class ToolRegistry:
         user_id: str,
         tool_names: list[str],
         db: AsyncSession | None = None,
+        thread_id: str | None = None,
     ) -> list[BaseTool]:
         """Resolves tool names/IDs into executable LangChain BaseTool instances.
 
@@ -225,14 +226,14 @@ class ToolRegistry:
             return []
 
         resolved: list[BaseTool] = []
-        rag_tools_map = get_user_rag_tool_map(user_id=user_id)
+        rag_tools_map = get_user_rag_tool_map(user_id=user_id, thread_id=thread_id)
         db_tool_names_or_ids: list[str] = []
         found_identifiers: set[str] = set()
 
         for name in tool_names:
             normalized = name.lower().strip()
             if normalized == "all_rag_tools":
-                resolved.extend(get_user_rag_tools(user_id=user_id))
+                resolved.extend(get_user_rag_tools(user_id=user_id, thread_id=thread_id))
             elif normalized in rag_tools_map:
                 resolved.append(rag_tools_map[normalized])
             elif normalized in ("calculator", "calc", "math"):

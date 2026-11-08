@@ -302,10 +302,14 @@ async def delete_user(session: AsyncSession, user_id: str) -> dict[str, int]:
     # 4. Purge LightRAG knowledge graph documents (best-effort)
     try:
         from app.core.rag.factory import get_provider
-        from app.core.rag.workspace import user_workspace
-        lightrag_provider = await get_provider("lightrag", user_workspace(user_id))
+        from app.core.rag.workspace import thread_workspace, user_workspace
         for doc in docs:
-            await lightrag_provider.delete_document(str(doc.id))
+            ws = thread_workspace(user_id, doc.thread_id) if doc.thread_id else user_workspace(user_id)
+            try:
+                lightrag_provider = await get_provider("lightrag", ws)
+                await lightrag_provider.delete_document(str(doc.id))
+            except Exception:
+                pass
     except Exception as exc:
         logger.debug("LightRAG cleanup skipped for user '%s': %s", user_id, exc)
 

@@ -21,18 +21,26 @@ logger = logging.getLogger(__name__)
 _recovery_tasks: set[asyncio.Task] = set()
 
 
-class DocumentTaskArguments(TypedDict):
+class DocumentTaskArguments(TypedDict, total=False):
     document_id: str
     r2_key: str
     user_id: str
     file_name: str
     preset: str
     is_reindex: bool
+    thread_id: str | None
 
 
-async def process_document_pipeline(document_id: str, r2_key: str, user_id: str,
-                                    file_name: str, preset: str = "balanced",
-                                    file_bytes: bytes | None = None, is_reindex: bool = False) -> int:
+async def process_document_pipeline(
+    document_id: str,
+    r2_key: str,
+    user_id: str,
+    file_name: str,
+    preset: str = "balanced",
+    file_bytes: bytes | None = None,
+    is_reindex: bool = False,
+    thread_id: str | None = None,
+) -> int:
     """Use a dedicated connection lock across indexing and concurrent delete/reindex."""
     parsed_id = uuid.UUID(document_id)
     async with document_lock(str(parsed_id)) as acquired:
@@ -44,6 +52,7 @@ async def process_document_pipeline(document_id: str, r2_key: str, user_id: str,
                 return 0
             if doc.user_id != user_id or doc.r2_key != r2_key:
                 raise ValueError("Document task does not match stored owner/source")
+            effective_thread_id = thread_id if thread_id is not None else doc.thread_id
             config = dict(doc.indexing_config or {})
             config.setdefault("preset", preset)
             config.setdefault("index_graph", False)
@@ -58,30 +67,58 @@ async def process_document_pipeline(document_id: str, r2_key: str, user_id: str,
                 doc.provider_status = {**(doc.provider_status or {}), "lightrag": "PARSING"}
             await session.commit()
         try:
-            return await _index_document(parsed_id, r2_key, user_id, file_name, config, file_bytes, is_reindex)
+            return await _index_document(
+                parsed_id,
+                r2_key,
+                user_id,
+                file_name,
+                config,
+                file_bytes,
+                is_reindex,
+                thread_id=effective_thread_id,
+            )
         except BaseException as exc:
             await _update_document_status(parsed_id, DocumentStatus.FAILED, f"Ingestion failed: {exc}")
             raise
 
 
-async def _index_document(parsed_id, r2_key, user_id, file_name, config, file_bytes, is_reindex):
+async def _index_document(
+    parsed_id,
+    r2_key,
+    user_id,
+    file_name,
+    config,
+    file_bytes,
+    is_reindex,
+    thread_id: str | None = None,
+):
     document_id = str(parsed_id)
     raw_bytes = file_bytes if file_bytes is not None else await r2_storage_service.download_file(r2_key)
-    raw_doc = await asyncio.to_thread(load_document, source=raw_bytes, filename=file_name,
-        extra_metadata={"document_id": document_id, "user_id": user_id, "file_name": file_name})
+    extra_meta = {"document_id": document_id, "user_id": user_id, "file_name": file_name}
+    if thread_id:
+        extra_meta["thread_id"] = thread_id
+    raw_doc = await asyncio.to_thread(
+        load_document,
+        source=raw_bytes,
+        filename=file_name,
+        extra_metadata=extra_meta,
+    )
     chunks = await asyncio.to_thread(split_markdown_document, raw_doc, config=get_rag_config(config["preset"]))
     for idx, chunk in enumerate(chunks):
         fingerprint = hashlib.sha256(chunk.page_content.encode()).hexdigest()
         chunk.metadata["chunk_id"] = str(uuid.uuid5(parsed_id, f"{config['pending_generation']}:{idx}:{fingerprint}"))
         chunk.metadata["_base_generation"] = config["pending_generation"]
         chunk.metadata["_base_active"] = False
+        if thread_id:
+            chunk.metadata["thread_id"] = thread_id
 
     # Parse and chunk successfully before removing the previous index.
     if is_reindex:
         if config["index_graph"] or config.get("purge_graph"):
             from app.core.rag.factory import get_provider
-            from app.core.rag.workspace import user_workspace
-            provider = await get_provider("lightrag", user_workspace(user_id))
+            from app.core.rag.workspace import thread_workspace, user_workspace
+            ws = thread_workspace(user_id, thread_id) if thread_id else user_workspace(user_id)
+            provider = await get_provider("lightrag", ws)
             await provider.delete_document(document_id)
 
     await index_documents(chunks)
@@ -109,8 +146,9 @@ async def _index_document(parsed_id, r2_key, user_id, file_name, config, file_by
         try:
             from app.core.rag.factory import get_provider
             from app.core.rag.protocols import IngestDocument
-            from app.core.rag.workspace import user_workspace
-            provider = await get_provider("lightrag", user_workspace(user_id))
+            from app.core.rag.workspace import thread_workspace, user_workspace
+            ws = thread_workspace(user_id, thread_id) if thread_id else user_workspace(user_id)
+            provider = await get_provider("lightrag", ws)
             result = await provider.ingest([IngestDocument(doc_id=document_id, content=raw_doc.page_content,
                 metadata=raw_doc.metadata, file_path=file_name)])
             if result.failed:
@@ -180,10 +218,13 @@ async def recover_stuck_documents(stuck_threshold_seconds: int = 300) -> list[st
                     doc.retry_count += 1
                     doc.updated_at = datetime.now(timezone.utc)
                     args: DocumentTaskArguments = {
-                        "document_id": str(doc.id), "r2_key": doc.r2_key, "user_id": doc.user_id,
+                        "document_id": str(doc.id),
+                        "r2_key": doc.r2_key,
+                        "user_id": doc.user_id,
                         "file_name": doc.file_name,
                         "preset": (doc.indexing_config or {}).get("preset", "balanced"),
                         "is_reindex": True,
+                        "thread_id": doc.thread_id,
                     }
                     await session.commit()
             try:

@@ -78,6 +78,7 @@ async def multi_query_hybrid_search(
     user_id: str,
     preset: str = "balanced",
     top_k_final: int = 8,
+    thread_id: str | None = None,
 ) -> list[Document]:
     """Executes parallel hybrid search for an agent-provided list of queries and fuses the results.
 
@@ -86,6 +87,7 @@ async def multi_query_hybrid_search(
         user_id: Caller's user_id for strict tenant isolation.
         preset: RAG retrieval preset ('high_precision', 'balanced', 'high_recall').
         top_k_final: Maximum number of fused documents to return.
+        thread_id: Optional conversation thread ID for thread-aware retrieval scoping.
 
     Returns:
         Ranked and deduplicated list of fused Document objects.
@@ -102,6 +104,7 @@ async def multi_query_hybrid_search(
             query=q,
             config=rag_cfg,
             filter_dict={"user_id": user_id},
+            thread_id=thread_id,
         )
         for q in cleaned_queries
     ]

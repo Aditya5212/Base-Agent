@@ -56,10 +56,12 @@ async def invoke_agent(llm: Any, messages: list[Any], cfg: AgentConfig, user_id:
     schema = None
     tools = []
     enabled = [t.tool_id for t in cfg.tools if t.enabled]
+    configurable = runnable_config.get("configurable", {}) if isinstance(runnable_config, dict) else getattr(runnable_config, "configurable", {})
+    thread_id = configurable.get("thread_id") if isinstance(configurable, dict) else None
     if enabled or cfg.structured_output.enabled:
         async with AsyncSessionLocal() as db:
             if enabled:
-                tools = await ToolRegistry.resolve_tools(user_id, enabled, db=db)
+                tools = await ToolRegistry.resolve_tools(user_id, enabled, db=db, thread_id=thread_id)
             if cfg.structured_output.enabled:
                 schema_id = cfg.structured_output.schema_id
                 if not schema_id:

@@ -20,7 +20,7 @@ from langchain_core.tools import BaseTool, tool
 
 from app.core.rag.factory import get_provider
 from app.core.rag.protocols import RetrievalQuery
-from app.core.rag.workspace import user_workspace
+from app.core.rag.workspace import thread_workspace, user_workspace
 from app.core.rag_config import get_rag_config
 from app.services.multi_query import multi_query_hybrid_search
 from app.services.retriever import hybrid_search
@@ -32,8 +32,8 @@ logger = logging.getLogger(__name__)
 # Exploitation Tool 1: Hybrid Document Search (PGVector + PostgreSQL FTS + RRF)
 # ---------------------------------------------------------------------------
 
-def make_hybrid_search_tool(user_id: str) -> BaseTool:
-    """Returns a hybrid_document_search tool pre-bound to *user_id*.
+def make_hybrid_search_tool(user_id: str, thread_id: str | None = None) -> BaseTool:
+    """Returns a hybrid_document_search tool pre-bound to *user_id* and optional *thread_id*.
 
     Targeted precision retrieval combining Dense vector search with Sparse keyword FTS via RRF.
     Best for finding specific factual answers, code references, numbers, or exact quotes for a single query.
@@ -64,6 +64,7 @@ def make_hybrid_search_tool(user_id: str) -> BaseTool:
                 query=query,
                 config=rag_cfg,
                 filter_dict={"user_id": user_id},
+                thread_id=thread_id,
             )
             if not fused_docs:
                 return f"No relevant documents found in knowledge base for query: '{query}'."
@@ -88,8 +89,8 @@ def make_hybrid_search_tool(user_id: str) -> BaseTool:
 # Exploitation Tool 2: Knowledge Graph Traversal (LightRAG)
 # ---------------------------------------------------------------------------
 
-def make_graph_rag_tool(user_id: str) -> BaseTool:
-    """Returns a graph_rag_search tool pre-bound to *user_id*.
+def make_graph_rag_tool(user_id: str, thread_id: str | None = None) -> BaseTool:
+    """Returns a graph_rag_search tool pre-bound to *user_id* and optional *thread_id*.
 
     Navigates the LightRAG knowledge graph (entities, relations, and communities) stored in PostgreSQL.
     Best for conceptual questions, entity relationship mapping, and multi-hop reasoning.
@@ -116,7 +117,7 @@ def make_graph_rag_tool(user_id: str) -> BaseTool:
             Formatted graph context including entity descriptions, relationships, and community insights.
         """
         try:
-            workspace = user_workspace(user_id)
+            workspace = thread_workspace(user_id, thread_id) if thread_id else user_workspace(user_id)
             provider = await get_provider("lightrag", workspace=workspace)
 
             retrieval_query = RetrievalQuery(
@@ -144,8 +145,8 @@ def make_graph_rag_tool(user_id: str) -> BaseTool:
 # Exploration Tool: Multi-Query Search (Agent-Provided Queries Array)
 # ---------------------------------------------------------------------------
 
-def make_multi_query_search_tool(user_id: str) -> BaseTool:
-    """Returns a multi_query_search tool pre-bound to *user_id*.
+def make_multi_query_search_tool(user_id: str, thread_id: str | None = None) -> BaseTool:
+    """Returns a multi_query_search tool pre-bound to *user_id* and optional *thread_id*.
 
     Exploration tool that accepts a list of distinct queries from the agent, executes parallel
     hybrid retrievals across all queries, and fuses the results using cross-query RRF.
@@ -181,6 +182,7 @@ def make_multi_query_search_tool(user_id: str) -> BaseTool:
                 user_id=user_id,
                 preset=preset,
                 top_k_final=top_k,
+                thread_id=thread_id,
             )
 
             if not fused_docs:
@@ -220,23 +222,23 @@ def make_multi_query_search_tool(user_id: str) -> BaseTool:
 # Factory Aggregators & Lookup Helpers
 # ---------------------------------------------------------------------------
 
-def get_user_rag_tools(user_id: str) -> list[BaseTool]:
-    """Returns the modular RAG research tools bound to the specified *user_id*.
+def get_user_rag_tools(user_id: str, thread_id: str | None = None) -> list[BaseTool]:
+    """Returns the modular RAG research tools bound to the specified *user_id* and optional *thread_id*.
 
     Includes:
     - Exploitation: hybrid_document_search, graph_rag_search
     - Exploration: multi_query_search
     """
     return [
-        make_hybrid_search_tool(user_id=user_id),
-        make_graph_rag_tool(user_id=user_id),
-        make_multi_query_search_tool(user_id=user_id),
+        make_hybrid_search_tool(user_id=user_id, thread_id=thread_id),
+        make_graph_rag_tool(user_id=user_id, thread_id=thread_id),
+        make_multi_query_search_tool(user_id=user_id, thread_id=thread_id),
     ]
 
 
-def get_user_rag_tool_map(user_id: str) -> dict[str, BaseTool]:
+def get_user_rag_tool_map(user_id: str, thread_id: str | None = None) -> dict[str, BaseTool]:
     """Returns a dictionary mapping tool names and standard aliases to pre-bound tool instances."""
-    tools = get_user_rag_tools(user_id=user_id)
+    tools = get_user_rag_tools(user_id=user_id, thread_id=thread_id)
     tool_map: dict[str, BaseTool] = {}
 
     for t in tools:

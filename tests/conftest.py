@@ -48,6 +48,16 @@ def pytest_collection_modifyitems(config, items):
         offline |= file.name == "test_tools_api.py" and name in OFFLINE_TOOL_TESTS
         offline |= file.name == "test_agents.py" and name in {"test_agent_config_defaults", "test_agent_config_custom_values", "test_agent_config_validation_errors", "test_agent_config_lru_cache"}
         offline |= file.name == "test_auth.py" and name in {"test_get_current_user_default_is_root", "test_get_current_user_from_headers", "test_get_current_user_from_mock_bearer", "test_require_admin_guard"}
+        offline |= file.name == "test_documents_api.py" and name in {
+            "test_search_documents_endpoint",
+            "test_upload_empty_file_rejected",
+            "test_upload_document_background_dispatch",
+            "test_upload_thread_scoped_document_background_dispatch",
+            "test_search_documents_with_thread_filter",
+            "test_build_rag_filter_scoping",
+            "test_get_document_invalid_uuid",
+            "test_retry_document_invalid_uuid",
+        }
         offline |= file.name == "test_users_api.py" and name in {
             "test_user_create_schema_valid",
             "test_user_create_schema_custom_id",

@@ -37,6 +37,7 @@ from app.services.document_processor import process_document_pipeline
 from app.services.r2_storage import r2_storage_service
 from app.services.retriever import hybrid_search
 from app.services.text_splitter import split_markdown_document
+from app.services.thread_service import verify_thread_ownership
 from app.services.vector_store import delete_documents_by_metadata, index_documents
 from app.services.document_lock import document_lock
 
@@ -101,6 +102,7 @@ async def upload_document(
     request: Request,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="Document file (PDF, DOCX, XLSX, HTML, TXT, MD)"),
+    thread_id: str | None = Form(default=None, description="Optional conversation thread ID for session-isolated documents"),
     user_id: str | None = Form(default=None, description="Owner user ID (admin only)"),
     preset: str = Form(default="balanced", description="Chunking preset (high_precision, balanced, high_recall)"),
     index_graph: bool = Form(default=False, description="Also index the document in LightRAG"),
@@ -113,6 +115,15 @@ async def upload_document(
         raise HTTPException(status_code=422, detail="Unsupported chunking preset")
     file_name = file.filename or "uploaded_file"
     content_type = file.content_type or "application/octet-stream"
+
+    # Validate thread ownership if thread_id is provided
+    if thread_id:
+        await verify_thread_ownership(
+            db,
+            thread_id=thread_id,
+            user_id=effective_user_id,
+            is_admin=current_user.is_admin,
+        )
 
     # Read and validate file content
     contents = await file.read()
@@ -129,7 +140,10 @@ async def upload_document(
         )
 
     doc_id = uuid.uuid4()
-    r2_key = f"documents/{effective_user_id}/{doc_id}_{file_name}"
+    if thread_id:
+        r2_key = f"documents/{effective_user_id}/threads/{thread_id}/{doc_id}_{file_name}"
+    else:
+        r2_key = f"documents/{effective_user_id}/global/{doc_id}_{file_name}"
 
     # Step 1: Upload raw file to Cloudflare R2
     try:
@@ -149,6 +163,7 @@ async def upload_document(
     doc_record = Document(
         id=doc_id,
         user_id=effective_user_id,
+        thread_id=thread_id,
         file_name=file_name,
         r2_key=r2_key,
         mime_type=content_type,
@@ -187,6 +202,7 @@ async def upload_document(
             file_name=file_name,
             preset=preset,
             is_reindex=False,
+            thread_id=thread_id,
         )
         dispatched = True
         logger.info("Dispatched document %s to Taskiq worker queue.", doc_id)
@@ -206,10 +222,12 @@ async def upload_document(
             preset=preset,
             file_bytes=contents,
             is_reindex=False,
+            thread_id=thread_id,
         )
 
     return DocumentUploadResponse(
         id=str(doc_id),
+        thread_id=thread_id,
         file_name=file_name,
         file_size=file_size,
         status=doc_record.status.value,
@@ -227,6 +245,7 @@ async def upload_document(
 )
 async def list_documents(
     user_id: str | None = None,
+    thread_id: str | None = Query(default=None, description="Filter documents: omitted for all user docs, 'global' for global docs only, or a thread UUID for thread-specific docs"),
     search: str | None = Query(default=None, description="Optional filename filter"),
     status_filter: str | None = Query(default=None, description="Filter by status (INDEXED, FAILED, PARSING)"),
     limit: int = Query(default=100, ge=1, le=500),
@@ -238,6 +257,10 @@ async def list_documents(
     effective_user_id = user_id if (current_user.is_admin and user_id and user_id != "root") else current_user.user_id
     # Build base filter predicate (reused for COUNT and paginated fetch)
     base_stmt = select(Document).where(Document.user_id == effective_user_id)
+    if thread_id == "global":
+        base_stmt = base_stmt.where(Document.thread_id.is_(None))
+    elif thread_id:
+        base_stmt = base_stmt.where(Document.thread_id == thread_id)
     if search:
         base_stmt = base_stmt.where(Document.file_name.ilike(f"%{search}%"))
     if status_filter:
@@ -262,6 +285,7 @@ async def list_documents(
         items.append(
             DocumentItemResponse(
                 id=str(doc.id),
+                thread_id=doc.thread_id,
                 file_name=doc.file_name,
                 mime_type=doc.mime_type,
                 file_size=doc.file_size,
@@ -313,6 +337,7 @@ async def get_document_details(
 
     return DocumentDetailResponse(
         id=str(doc.id),
+        thread_id=doc.thread_id,
         file_name=doc.file_name,
         mime_type=doc.mime_type,
         file_size=doc.file_size,
@@ -472,6 +497,7 @@ async def _reindex_document_locked(document_id, request, background_tasks, user_
             file_name=doc.file_name,
             preset=request.preset,
             is_reindex=True,
+            thread_id=doc.thread_id,
         )
         dispatched = True
         logger.info("Dispatched document %s re-indexing to Taskiq worker queue.", doc.id)
@@ -491,10 +517,12 @@ async def _reindex_document_locked(document_id, request, background_tasks, user_
             preset=request.preset,
             file_bytes=None,
             is_reindex=True,
+            thread_id=doc.thread_id,
         )
 
     return ReindexDocumentResponse(
         document_id=str(doc.id),
+        thread_id=doc.thread_id,
         file_name=doc.file_name,
         previous_chunks=prev_count,
         new_chunks=0,
@@ -580,6 +608,7 @@ async def _retry_document_locked(document_id, request, background_tasks, user_id
             file_name=doc.file_name,
             preset=target_preset,
             is_reindex=True,
+            thread_id=doc.thread_id,
         )
         dispatched = True
         logger.info("Dispatched document %s retry to Taskiq worker queue.", doc.id)
@@ -599,10 +628,12 @@ async def _retry_document_locked(document_id, request, background_tasks, user_id
             preset=target_preset,
             file_bytes=None,
             is_reindex=True,
+            thread_id=doc.thread_id,
         )
 
     return DocumentRetryResponse(
         document_id=str(doc.id),
+        thread_id=doc.thread_id,
         file_name=doc.file_name,
         status=doc.status.value,
         preset=target_preset,
@@ -712,6 +743,7 @@ async def _delete_document_locked(document_id, user_id, current_user, db):
     doc_file_name = doc.file_name
     doc_r2_key = doc.r2_key
     doc_user_id = doc.user_id
+    doc_thread_id = doc.thread_id
 
     # Step 1: Purge vector-store chunks (reversible — re-index restores these)
     chunks_removed = await delete_documents_by_metadata("document_id", doc_id_str)
@@ -719,8 +751,9 @@ async def _delete_document_locked(document_id, user_id, current_user, db):
     # Step 2: Purge LightRAG knowledge-graph entries (best-effort; not fatal)
     try:
         from app.core.rag.factory import get_provider
-        from app.core.rag.workspace import user_workspace
-        lightrag_provider = await get_provider("lightrag", user_workspace(doc_user_id))
+        from app.core.rag.workspace import thread_workspace, user_workspace
+        ws = thread_workspace(doc_user_id, doc_thread_id) if doc_thread_id else user_workspace(doc_user_id)
+        lightrag_provider = await get_provider("lightrag", ws)
         await lightrag_provider.delete_document(doc_id_str)
     except Exception as g_exc:
         logger.debug("LightRAG knowledge graph purge skipped/failed for doc %s: %s", doc_id_str, g_exc)
@@ -778,6 +811,7 @@ async def search_documents(
         query=search_request.query,
         config=rag_cfg,
         filter_dict=filter_dict if filter_dict else None,
+        thread_id=search_request.thread_id,
     )
 
     results: list[RAGSearchChunkResponse] = []

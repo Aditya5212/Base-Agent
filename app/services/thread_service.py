@@ -222,3 +222,74 @@ def format_thread_assets_context(assets: list[dict[str, Any]]) -> str:
     )
     lines.append("============================================")
     return "\n".join(lines)
+
+
+async def delete_thread_cascade(db: AsyncSession, thread_id: str, user_id: str) -> bool:
+    """Cascade deletes all resources associated with a thread:
+
+    1. Thread-scoped documents:
+       - Purge vector chunks from PGVector
+       - Purge LightRAG thread workspace entries
+       - Delete raw files from Cloudflare R2
+    2. Thread uploaded media assets:
+       - Delete raw files from Cloudflare R2
+    3. LangGraph checkpointer memory:
+       - Purge checkpoints, checkpoint_blobs, checkpoint_writes
+    4. Thread database record:
+       - Deletes thread row (cascades in SQL to documents, chunks, and assets)
+    """
+    from app.models.document import Document
+    from app.services.memory import delete_thread_memory
+    from app.services.vector_store import delete_documents_by_metadata
+
+    # 1. Fetch thread-scoped documents
+    doc_stmt = select(Document).where(Document.thread_id == thread_id)
+    doc_res = await db.execute(doc_stmt)
+    thread_docs = doc_res.scalars().all()
+
+    for doc in thread_docs:
+        doc_id_str = str(doc.id)
+        # Purge vector store chunks
+        try:
+            await delete_documents_by_metadata("document_id", doc_id_str)
+        except Exception as exc:
+            logger.warning("Failed to purge vector chunks for thread doc %s: %s", doc_id_str, exc)
+
+        # Purge LightRAG entries
+        try:
+            from app.core.rag.factory import get_provider
+            from app.core.rag.workspace import thread_workspace
+            lightrag_provider = await get_provider("lightrag", thread_workspace(user_id, thread_id))
+            await lightrag_provider.delete_document(doc_id_str)
+        except Exception as exc:
+            logger.debug("LightRAG thread cleanup skipped for doc %s: %s", doc_id_str, exc)
+
+        # Delete from R2
+        if doc.r2_key:
+            try:
+                await r2_storage_service.delete_file(doc.r2_key)
+            except Exception as exc:
+                logger.warning("Failed to delete R2 file for thread doc %s: %s", doc_id_str, exc)
+
+    # 2. Fetch thread assets and delete from R2
+    asset_stmt = select(ThreadAsset).where(ThreadAsset.thread_id == thread_id)
+    asset_res = await db.execute(asset_stmt)
+    thread_assets = asset_res.scalars().all()
+
+    for asset in thread_assets:
+        if asset.r2_key:
+            try:
+                await r2_storage_service.delete_file(asset.r2_key)
+            except Exception as exc:
+                logger.warning("Failed to delete R2 file for thread asset %s: %s", asset.id, exc)
+
+    # 3. Purge checkpointer memory
+    await delete_thread_memory(thread_id)
+
+    # 4. Delete thread record from DB if present (cascades to remaining DB records)
+    thread = await db.get(Thread, thread_id)
+    if thread:
+        await db.delete(thread)
+        await db.commit()
+
+    return True

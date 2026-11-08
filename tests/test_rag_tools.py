@@ -207,6 +207,7 @@ async def test_make_multi_query_search_tool():
             user_id="charlie",
             preset="balanced",
             top_k_final=8,
+            thread_id=None,
         )
         assert "Multi-Query Exploration Results (2 queries searched in parallel):" in result
         assert "LightRAG storage backend architecture" in result
