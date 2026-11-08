@@ -21,6 +21,7 @@ from app.schemas.chat import (
     ThreadDetailsResponse,
     ThreadHistoryResponse,
 )
+from app.schemas.agent import ToolSpec
 from app.services.agent import execute_agent, stream_agent_events
 from app.services.agent_service import resolve_agent_for_chat
 from app.services.memory import delete_thread_memory, get_thread_messages
@@ -95,6 +96,21 @@ async def chat(
             is_admin=current_user.is_admin,
         )
 
+        # Attach/enable tools on agent_config:
+        agent_config = agent_config.model_copy(deep=True)
+        if chat_request.tools is not None:
+            existing_tool_ids = {t.tool_id for t in agent_config.tools}
+            for tool_name in chat_request.tools:
+                if tool_name not in existing_tool_ids:
+                    agent_config.tools.append(ToolSpec(tool_id=tool_name, enabled=True))
+                else:
+                    for t in agent_config.tools:
+                        if t.tool_id == tool_name:
+                            t.enabled = True
+        elif not any(t.enabled for t in agent_config.tools):
+            # Default to providing hybrid_document_search tool so chat agent can search dynamically
+            agent_config.tools.append(ToolSpec(tool_id="hybrid_document_search", enabled=True))
+
         result, resolved_model = await execute_agent(
             message=chat_request.message,
             thread_id=chat_request.thread_id,
@@ -118,6 +134,19 @@ async def chat(
         last_message = messages[-1]
         response_text = getattr(last_message, "text", None) or str(last_message.content)
 
+        # Extract executed tool calls from message history
+        executed_tool_calls: list[dict[str, Any]] = []
+        for msg in messages:
+            if hasattr(msg, "tool_calls") and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    executed_tool_calls.append(
+                        {
+                            "id": tc.get("id"),
+                            "name": tc.get("name"),
+                            "args": tc.get("args"),
+                        }
+                    )
+
         return ChatResponse(
             thread_id=chat_request.thread_id,
             user_id=effective_user_id,
@@ -127,6 +156,7 @@ async def chat(
             history_length=len(messages),
             sources=result.get("rag_sources"),
             thread_assets=result.get("thread_assets"),
+            tool_calls=executed_tool_calls if executed_tool_calls else None,
         )
     except HTTPException:
         raise
@@ -177,6 +207,20 @@ async def chat_stream(
         agent_id=chat_request.agent_id,
         is_admin=current_user.is_admin,
     )
+
+    # Attach/enable tools on agent_config:
+    agent_config = agent_config.model_copy(deep=True)
+    if chat_request.tools is not None:
+        existing_tool_ids = {t.tool_id for t in agent_config.tools}
+        for tool_name in chat_request.tools:
+            if tool_name not in existing_tool_ids:
+                agent_config.tools.append(ToolSpec(tool_id=tool_name, enabled=True))
+            else:
+                for t in agent_config.tools:
+                    if t.tool_id == tool_name:
+                        t.enabled = True
+    elif not any(t.enabled for t in agent_config.tools):
+        agent_config.tools.append(ToolSpec(tool_id="hybrid_document_search", enabled=True))
 
     async def sse_event_generator():
         try:

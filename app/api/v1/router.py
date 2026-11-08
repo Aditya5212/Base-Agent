@@ -8,6 +8,7 @@ from app.api.v1.endpoints import (
     storage,
     structured_schemas,
     tools,
+    users,
     workflows,
 )
 
@@ -16,6 +17,7 @@ api_router = APIRouter()
 # Register endpoint routers
 api_router.include_router(health.router)
 api_router.include_router(chat.router)
+api_router.include_router(users.router)
 api_router.include_router(agents.router)
 api_router.include_router(workflows.router)
 api_router.include_router(structured_schemas.router)

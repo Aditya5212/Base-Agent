@@ -48,6 +48,15 @@ def pytest_collection_modifyitems(config, items):
         offline |= file.name == "test_tools_api.py" and name in OFFLINE_TOOL_TESTS
         offline |= file.name == "test_agents.py" and name in {"test_agent_config_defaults", "test_agent_config_custom_values", "test_agent_config_validation_errors", "test_agent_config_lru_cache"}
         offline |= file.name == "test_auth.py" and name in {"test_get_current_user_default_is_root", "test_get_current_user_from_headers", "test_get_current_user_from_mock_bearer", "test_require_admin_guard"}
+        offline |= file.name == "test_users_api.py" and name in {
+            "test_user_create_schema_valid",
+            "test_user_create_schema_custom_id",
+            "test_user_create_schema_invalid_id",
+            "test_user_create_schema_invalid_email",
+            "test_user_update_schema_partial",
+            "test_user_stats_schema_defaults",
+            "test_user_delete_response_schema",
+        }
         offline |= file.name == "test_rag_providers.py" and name != "test_hybrid_provider_capabilities_and_health"
         if not offline:
             item.add_marker(pytest.mark.skip(reason="Service-backed test: use --run-integration and TEST_DATABASE_URL"))

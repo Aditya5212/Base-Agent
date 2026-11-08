@@ -61,6 +61,46 @@ class AgentState(TypedDict, total=False):
     rag_sources: list[dict[str, Any]]
     thread_assets: list[dict[str, Any]]
     thread_assets_context: str | None
+    knowledge_base_context: str | None
+
+
+async def get_user_knowledge_base_context(user_id: str) -> str:
+    """Queries user's indexed documents and formats an informative context string for the LLM."""
+    try:
+        from app.core.database import AsyncSessionLocal
+        from app.models.document import Document, DocumentStatus
+        from app.schemas.storage import format_bytes
+        from sqlalchemy import select
+
+        async with AsyncSessionLocal() as session:
+            stmt = (
+                select(Document)
+                .where(Document.user_id == user_id, Document.status == DocumentStatus.INDEXED)
+                .order_by(Document.created_at.desc())
+                .limit(50)
+            )
+            res = await session.execute(stmt)
+            docs = res.scalars().all()
+            if not docs:
+                return ""
+
+            lines = [
+                "=== Available Knowledge Base Documents ===",
+                "The user has the following documents uploaded and indexed in their knowledge base:",
+            ]
+            for d in docs:
+                size_str = format_bytes(d.file_size) if d.file_size else ""
+                lines.append(f'- "{d.file_name}" ({size_str})')
+
+            lines.append(
+                "You have access to RAG research tools (e.g. `hybrid_document_search`, `graph_rag_search`, `multi_query_search`). "
+                "Use these tools whenever the user asks questions, references their documents, or requests analysis related to these files."
+            )
+            lines.append("==========================================")
+            return "\n".join(lines)
+    except Exception as exc:
+        logger.warning("Could not fetch user knowledge base context for user %s: %s", user_id, exc)
+        return ""
 
 
 async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]:
@@ -83,6 +123,9 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
         except Exception as exc:
             logger.warning("Could not fetch thread assets for thread %s: %s", thread_id, exc)
 
+    # 2. Fetch user knowledge base document inventory for situational awareness
+    kb_context = await get_user_knowledge_base_context(user_id)
+
     use_rag = configurable.get("use_rag", False)
     if not use_rag:
         return {
@@ -90,6 +133,7 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
             "rag_sources": [],
             "thread_assets": thread_assets,
             "thread_assets_context": thread_assets_context,
+            "knowledge_base_context": kb_context,
         }
 
     active_providers = [provider for provider in agent_config.knowledge_providers if provider.enabled]
@@ -108,6 +152,7 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
             "rag_sources": [],
             "thread_assets": thread_assets,
             "thread_assets_context": thread_assets_context,
+            "knowledge_base_context": kb_context,
         }
 
     # Extract text from content (handling plain string or multimodal list of blocks)
@@ -210,6 +255,7 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
             "rag_sources": [],
             "thread_assets": thread_assets,
             "thread_assets_context": thread_assets_context,
+            "knowledge_base_context": kb_context,
         }
 
     context_blocks = []
@@ -254,6 +300,7 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
         "rag_sources": sources,
         "thread_assets": thread_assets,
         "thread_assets_context": thread_assets_context,
+        "knowledge_base_context": kb_context,
     }
 
 
@@ -288,6 +335,9 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]
 
     rag_context = state.get("rag_context")
     thread_assets_context = state.get("thread_assets_context")
+    knowledge_base_context = state.get("knowledge_base_context")
+
+    extra_body = {"thinking": {"type": "enabled"}} if (agent_config.model and agent_config.model.enable_thinking) else None
 
     llm = get_llm(
         model_name=model_name,
@@ -295,7 +345,7 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]
         max_tokens=max_tokens,
         base_url=base_url,
         max_retries=agent_config.advanced.max_retries,
-        extra_body={"thinking": {"type": "enabled" if agent_config.model.enable_thinking else "disabled"}},
+        extra_body=extra_body,
     )
 
     if llm is None:
@@ -336,6 +386,9 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]
     if thread_assets_context:
         system_prompt += f"\n\n{thread_assets_context}"
 
+    if knowledge_base_context:
+        system_prompt += f"\n\n{knowledge_base_context}"
+
     if rag_context:
         system_prompt += (
             "\n\n=== Retrieved Document Context ===\n"
@@ -353,6 +406,8 @@ async def chat_node(state: AgentState, config: RunnableConfig) -> dict[str, Any]
         combined_sys = str(existing_sys)
         if thread_assets_context and "Uploaded Thread Assets" not in combined_sys:
             combined_sys += f"\n\n{thread_assets_context}"
+        if knowledge_base_context and "Available Knowledge Base Documents" not in combined_sys:
+            combined_sys += f"\n\n{knowledge_base_context}"
         if rag_context and "Retrieved Document Context" not in combined_sys:
             combined_sys += f"\n\n=== Retrieved Document Context ===\n{rag_context}\n==================================="
         input_messages.append(SystemMessage(content=combined_sys))

@@ -48,7 +48,7 @@ async def process_document_pipeline(document_id: str, r2_key: str, user_id: str,
             config.setdefault("preset", preset)
             config.setdefault("index_graph", False)
             graph_ready = not config["index_graph"] or (doc.provider_status or {}).get("lightrag") == "INDEXED"
-            if doc.status == DocumentStatus.INDEXED and graph_ready:
+            if not is_reindex and doc.status == DocumentStatus.INDEXED and graph_ready:
                 return (await session.execute(select(func.count(DocumentChunk.id)).where(DocumentChunk.document_id == parsed_id))).scalar_one()
             if not config.get("pending_generation") or config.get("pending_generation") == config.get("active_generation"):
                 config["pending_generation"] = str(uuid.uuid4())

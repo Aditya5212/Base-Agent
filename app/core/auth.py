@@ -42,7 +42,7 @@ async def get_current_user(
     x_user_email: Annotated[str | None, Header(alias="X-User-Email")] = None,
     x_user_role: Annotated[str | None, Header(alias="X-User-Role")] = None,
     authorization: Annotated[str | None, Header(alias="Authorization")] = None,
-    user_id: Annotated[str | None, Query(alias="user_id", description="Fallback user ID for query-based tenant scoping")] = None,
+    query_user_id: Annotated[str | None, Query(alias="user_id", description="Fallback user ID for query-based tenant scoping")] = None,
 ) -> UserContext:
     """Resolves authenticated user context.
 
@@ -70,8 +70,8 @@ async def get_current_user(
             resolved_id = token.replace("mock_", "", 1)
             resolved_email = f"{resolved_id}@baseagent.local"
             resolved_role = "root" if resolved_id == "root" else "user"
-    elif user_id:
-        resolved_id = user_id.strip()
+    elif query_user_id:
+        resolved_id = query_user_id.strip()
         resolved_email = f"{resolved_id}@baseagent.local"
         resolved_role = "root" if resolved_id in ("root", "admin") else "user"
 

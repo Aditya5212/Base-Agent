@@ -1,7 +1,7 @@
 """SQLAlchemy ORM models for Documents and Document Chunks with pgvector and FTS."""
 
 import enum
-from typing import Any
+from typing import TYPE_CHECKING, Any
 import uuid
 
 from pgvector.sqlalchemy import Vector
@@ -18,6 +18,9 @@ from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
+
+if TYPE_CHECKING:
+    from app.models.user import User
 
 
 class DocumentStatus(str, enum.Enum):
@@ -37,7 +40,12 @@ class Document(Base, TimestampMixin):
     id: Mapped[uuid.UUID] = mapped_column(
         PG_UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
     )
-    user_id: Mapped[str] = mapped_column(String(128), index=True, nullable=False)
+    user_id: Mapped[str] = mapped_column(
+        String(128),
+        ForeignKey("users.id", ondelete="CASCADE"),
+        index=True,
+        nullable=False,
+    )
     file_name: Mapped[str] = mapped_column(String(255), nullable=False)
     r2_key: Mapped[str] = mapped_column(String(512), unique=True, nullable=False)
     mime_type: Mapped[str] = mapped_column(String(128), nullable=False)
@@ -52,6 +60,7 @@ class Document(Base, TimestampMixin):
     indexing_config: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
     provider_status: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
 
+    user: Mapped["User"] = relationship("User", back_populates="documents")
     chunks: Mapped[list["DocumentChunk"]] = relationship(
         "DocumentChunk",
         back_populates="document",

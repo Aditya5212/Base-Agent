@@ -299,4 +299,42 @@ async def test_build_human_message_authorized_keys():
         assert isinstance(msg_root.content, list)
 
 
+def test_chat_endpoint_with_tools_and_tool_calls():
+    """Chat endpoint supports dynamic tool enabling and serializes tool calls in response."""
+    mock_messages = [
+        HumanMessage(content="What is in my Nigeria doc?"),
+        AIMessage(content="", tool_calls=[{"id": "call_1", "name": "hybrid_document_search", "args": {"query": "Nigeria"}}]),
+        AIMessage(content="According to the Nigeria report..."),
+    ]
+    with patch("app.api.v1.endpoints.chat.execute_agent", new_callable=AsyncMock) as mock_exec:
+        mock_exec.return_value = (
+            {
+                "messages": mock_messages,
+                "thread_id": "test-t-tools",
+                "user_id": "user-1",
+            },
+            "deepseek-flash",
+        )
+
+        payload = {
+            "message": "What is in my Nigeria doc?",
+            "thread_id": "test-t-tools",
+            "user_id": "user-1",
+            "tools": ["hybrid_document_search"],
+        }
+        response = client.post("/api/v1/chat", json=payload)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["thread_id"] == "test-t-tools"
+        assert data["tool_calls"] is not None
+        assert len(data["tool_calls"]) == 1
+        assert data["tool_calls"][0]["name"] == "hybrid_document_search"
+        assert data["tool_calls"][0]["args"] == {"query": "Nigeria"}
+
+        call_kwargs = mock_exec.call_args.kwargs
+        cfg = call_kwargs["agent_config"]
+        tool_ids = [t.tool_id for t in cfg.tools if t.enabled]
+        assert "hybrid_document_search" in tool_ids
+
+
 

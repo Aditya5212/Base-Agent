@@ -59,6 +59,7 @@ async def list_schemas_endpoint(
     page: int = Query(1, ge=1, description="Page number"),
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
     search: str | None = Query(None, description="Search filter for schema name or description"),
+    all_tenants: bool = Query(False, description="Admin only: retrieve schemas across all user tenants"),
     current_user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> StructuredSchemaListResponse:
@@ -66,7 +67,7 @@ async def list_schemas_endpoint(
     items, total = await list_structured_schemas(
         db,
         user_id=current_user.user_id,
-        is_admin=current_user.is_admin,
+        is_admin=current_user.is_admin and all_tenants,
         page=page,
         page_size=page_size,
         search=search,

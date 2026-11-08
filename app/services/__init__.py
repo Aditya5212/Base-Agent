@@ -18,6 +18,7 @@ from app.services.thread_service import (
     get_thread_assets_with_signed_urls,
 )
 from app.services.tools import AGENT_TOOLS, make_search_tool
+from app.services import user_service
 
 __all__ = [
     "AgentState",
@@ -38,4 +39,5 @@ __all__ = [
     "format_thread_assets_context",
     "make_search_tool",
     "AGENT_TOOLS",
+    "user_service",
 ]

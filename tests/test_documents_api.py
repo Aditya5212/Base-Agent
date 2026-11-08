@@ -235,4 +235,107 @@ async def test_recover_stuck_documents():
             assert refreshed.retry_count == 1
 
 
+@pytest.mark.asyncio
+async def test_failed_document_error_message_in_list_and_details():
+    """Verifies that failed documents expose error_message in both list and detail endpoints."""
+    import uuid
+    from app.models.document import Document, DocumentStatus
+    from app.core.database import async_session_factory
+
+    doc_id = uuid.uuid4()
+    async with async_session_factory() as session:
+        doc = Document(
+            id=doc_id,
+            user_id="test_err_user",
+            file_name="corrupt.pdf",
+            r2_key=f"documents/test_err_user/{doc_id}_corrupt.pdf",
+            mime_type="application/pdf",
+            file_size=2048,
+            status=DocumentStatus.FAILED,
+            error_message="Ingestion failed: PdfConverter threw MissingDependencyException",
+            indexing_config={"preset": "balanced", "index_graph": False},
+            provider_status={"hybrid": "FAILED"},
+        )
+        session.add(doc)
+        await session.commit()
+
+    # 1. Test GET /api/v1/documents (list)
+    list_res = client.get("/api/v1/documents?user_id=test_err_user")
+    assert list_res.status_code == 200
+    list_data = list_res.json()
+    assert list_data["total"] >= 1
+    found = next((d for d in list_data["documents"] if d["id"] == str(doc_id)), None)
+    assert found is not None
+    assert found["status"] == "FAILED"
+    assert found["error_message"] == "Ingestion failed: PdfConverter threw MissingDependencyException"
+
+    # 2. Test GET /api/v1/documents/{id} (details)
+    detail_res = client.get(f"/api/v1/documents/{doc_id}?user_id=test_err_user")
+    assert detail_res.status_code == 200
+    detail_data = detail_res.json()
+    assert detail_data["status"] == "FAILED"
+    assert detail_data["error_message"] == "Ingestion failed: PdfConverter threw MissingDependencyException"
+
+
+@pytest.mark.asyncio
+async def test_retry_document_endpoint():
+    """Verifies that POST /retry restarts the pipeline, returns previous_error, and clears error state."""
+    import uuid
+    from app.models.document import Document, DocumentStatus
+    from app.core.database import async_session_factory
+
+    doc_id = uuid.uuid4()
+    async with async_session_factory() as session:
+        doc = Document(
+            id=doc_id,
+            user_id="test_retry_user",
+            file_name="manual_retry.pdf",
+            r2_key=f"documents/test_retry_user/{doc_id}_manual_retry.pdf",
+            mime_type="application/pdf",
+            file_size=4096,
+            status=DocumentStatus.FAILED,
+            error_message="Ingestion failed: network timeout during embedding",
+            retry_count=3,
+            indexing_config={"preset": "high_precision", "index_graph": False},
+        )
+        session.add(doc)
+        await session.commit()
+
+    with patch("app.api.v1.endpoints.documents.process_document_pipeline", new_callable=AsyncMock) as mock_pipe:
+        # Call retry without body (defaults applied)
+        res = client.post(f"/api/v1/documents/{doc_id}/retry?user_id=test_retry_user")
+        assert res.status_code == 202
+        data = res.json()
+        assert data["document_id"] == str(doc_id)
+        assert data["status"] == "PARSING"
+        assert data["preset"] == "high_precision"
+        assert data["previous_error"] == "Ingestion failed: network timeout during embedding"
+        assert "retry initiated" in data["message"].lower()
+
+        # Check DB state
+        async with async_session_factory() as session:
+            refreshed = await session.get(Document, doc_id)
+            assert refreshed is not None
+            assert refreshed.status == DocumentStatus.PARSING
+            assert refreshed.error_message is None
+            assert refreshed.retry_count == 0
+
+
+def test_retry_document_invalid_uuid():
+    response = client.post("/api/v1/documents/not-a-valid-uuid/retry")
+    assert response.status_code == 400
+    assert "invalid uuid" in response.json()["detail"].lower()
+
+
+def test_retry_document_not_found_and_unauthorized():
+    """Verifies error responses for nonexistent doc."""
+    import uuid
+
+    # Nonexistent UUID
+    fake_id = uuid.uuid4()
+    res_404 = client.post(f"/api/v1/documents/{fake_id}/retry")
+    assert res_404.status_code == 404
+
+
+
 

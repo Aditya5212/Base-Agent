@@ -25,6 +25,7 @@ class DocumentItemResponse(BaseModel):
     mime_type: str = Field(..., description="MIME content type")
     file_size: int = Field(..., description="File size in bytes")
     status: str = Field(..., description="Current status")
+    error_message: str | None = Field(default=None, description="Ingestion error if failed")
     created_at: datetime = Field(..., description="Upload timestamp")
     download_url: str | None = Field(default=None, description="Presigned download URL")
 
@@ -134,6 +135,31 @@ class ReindexDocumentResponse(BaseModel):
     new_chunks: int = Field(default=0, description="Number of new chunks indexed (0 while processing in background)")
     preset: str = Field(..., description="Applied RAG preset profile")
     status: str = Field(..., description="Document status")
+    error_message: str | None = Field(default=None, description="Prior failure error if re-indexing from failed state")
+    message: str = Field(..., description="Status summary")
+
+
+class RetryDocumentRequest(BaseModel):
+    """Optional request payload to retry failed or stuck document indexing."""
+
+    preset: Literal["balanced", "high_precision", "high_recall"] | None = Field(
+        default=None,
+        description="Optional chunking preset override; defaults to existing document preset",
+    )
+    index_graph: bool | None = Field(
+        default=None,
+        description="Optional graph indexing override; defaults to existing document setting",
+    )
+
+
+class DocumentRetryResponse(BaseModel):
+    """Response returned upon retrying a document indexing task."""
+
+    document_id: str = Field(..., description="Document UUID")
+    file_name: str = Field(..., description="Document file name")
+    status: str = Field(..., description="Updated document status (PARSING)")
+    preset: str = Field(..., description="Applied RAG preset profile")
+    previous_error: str | None = Field(default=None, description="Previous failure error message if any")
     message: str = Field(..., description="Status summary")
 
 

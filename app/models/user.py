@@ -7,6 +7,7 @@ from app.models.base import Base, TimestampMixin
 
 if TYPE_CHECKING:
     from app.models.agent import Agent
+    from app.models.document import Document
     from app.models.structured_schema import StructuredSchema
     from app.models.thread import Thread, ThreadAsset
     from app.models.tool import Tool
@@ -67,6 +68,12 @@ class User(Base, TimestampMixin):
     )
     workflow_runs: Mapped[list["WorkflowRun"]] = relationship(
         "WorkflowRun",
+        back_populates="user",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    documents: Mapped[list["Document"]] = relationship(
+        "Document",
         back_populates="user",
         cascade="all, delete-orphan",
         passive_deletes=True,

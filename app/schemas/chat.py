@@ -37,6 +37,10 @@ class ChatRequest(BaseModel):
         default=None,
         description="Optional agent UUID. If omitted, the user's default agent is resolved.",
     )
+    tools: list[str] | None = Field(
+        default=None,
+        description="Optional list of tools to enable for this turn (e.g. 'hybrid_document_search', 'graph_rag_search', 'multi_query_search', 'all_rag_tools', 'calculator')",
+    )
 
     @field_validator("thread_id")
     @classmethod
@@ -70,6 +74,10 @@ class ChatResponse(BaseModel):
     thread_assets: list[dict[str, Any]] | None = Field(
         default=None,
         description="Uploaded assets (images, documents) associated with this thread with fresh signed URLs",
+    )
+    tool_calls: list[dict[str, Any]] | None = Field(
+        default=None,
+        description="List of tool calls executed during this conversation turn",
     )
 
 

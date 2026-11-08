@@ -14,6 +14,14 @@ from app.schemas.chat import (
     ThreadHistoryResponse,
 )
 from app.schemas.health import DatabaseHealth, HealthResponse
+from app.schemas.user import (
+    UserCreate,
+    UserDeleteResponse,
+    UserListResponse,
+    UserResponse,
+    UserStats,
+    UserUpdate,
+)
 from app.schemas.structured_schema import (
     StructuredSchemaCreate,
     StructuredSchemaListResponse,
@@ -107,5 +115,11 @@ __all__ = [
     "ToolListResponse",
     "ToolExecutionRequest",
     "ToolExecutionResponse",
+    "UserCreate",
+    "UserUpdate",
+    "UserResponse",
+    "UserListResponse",
+    "UserStats",
+    "UserDeleteResponse",
 ]
 

@@ -329,6 +329,30 @@ def test_tenant_isolation_cross_user_access_blocked():
     assert admin_get.json()["id"] == bob_agent_id
 
 
+def test_admin_list_agents_scoping_and_single_default():
+    """Admin calling GET /api/v1/agents only receives root's agents unless all_tenants=True."""
+    root_headers = {"X-User-ID": "root", "X-User-Role": "root"}
+    bob_headers = {"X-User-ID": "user_bob_scoping", "X-User-Role": "user"}
+
+    # Seed bob agent
+    client.post("/api/v1/agents", json={"name": "Bob Agent"}, headers=bob_headers)
+
+    # Root lists agents without all_tenants -> should only return root's agents
+    r = client.get("/api/v1/agents", headers=root_headers)
+    assert r.status_code == 200
+    data = r.json()
+    for item in data["items"]:
+        assert item["user_id"] == "root"
+    defaults = [item for item in data["items"] if item["is_default"]]
+    assert len(defaults) <= 1
+
+    # Root lists agents with all_tenants=True -> returns cross-tenant agents
+    r_all = client.get("/api/v1/agents?all_tenants=true", headers=root_headers)
+    assert r_all.status_code == 200
+    data_all = r_all.json()
+    assert any(item["user_id"] == "user_bob_scoping" for item in data_all["items"])
+
+
 # ---------------------------------------------------------------------------
 # 5. Chat Endpoint Dynamic Agent Resolution Tests
 # ---------------------------------------------------------------------------

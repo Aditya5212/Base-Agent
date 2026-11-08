@@ -21,6 +21,7 @@ from app.schemas.document import (
     DocumentDetailResponse,
     DocumentItemResponse,
     DocumentListResponse,
+    DocumentRetryResponse,
     DocumentUploadResponse,
     KnowledgeBaseStatsResponse,
     RAGSearchChunkResponse,
@@ -28,6 +29,7 @@ from app.schemas.document import (
     RAGSearchResponse,
     ReindexDocumentRequest,
     ReindexDocumentResponse,
+    RetryDocumentRequest,
 )
 from app.schemas.storage import format_bytes
 from app.services.document_loader import convert_to_markdown, load_document
@@ -264,6 +266,7 @@ async def list_documents(
                 mime_type=doc.mime_type,
                 file_size=doc.file_size,
                 status=doc.status.value,
+                error_message=doc.error_message,
                 created_at=doc.created_at,
                 download_url=download_url,
             )
@@ -406,8 +409,8 @@ async def get_document_chunks(
 )
 async def reindex_document(
     document_id: str,
-    request: ReindexDocumentRequest,
     background_tasks: BackgroundTasks,
+    request: ReindexDocumentRequest = ReindexDocumentRequest(),
     user_id: str | None = None,
     current_user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
@@ -445,9 +448,11 @@ async def _reindex_document_locked(document_id, request, background_tasks, user_
     count_stmt = select(func.count(DocumentChunk.id)).where(DocumentChunk.document_id == parsed_id)
     prev_count = (await db.execute(count_stmt)).scalar_one_or_none() or 0
 
-    # Mark document as PARSING during re-indexing
+    # Capture prior failure error and reset lifecycle for re-indexing
+    prior_error = doc.error_message
     doc.status = DocumentStatus.PARSING
     doc.error_message = None
+    doc.retry_count = 0
     config = dict(doc.indexing_config or {})
     config["purge_graph"] = config.get("index_graph", False)
     config["preset"] = request.preset
@@ -495,7 +500,114 @@ async def _reindex_document_locked(document_id, request, background_tasks, user_
         new_chunks=0,
         preset=request.preset,
         status=doc.status.value,
+        error_message=prior_error,
         message=f"Document '{doc.file_name}' re-indexing pipeline started in background using '{request.preset}' preset.",
+    )
+
+
+@router.post(
+    "/{document_id}/retry",
+    response_model=DocumentRetryResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Retry failed or stuck document indexing in background",
+    description="Restarts the background parsing and indexing pipeline for a failed or stuck document. Resets error state and retry count.",
+)
+async def retry_document(
+    document_id: str,
+    background_tasks: BackgroundTasks,
+    request: RetryDocumentRequest = RetryDocumentRequest(),
+    user_id: str | None = None,
+    current_user: UserContext = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> DocumentRetryResponse:
+    try:
+        parsed_id = uuid.UUID(document_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid UUID format") from exc
+    async with document_lock(str(parsed_id)) as acquired:
+        if not acquired:
+            raise HTTPException(status_code=409, detail="Document is currently being processed")
+        return await _retry_document_locked(document_id, request, background_tasks, user_id, current_user, db)
+
+
+async def _retry_document_locked(document_id, request, background_tasks, user_id, current_user, db):
+    """Restarts indexing pipeline for a failed or stuck document."""
+    effective_user_id = user_id if (current_user.is_admin and user_id and user_id != "root") else current_user.user_id
+    try:
+        parsed_id = uuid.UUID(document_id)
+    except ValueError:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid UUID format.")
+
+    stmt = select(Document).where(Document.id == parsed_id)
+    res = await db.execute(stmt)
+    doc = res.scalar_one_or_none()
+    if not doc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+
+    if doc.user_id != effective_user_id and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied: You do not have permission to retry indexing for this document.",
+        )
+
+    config = dict(doc.indexing_config or {})
+    target_preset = request.preset or config.get("preset", "balanced")
+    target_index_graph = request.index_graph if request.index_graph is not None else config.get("index_graph", False)
+
+    prior_error = doc.error_message
+
+    # Transition to PARSING, clear error, and reset retry counter
+    doc.status = DocumentStatus.PARSING
+    doc.error_message = None
+    doc.retry_count = 0
+    config["preset"] = target_preset
+    config["index_graph"] = target_index_graph
+    config["purge_graph"] = target_index_graph
+    doc.indexing_config = config
+    doc.provider_status = {
+        "hybrid": "PARSING",
+        **({"lightrag": "PARSING"} if target_index_graph else {}),
+    }
+    await db.commit()
+
+    dispatched = False
+    try:
+        from app.tasks.document_tasks import process_document_task
+        await process_document_task.kiq(
+            document_id=str(doc.id),
+            r2_key=doc.r2_key,
+            user_id=doc.user_id,
+            file_name=doc.file_name,
+            preset=target_preset,
+            is_reindex=True,
+        )
+        dispatched = True
+        logger.info("Dispatched document %s retry to Taskiq worker queue.", doc.id)
+    except Exception as tq_exc:
+        logger.debug(
+            "Taskiq task dispatch unavailable (%s); using in-process BackgroundTasks fallback.",
+            tq_exc,
+        )
+
+    if not dispatched:
+        background_tasks.add_task(
+            process_document_pipeline,
+            document_id=str(doc.id),
+            r2_key=doc.r2_key,
+            user_id=doc.user_id,
+            file_name=doc.file_name,
+            preset=target_preset,
+            file_bytes=None,
+            is_reindex=True,
+        )
+
+    return DocumentRetryResponse(
+        document_id=str(doc.id),
+        file_name=doc.file_name,
+        status=doc.status.value,
+        preset=target_preset,
+        previous_error=prior_error,
+        message=f"Document '{doc.file_name}' indexing retry initiated in background using '{target_preset}' preset.",
     )
 
 

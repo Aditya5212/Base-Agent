@@ -64,6 +64,7 @@ async def list_agents_endpoint(
     page_size: int = Query(20, ge=1, le=100, description="Items per page"),
     search: str | None = Query(None, description="Search filter for agent name or description"),
     is_default: bool | None = Query(None, description="Filter by default agent status"),
+    all_tenants: bool = Query(False, description="Admin only: retrieve agents across all user tenants"),
     current_user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> AgentListResponse:
@@ -71,7 +72,7 @@ async def list_agents_endpoint(
     items, total = await list_agents(
         db,
         user_id=current_user.user_id,
-        is_admin=current_user.is_admin,
+        is_admin=current_user.is_admin and all_tenants,
         page=page,
         page_size=page_size,
         search=search,

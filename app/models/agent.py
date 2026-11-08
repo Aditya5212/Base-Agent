@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 import uuid
 
-from sqlalchemy import Boolean, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, ForeignKey, Index, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -41,3 +41,12 @@ class Agent(Base, TimestampMixin):
     version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
 
     user: Mapped["User"] = relationship("User", back_populates="agents")
+
+    __table_args__ = (
+        Index(
+            "uq_agents_user_default",
+            "user_id",
+            unique=True,
+            postgresql_where=text("is_default = TRUE"),
+        ),
+    )
