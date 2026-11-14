@@ -131,6 +131,7 @@ Base-Agent/
 │   │   ├── tool_executors/     # Specialized tool execution engines (http, code, database)
 │   │   ├── memory.py           # PostgreSQL checkpointer service (AsyncPostgresSaver)
 │   │   ├── thread_service.py   # Thread persistence, root user, and asset management
+│   │   ├── retrieval_service.py# Centralized RetrievalScope, scoped filtering, dual-layer LightRAG & RRF boosting
 │   │   ├── tools.py            # LangChain agent tool factory & backwards-compatible re-exports
 │   │   ├── rag_tools.py        # Modular RAG research tools (Exploitation & Exploration)
 │   │   ├── multi_query.py      # LLM query expansion & parallel cross-query RRF fusion
@@ -173,7 +174,7 @@ Interactive Swagger UI is available at `http://localhost:8000/docs`.
 | `GET` | `/api/v1/chat/{thread_id}/assets` | List uploaded images & documents in thread with signed URLs |
 | `GET` | `/api/v1/chat/{thread_id}/details` | Get thread metadata, ownership, and active assets |
 | `GET` | `/api/v1/chat/{thread_id}/history` | Retrieve stored conversation history |
-| `DELETE` | `/api/v1/chat/{thread_id}` | Cascade clear thread: checkpoints, thread-scoped documents in R2/PGVector/LightRAG, and thread media assets |
+| `DELETE` | `/api/v1/chat/{thread_id}` | Durable cascade clear thread: aborts active ingestion, purges memory/checkpoints, thread-scoped documents in R2/PGVector/LightRAG, and thread media assets (preserves records on external failure for safe retry) |
 
 ### Knowledge Base Management (`/api/v1/documents`)
 | Method | Endpoint | Description |
@@ -186,7 +187,7 @@ Interactive Swagger UI is available at `http://localhost:8000/docs`.
 | `POST` | `/api/v1/documents/{id}/reindex` | Re-index document from R2 with preset (purges chunks & graph entities) |
 | `GET` | `/api/v1/documents/{id}/download` | Stream binary from R2 with `?inline=true` browser preview support |
 | `DELETE` | `/api/v1/documents/{id}` | Cascade delete: R2 storage, PGVector embeddings, LightRAG graph & record |
-| `POST` | `/api/v1/documents/search` | Direct Hybrid Search (Dense HNSW + FTS GIN + RRF fusion) supporting optional `thread_id` scoping |
+| `POST` | `/api/v1/documents/search` | Direct Hybrid Search (Dense HNSW + FTS GIN + RRF fusion) supporting 4 explicit scopes (`global_only`, `thread_only`, `thread_with_global`, `all_user`) and active thread ranking boost |
 
 ### Agent Management (`/api/v1/agents`)
 | Method | Endpoint | Description |

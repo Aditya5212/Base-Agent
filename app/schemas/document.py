@@ -56,6 +56,10 @@ class RAGSearchRequest(BaseModel):
     top_k: int | None = Field(default=None, ge=1, le=30, description="Optional top-k override")
     user_id: str | None = Field(default=None, description="Optional user filter to scope retrieval")
     thread_id: str | None = Field(default=None, description="Optional thread filter to scope retrieval")
+    scope: str | None = Field(
+        default=None,
+        description="Optional explicit retrieval scope: 'global_only', 'thread_only', 'thread_with_global', 'all_user'",
+    )
 
 
 class RAGSearchChunkResponse(BaseModel):

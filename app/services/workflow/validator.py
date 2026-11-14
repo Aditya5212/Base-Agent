@@ -47,7 +47,7 @@ def validate_workflow_graph(
         config = node.get("config") or {}
         if "knowledge" in config:
             errors.append(f"Node '{node_id}' must use an explicit retrieve node for knowledge attachment.")
-        if node_type == "retrieve" and (config.get("workspace_type", "user") != "user" or config.get("provider_name", "hybrid") not in {"hybrid", "lightrag", "multi_query"}):
+        if node_type == "retrieve" and (config.get("workspace_type", "user") not in {"user", "thread", "global"} or config.get("provider_name", "hybrid") not in {"hybrid", "lightrag", "multi_query"}):
             errors.append(f"Node '{node_id}' uses an unsupported provider or knowledge scope.")
         if node_type == "conditional" and any(b.get("condition_type") == "jsonpath" for b in config.get("branches", [])):
             errors.append(f"Node '{node_id}' uses unimplemented JSONPath routing.")

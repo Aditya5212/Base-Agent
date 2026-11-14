@@ -25,11 +25,14 @@ def cross_query_reciprocal_rank_fusion(
     top_k: int = 8,
     k_constant: float = 60.0,
     multi_hit_bonus: float = 0.05,
+    active_thread_id: str | None = None,
+    thread_boost: float = 0.05,
 ) -> list[Document]:
     """Fuses documents retrieved across multiple queries using reciprocal rank fusion with multi-query bonuses.
 
     Formula:
         Score(d) = Sum_{q in Q} [ 1.0 / (k + rank(d, q)) ] + (num_matched_queries - 1) * multi_hit_bonus
+    Additionally awards thread_boost to documents matching active_thread_id.
     """
     doc_registry: dict[str, Document] = {}
     fused_scores: dict[str, float] = {}
@@ -58,6 +61,17 @@ def cross_query_reciprocal_rank_fusion(
             bonus = (len(queries_matched) - 1) * multi_hit_bonus
             fused_scores[fp] += bonus
 
+    # Apply active thread bonus to prioritize conversation-specific knowledge
+    for fp, doc in doc_registry.items():
+        doc_thread = doc.metadata.get("thread_id")
+        if active_thread_id and doc_thread == active_thread_id:
+            fused_scores[fp] += thread_boost
+            doc.metadata["is_thread_document"] = True
+            doc.metadata["retrieval_scope"] = "thread"
+        else:
+            doc.metadata["is_thread_document"] = False
+            doc.metadata["retrieval_scope"] = "global" if not doc_thread else "other_thread"
+
     # Sort descending by final fused score
     sorted_fps = sorted(fused_scores.keys(), key=lambda fp: fused_scores[fp], reverse=True)
 
@@ -79,6 +93,7 @@ async def multi_query_hybrid_search(
     preset: str = "balanced",
     top_k_final: int = 8,
     thread_id: str | None = None,
+    scope: Any = None,
 ) -> list[Document]:
     """Executes parallel hybrid search for an agent-provided list of queries and fuses the results.
 
@@ -88,6 +103,7 @@ async def multi_query_hybrid_search(
         preset: RAG retrieval preset ('high_precision', 'balanced', 'high_recall').
         top_k_final: Maximum number of fused documents to return.
         thread_id: Optional conversation thread ID for thread-aware retrieval scoping.
+        scope: Optional explicit RetrievalScope.
 
     Returns:
         Ranked and deduplicated list of fused Document objects.
@@ -105,6 +121,7 @@ async def multi_query_hybrid_search(
             config=rag_cfg,
             filter_dict={"user_id": user_id},
             thread_id=thread_id,
+            scope=scope,
         )
         for q in cleaned_queries
     ]
@@ -126,4 +143,5 @@ async def multi_query_hybrid_search(
     return cross_query_reciprocal_rank_fusion(
         query_results=query_results,
         top_k=top_k_final,
+        active_thread_id=thread_id,
     )

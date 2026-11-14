@@ -20,6 +20,7 @@ OFFLINE_MODULES = {
     "test_config.py", "test_document_loader.py", "test_embedding.py", "test_text_splitter.py",
     "test_retriever.py", "test_llm.py", "test_rag_tools.py", "test_taskiq.py",
     "test_workflow_compiler.py", "test_workflow_nodes.py", "test_rate_limit.py",
+    "test_thread_reliability.py",
 }
 OFFLINE_TOOL_TESTS = {
     "test_secret_encryption_and_decryption", "test_secret_masking", "test_corrupted_token_decryption_error",

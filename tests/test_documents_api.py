@@ -457,9 +457,18 @@ def test_build_rag_filter_scoping():
     sql_strict = _build_sparse_filter_clause(f_strict, params_s, counter_s)
     assert "cmetadata->>'thread_id' = :sparse_p_1" in sql_strict
 
-    # 3. User only (no thread)
+    # 3. Global only (no thread provided defaults to GLOBAL_ONLY to prevent leaks)
     f_user = build_rag_filter(user_id="user1", thread_id=None)
-    assert f_user == {"user_id": {"$eq": "user1"}}
+    assert f_user == {
+        "$and": [
+            {"user_id": {"$eq": "user1"}},
+            {"thread_id": {"$exists": False}},
+        ]
+    }
+
+    # 4. Explicit ALL_USER cross-thread search
+    f_all = build_rag_filter(user_id="user1", scope="all_user")
+    assert f_all == {"user_id": {"$eq": "user1"}}
 
 
 

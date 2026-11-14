@@ -134,6 +134,10 @@ class RetrieveNodeConfig(BaseModel):
         default="user",
         description="Knowledge isolation boundary.",
     )
+    scope: Literal["global_only", "thread_only", "thread_with_global", "all_user"] | None = Field(
+        default=None,
+        description="Explicit retrieval scope. If omitted, resolved based on workspace_type and active thread.",
+    )
     output_variable: str = Field(
         default="rag_context",
         description="Variable key to store formatted retrieved context text.",

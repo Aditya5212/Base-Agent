@@ -18,6 +18,11 @@ from sqlalchemy import text
 from app.core.config import settings
 from app.core.database import engine
 from app.core.rag_config import RAGConfig, get_rag_config
+from app.services.retrieval_service import (
+    RetrievalScope,
+    build_scoped_filter,
+    resolve_retrieval_scope,
+)
 from app.services.vector_store import get_vector_store
 
 logger = logging.getLogger(__name__)
@@ -32,34 +37,24 @@ def build_rag_filter(
     user_id: str | None = None,
     thread_id: str | None = None,
     thread_scoped_only: bool = False,
+    scope: RetrievalScope | str | None = None,
 ) -> dict[str, Any] | None:
     """Builds a structured metadata filter compatible with both PGVector and sparse search.
 
-    If thread_id is provided and thread_scoped_only is False (default for chat turns),
-    it allows retrieving both thread-scoped documents and user-global documents
-    (documents where thread_id does not exist).
-    If thread_id is None, it scopes retrieval to user_id (or returns None).
+    Delegates to build_scoped_filter in retrieval_service for centralized scope rules:
+    - GLOBAL_ONLY (default when thread_id is None): only documents without a thread_id.
+    - THREAD_ONLY: only documents matching the thread_id.
+    - THREAD_WITH_GLOBAL: documents matching thread_id OR global documents.
+    - ALL_USER: explicit cross-thread search.
     """
-    clauses: list[dict[str, Any]] = []
-    if user_id:
-        clauses.append({"user_id": {"$eq": user_id}})
-
-    if thread_id:
-        if thread_scoped_only:
-            clauses.append({"thread_id": {"$eq": thread_id}})
-        else:
-            clauses.append({
-                "$or": [
-                    {"thread_id": {"$eq": thread_id}},
-                    {"thread_id": {"$exists": False}},
-                ]
-            })
-
-    if not clauses:
+    if not user_id:
         return None
-    if len(clauses) == 1:
-        return clauses[0]
-    return {"$and": clauses}
+    return build_scoped_filter(
+        user_id=user_id,
+        scope=scope,
+        thread_id=thread_id,
+        thread_scoped_only=thread_scoped_only,
+    )
 
 
 def _build_sparse_filter_clause(
@@ -195,18 +190,22 @@ async def _sparse_search(
 
 
 def apply_reciprocal_rank_fusion(
-    dense_results: list[tuple[Document, float]],
-    sparse_results: list[tuple[Document, float]],
-    config: RAGConfig,
+    dense_results: list[tuple[Document, float]] | list[Document],
+    sparse_results: list[tuple[Document, float]] | list[Document],
+    config: RAGConfig | None = None,
+    active_thread_id: str | None = None,
+    thread_boost: float = 0.05,
 ) -> list[Document]:
     """Combines dense and sparse ranked lists using Reciprocal Rank Fusion (RRF).
 
     Formula:
         RRF(d) = (w_dense / (k + rank_dense)) + (w_sparse / (k + rank_sparse))
+    Additionally applies a thread priority boost if active_thread_id matches.
     """
-    k = config.rrf_k
-    w_dense = config.vector_weight
-    w_sparse = config.sparse_weight
+    rag_cfg = config or get_rag_config()
+    k = rag_cfg.rrf_k
+    w_dense = rag_cfg.vector_weight
+    w_sparse = rag_cfg.sparse_weight
 
     rrf_scores: dict[str, float] = {}
     doc_registry: dict[str, Document] = {}
@@ -214,19 +213,33 @@ def apply_reciprocal_rank_fusion(
     sparse_ranks: dict[str, int] = {}
 
     # Accumulate dense ranks (1-indexed)
-    for rank, (doc, _) in enumerate(dense_results, 1):
+    for rank, item in enumerate(dense_results, 1):
+        doc = item[0] if isinstance(item, tuple) else item
         fingerprint = _compute_chunk_fingerprint(doc)
         doc_registry[fingerprint] = doc
         dense_ranks[fingerprint] = rank
         rrf_scores[fingerprint] = rrf_scores.get(fingerprint, 0.0) + (w_dense / (k + rank))
 
     # Accumulate sparse ranks (1-indexed)
-    for rank, (doc, _) in enumerate(sparse_results, 1):
+    for rank, item in enumerate(sparse_results, 1):
+        doc = item[0] if isinstance(item, tuple) else item
         fingerprint = _compute_chunk_fingerprint(doc)
         if fingerprint not in doc_registry:
             doc_registry[fingerprint] = doc
         sparse_ranks[fingerprint] = rank
         rrf_scores[fingerprint] = rrf_scores.get(fingerprint, 0.0) + (w_sparse / (k + rank))
+
+    # Apply active thread bonus to prioritize conversation-specific knowledge
+    for fp, doc in doc_registry.items():
+        doc_thread = doc.metadata.get("thread_id")
+        if active_thread_id and doc_thread == active_thread_id:
+            rrf_scores[fp] += thread_boost
+            doc.metadata["is_thread_document"] = True
+            doc.metadata["retrieval_scope"] = "thread"
+            doc.metadata["thread_boost_applied"] = thread_boost
+        else:
+            doc.metadata["is_thread_document"] = False
+            doc.metadata["retrieval_scope"] = "global" if not doc_thread else "other_thread"
 
     # Sort documents in descending order of fused RRF score
     sorted_fingerprints = sorted(
@@ -236,7 +249,7 @@ def apply_reciprocal_rank_fusion(
     )
 
     fused_docs: list[Document] = []
-    for fp in sorted_fingerprints[:config.top_k_final]:
+    for fp in sorted_fingerprints[:rag_cfg.top_k_final]:
         doc = doc_registry[fp]
         # Attach fusion telemetry to metadata
         doc.metadata["rrf_score"] = round(rrf_scores[fp], 6)
@@ -260,6 +273,8 @@ async def hybrid_search(
     filter_dict: dict[str, Any] | None = None,
     thread_id: str | None = None,
     thread_scoped_only: bool = False,
+    scope: RetrievalScope | str | None = None,
+    thread_boost: float = 0.05,
 ) -> list[Document]:
     """Executes end-to-end hybrid search (dense pgvector + sparse PostgreSQL FTS) with RRF fusion.
 
@@ -270,6 +285,8 @@ async def hybrid_search(
         filter_dict: Optional metadata filter dict (e.g. {'user_id': 'aditya'}).
         thread_id: Optional thread ID to apply thread scoping (thread + global fallback).
         thread_scoped_only: If True, search strictly thread-scoped documents without global fallback.
+        scope: Explicit RetrievalScope ('global_only', 'thread_only', 'thread_with_global', 'all_user').
+        thread_boost: Score bonus awarded to chunks originating from active thread in RRF.
 
     Returns:
         Ranked list of top-K fused Document objects.
@@ -278,13 +295,17 @@ async def hybrid_search(
     target_collection = collection_name or settings.RAG_COLLECTION_NAME
 
     effective_filter = dict(filter_dict) if filter_dict else None
-    if thread_id and (not effective_filter or "thread_id" not in effective_filter):
-        user_id = effective_filter.get("user_id") if effective_filter else None
-        effective_filter = build_rag_filter(
-            user_id=user_id,
-            thread_id=thread_id,
-            thread_scoped_only=thread_scoped_only,
-        )
+    user_id = effective_filter.get("user_id") if effective_filter else None
+
+    # Apply scoped filter if not already structured as an explicit $and/$or tree
+    if not effective_filter or ("$and" not in effective_filter and "$or" not in effective_filter):
+        if user_id or thread_id or scope:
+            effective_filter = build_rag_filter(
+                user_id=user_id,
+                thread_id=thread_id,
+                thread_scoped_only=thread_scoped_only,
+                scope=scope,
+            )
 
     # Execute dense and sparse retrieval in parallel to minimise wall-clock latency
     dense_candidates, sparse_candidates = await asyncio.gather(
@@ -302,11 +323,13 @@ async def hybrid_search(
         ),
     )
 
-    # Fuse candidate lists
+    # Fuse candidate lists with thread prioritization
     fused_results = apply_reciprocal_rank_fusion(
         dense_results=dense_candidates,
         sparse_results=sparse_candidates,
         config=rag_cfg,
+        active_thread_id=thread_id,
+        thread_boost=thread_boost,
     )
     return fused_results
 

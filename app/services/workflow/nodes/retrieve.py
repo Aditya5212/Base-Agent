@@ -11,10 +11,15 @@ from app.core.rag.workspace import (
     thread_workspace,
     user_workspace,
 )
+from app.core.rag_config import get_rag_config
 from app.schemas.workflow import RetrieveNodeConfig
 from app.services.multi_query import multi_query_hybrid_search
+from app.services.retrieval_service import (
+    RetrievalScope,
+    query_graph_rag_dual_layer,
+    resolve_retrieval_scope,
+)
 from app.services.retriever import hybrid_search
-from app.core.rag_config import get_rag_config
 from app.services.workflow.state import WorkflowState, render_template
 
 logger = logging.getLogger(__name__)
@@ -45,8 +50,8 @@ def build_retrieve_node(node_id: str, config_dict: dict[str, Any]) -> Any:
     config = RetrieveNodeConfig.model_validate(config_dict or {})
     if config.provider_name not in ("hybrid", "lightrag", "multi_query"):
         raise ValueError(f"Unsupported retrieval provider '{config.provider_name}'")
-    if config.workspace_type != "user":
-        raise ValueError("Only user knowledge scope has an ingestion path; other scopes are not available yet")
+    if config.workspace_type not in ("user", "thread", "global"):
+        raise ValueError(f"Unsupported knowledge scope '{config.workspace_type}'")
 
     async def retrieve_handler(state: WorkflowState) -> dict[str, Any]:
         logger.debug(
@@ -58,6 +63,20 @@ def build_retrieve_node(node_id: str, config_dict: dict[str, Any]) -> Any:
 
         rendered_query = render_template(config.query_template, state).strip()
         user_id = state.get("user_id", "root")
+        raw_thread_id = state.get("thread_id")
+        effective_thread_id = raw_thread_id if raw_thread_id and not raw_thread_id.startswith("wf_run_") else None
+        if config.workspace_type == "thread" and raw_thread_id:
+            effective_thread_id = raw_thread_id
+
+        if config.scope:
+            resolved_scope = resolve_retrieval_scope(config.scope, thread_id=effective_thread_id)
+        elif config.workspace_type == "thread":
+            resolved_scope = RetrievalScope.THREAD_WITH_GLOBAL if effective_thread_id else RetrievalScope.GLOBAL_ONLY
+        elif config.workspace_type == "global":
+            resolved_scope = RetrievalScope.GLOBAL_ONLY
+        else:
+            resolved_scope = RetrievalScope.THREAD_WITH_GLOBAL if effective_thread_id else RetrievalScope.GLOBAL_ONLY
+
         workspace = _resolve_workspace(config.workspace_type, user_id, state)
 
         variables = dict(state.get("variables") or {})
@@ -77,25 +96,37 @@ def build_retrieve_node(node_id: str, config_dict: dict[str, Any]) -> Any:
             # 1. LightRAG Knowledge Graph Provider
             # ---------------------------------------------------------------
             if provider in ("lightrag", "graph", "knowledge_graph"):
-                rag_provider = await get_provider("lightrag", workspace=workspace)
-                retrieval_query = RetrievalQuery(
-                    query=rendered_query,
-                    top_k=config.top_k,
-                    mode="mix",
-                )
-                res = await rag_provider.query(retrieval_query)
-                formatted_context = res.context.strip() if res.context else ""
-                sources = [
-                    {
-                        "index": idx,
-                        "source": chunk.source,
-                        "chunk_id": chunk.chunk_id,
-                        "metadata": chunk.metadata,
-                    }
-                    for idx, chunk in enumerate(res.chunks, 1)
-                ]
-                variables[config.output_variable] = formatted_context
-                variables[config.sources_variable] = sources
+                if effective_thread_id and resolved_scope == RetrievalScope.THREAD_WITH_GLOBAL:
+                    formatted_context, sources = await query_graph_rag_dual_layer(
+                        query=rendered_query,
+                        user_id=user_id,
+                        thread_id=effective_thread_id,
+                        top_k=config.top_k,
+                        mode="mix",
+                        provider_getter=get_provider,
+                    )
+                    variables[config.output_variable] = formatted_context
+                    variables[config.sources_variable] = sources
+                else:
+                    rag_provider = await get_provider("lightrag", workspace=workspace)
+                    retrieval_query = RetrievalQuery(
+                        query=rendered_query,
+                        top_k=config.top_k,
+                        mode="mix",
+                    )
+                    res = await rag_provider.query(retrieval_query)
+                    formatted_context = res.context.strip() if res.context else ""
+                    sources = [
+                        {
+                            "index": idx,
+                            "source": chunk.source,
+                            "chunk_id": chunk.chunk_id,
+                            "metadata": chunk.metadata,
+                        }
+                        for idx, chunk in enumerate(res.chunks, 1)
+                    ]
+                    variables[config.output_variable] = formatted_context
+                    variables[config.sources_variable] = sources
 
             # ---------------------------------------------------------------
             # 2. Multi-Query Exploration Provider (Agent-Provided Queries)
@@ -112,6 +143,8 @@ def build_retrieve_node(node_id: str, config_dict: dict[str, Any]) -> Any:
                 fused_docs = await multi_query_hybrid_search(
                     queries=queries_list,
                     user_id=user_id,
+                    thread_id=effective_thread_id if resolved_scope in (RetrievalScope.THREAD_ONLY, RetrievalScope.THREAD_WITH_GLOBAL) else None,
+                    scope=resolved_scope,
                     top_k_final=config.top_k,
                 )
                 context_chunks = []
@@ -122,14 +155,17 @@ def build_retrieve_node(node_id: str, config_dict: dict[str, Any]) -> Any:
                     header_info = f" ({section})" if section else ""
                     matched_qs = doc.metadata.get("matched_queries") or []
                     matched_str = f" [Matched: {', '.join(matched_qs)}]" if matched_qs else ""
+                    is_th = doc.metadata.get("is_thread_document", False)
+                    th_tag = " [Thread Doc]" if is_th else ""
                     context_chunks.append(
-                        f"[{idx}] Source: {src_name}{header_info}{matched_str}\n{doc.page_content.strip()}"
+                        f"[{idx}] Source: {src_name}{header_info}{th_tag}{matched_str}\n{doc.page_content.strip()}"
                     )
                     sources.append({
                         "index": idx,
                         "source": src_name,
                         "section": section,
                         "matched_queries": matched_qs,
+                        "is_thread_document": is_th,
                         "metadata": doc.metadata,
                     })
 
@@ -140,10 +176,11 @@ def build_retrieve_node(node_id: str, config_dict: dict[str, Any]) -> Any:
             # 3. Standard Hybrid Search (Dense + Sparse + RRF) Default
             # ---------------------------------------------------------------
             else:
-                filter_dict = {"user_id": user_id}
                 documents = await hybrid_search(
                     query=rendered_query,
-                    filter_dict=filter_dict,
+                    filter_dict={"user_id": user_id},
+                    thread_id=effective_thread_id if resolved_scope in (RetrievalScope.THREAD_ONLY, RetrievalScope.THREAD_WITH_GLOBAL) else None,
+                    scope=resolved_scope,
                     config=get_rag_config(top_k_final=config.top_k, top_k_dense=max(20, config.top_k), top_k_sparse=max(20, config.top_k)),
                 )
 
@@ -155,11 +192,14 @@ def build_retrieve_node(node_id: str, config_dict: dict[str, Any]) -> Any:
                     src_name = doc.metadata.get("source") or doc.metadata.get("filename") or f"doc_{idx}"
                     section = doc.metadata.get("header") or doc.metadata.get("section") or ""
                     header_info = f" ({section})" if section else ""
-                    context_chunks.append(f"[{idx}] Source: {src_name}{header_info}\n{doc.page_content.strip()}")
+                    is_th = doc.metadata.get("is_thread_document", False)
+                    th_tag = " [Thread Doc]" if is_th else ""
+                    context_chunks.append(f"[{idx}] Source: {src_name}{header_info}{th_tag}\n{doc.page_content.strip()}")
                     sources.append({
                         "index": idx,
                         "source": src_name,
                         "section": section,
+                        "is_thread_document": is_th,
                         "metadata": doc.metadata,
                     })
 

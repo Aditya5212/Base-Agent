@@ -812,6 +812,7 @@ async def search_documents(
         config=rag_cfg,
         filter_dict=filter_dict if filter_dict else None,
         thread_id=search_request.thread_id,
+        scope=search_request.scope,
     )
 
     results: list[RAGSearchChunkResponse] = []

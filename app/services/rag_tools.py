@@ -23,6 +23,7 @@ from app.core.rag.protocols import RetrievalQuery
 from app.core.rag.workspace import thread_workspace, user_workspace
 from app.core.rag_config import get_rag_config
 from app.services.multi_query import multi_query_hybrid_search
+from app.services.retrieval_service import query_graph_rag_dual_layer
 from app.services.retriever import hybrid_search
 
 logger = logging.getLogger(__name__)
@@ -117,23 +118,19 @@ def make_graph_rag_tool(user_id: str, thread_id: str | None = None) -> BaseTool:
             Formatted graph context including entity descriptions, relationships, and community insights.
         """
         try:
-            workspace = thread_workspace(user_id, thread_id) if thread_id else user_workspace(user_id)
-            provider = await get_provider("lightrag", workspace=workspace)
-
-            retrieval_query = RetrievalQuery(
+            formatted_context, _ = await query_graph_rag_dual_layer(
+                user_id=user_id,
                 query=query,
-                top_k=top_k,
                 mode=mode,
+                top_k=top_k,
+                thread_id=thread_id,
+                provider_getter=get_provider,
             )
-            result = await provider.query(retrieval_query)
 
-            if not result.context or not result.context.strip():
+            if not formatted_context or not formatted_context.strip():
                 return f"No graph entities or relationships found in knowledge base for query: '{query}'."
 
-            return (
-                f"### Knowledge Graph Traversal [Mode: {mode.upper()}]\n\n"
-                f"{result.context.strip()}"
-            )
+            return formatted_context
         except Exception as exc:
             logger.warning("graph_rag_search tool encountered error: %s", exc, exc_info=True)
             return f"Notice: Knowledge graph traversal unavailable for query '{query}': {exc}"

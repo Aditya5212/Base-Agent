@@ -1,6 +1,7 @@
 """Chat endpoints with persistent PostgreSQL short-term memory, multimodal image support, and thread assets."""
 
 import logging
+from typing import Any
 import uuid
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.responses import StreamingResponse
@@ -459,7 +460,14 @@ async def clear_memory(
         is_admin=current_user.is_admin,
         allow_missing=True,
     )
-    success = await delete_thread_cascade(db, thread_id=thread_id, user_id=current_user.user_id)
+    try:
+        success = await delete_thread_cascade(db, thread_id=thread_id, user_id=current_user.user_id)
+    except RuntimeError as rerr:
+        logger.error("Cascade deletion of thread %s failed: %s", thread_id, rerr)
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(rerr),
+        )
     if not success:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

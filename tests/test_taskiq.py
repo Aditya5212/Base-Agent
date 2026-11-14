@@ -39,6 +39,7 @@ async def test_process_document_task_execution():
             preset="balanced",
             file_bytes=None,
             is_reindex=False,
+            thread_id=None,
         )
 
 

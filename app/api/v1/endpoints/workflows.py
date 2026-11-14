@@ -47,7 +47,7 @@ async def execution_capabilities(current_user: UserContext = Depends(get_current
     return {
         "node_types": sorted(SUPPORTED_NODE_TYPES),
         "knowledge_providers": ["hybrid", "lightrag", "multi_query"],
-        "knowledge_scopes": ["user"],
+        "knowledge_scopes": ["user", "thread", "global"],
         "knowledge_attachment_node_types": ["retrieve"],
         "parallel_execution": False, "subgraph_execution": False,
         "agent_tools": True, "structured_output_validation": True,

@@ -52,7 +52,7 @@ async def process_document_pipeline(
                 return 0
             if doc.user_id != user_id or doc.r2_key != r2_key:
                 raise ValueError("Document task does not match stored owner/source")
-            effective_thread_id = thread_id if thread_id is not None else doc.thread_id
+            effective_thread_id = thread_id if thread_id is not None else getattr(doc, "thread_id", None)
             config = dict(doc.indexing_config or {})
             config.setdefault("preset", preset)
             config.setdefault("index_graph", False)

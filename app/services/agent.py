@@ -31,6 +31,7 @@ from app.services.memory import get_checkpointer, validate_chat_thread_id
 from app.services.agent_execution import invoke_agent, validate_runtime_config, check_agent_input
 from app.services.multi_query import multi_query_hybrid_search
 from app.services.r2_storage import r2_storage_service
+from app.services.retrieval_service import query_graph_rag_dual_layer
 from app.services.retriever import hybrid_search
 from app.services.thread_service import format_thread_assets_context, get_thread_assets_with_signed_urls
 
@@ -209,41 +210,46 @@ async def retrieve_node(state: AgentState, config: RunnableConfig) -> dict[str, 
                     break
     retrieval_mode = (retrieval_mode or "hybrid").lower().strip()
 
-    # 1. Knowledge Graph mode
+    # 1. Knowledge Graph mode (Dual-Layer: Thread workspace + Global user fallback)
     if retrieval_mode in ("lightrag", "graph", "knowledge_graph"):
         try:
-            workspace = thread_workspace(user_id, thread_id) if thread_id else user_workspace(user_id)
-            rag_provider = await get_provider("lightrag", workspace=workspace)
-            graph_res = await rag_provider.query(
-                RetrievalQuery(query=query_text, mode=selected_provider.mode if selected_provider.mode in {"mix", "local", "global", "hybrid", "naive"} else "mix", top_k=selected_provider.top_k)
+            mode_param = selected_provider.mode if selected_provider.mode in {"mix", "local", "global", "hybrid", "naive"} else "mix"
+            formatted_context, graph_sources_raw = await query_graph_rag_dual_layer(
+                user_id=user_id,
+                query=query_text,
+                mode=mode_param,
+                top_k=selected_provider.top_k,
+                thread_id=thread_id,
             )
-            if not graph_res.context:
+            if not formatted_context:
                 return {
                     "rag_context": None,
                     "rag_sources": [],
                     "thread_assets": thread_assets,
                     "thread_assets_context": thread_assets_context,
+                    "knowledge_base_context": kb_context,
                 }
             graph_sources = [
                 {
                     "source_id": idx,
                     "document_id": None,
-                    "chunk_id": chunk.chunk_id,
-                    "filename": "Knowledge Graph",
-                    "section": None,
-                    "preview": chunk.content[:150],
-                    "content": chunk.content,
+                    "chunk_id": item.get("chunk_id"),
+                    "filename": item.get("source", "Knowledge Graph"),
+                    "section": item.get("scope"),
+                    "preview": item.get("preview", ""),
+                    "content": item.get("content", ""),
                     "view_url": None,
                     "download_url": None,
-                    "metadata": chunk.metadata,
+                    "metadata": item.get("metadata", {}),
                 }
-                for idx, chunk in enumerate(graph_res.chunks, 1)
+                for idx, item in enumerate(graph_sources_raw, 1)
             ]
             return {
-                "rag_context": graph_res.context,
+                "rag_context": formatted_context,
                 "rag_sources": graph_sources,
                 "thread_assets": thread_assets,
                 "thread_assets_context": thread_assets_context,
+                "knowledge_base_context": kb_context,
             }
         except Exception as exc:
             logger.error("Error during LightRAG retrieval in retrieve_node: %s", exc, exc_info=True)

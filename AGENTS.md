@@ -9,7 +9,12 @@ The current supported capabilities are exposed by `GET /api/v1/workflows/capabil
 - Eight node types execute today. `parallel`, `subgraph`, static fan-out, and JSONPath routing are rejected before saving/running; their schemas reserve future features.
 - Runs use internal `workflow:` checkpoint identities and immutable graph snapshots. Chat cannot use this reserved namespace. Approval payloads are persisted; deadlines are checked on resume. Legacy paused runs without snapshots must be restarted.
 - Agent tools execute in a bounded model/tool loop. Structured JSON and guardrail output checks run before protected SSE responses are emitted; these responses buffer the final answer. Unsupported provider, memory, fusion, and tool-override settings fail explicitly.
-- Knowledge ingestion, storage, and retrieval support both **User Global Scope** and **Thread Scoped Isolation**. Documents can be uploaded globally or scoped to a conversation thread (`threads/{thread_id}/`). Retrieval employs dual-layer scoping (thread documents + user global documents fallback) with strict cross-thread isolation. Knowledge attaches to retrieve nodes and is available to agent models via modular RAG research tools (`hybrid_document_search`, `graph_rag_search`, `multi_query_search`) with available document inventory injected into prompt context. Upload `index_graph=true` to request LightRAG indexing, with provider readiness exposed in document details.
+- Knowledge ingestion, storage, and retrieval support both **User Global Scope** and **Thread Scoped Isolation** managed by a centralized `retrieval_service`:
+  - Four explicit retrieval modes: `global_only` (default when no thread is supplied, strictly preventing thread document leakage), `thread_only` (strictly scoped to the active conversation), `thread_with_global` (active thread knowledge supplemented by global documents), and `all_user` (cross-thread admin/user search).
+  - Reciprocal Rank Fusion (RRF) and Multi-Query fusion award an active `thread_boost=0.05` bonus to conversation-specific chunks so they outrank generic global matches.
+  - Dual-layer LightRAG graph traversal (`query_graph_rag_dual_layer`) queries the thread workspace first, then seamlessly supplements with the user's global graph knowledge.
+  - Durable & lock-safe thread deletion coordinates with active background ingestion via PostgreSQL advisory locks (`document_lock`), aborts active `PARSING` jobs, verifies all external resources (PGVector, LightRAG, R2 documents, R2 media assets, LangGraph memory) are cleanly removed before deleting database records, and preserves records on external failure for safe retry.
+  - Workflow `retrieve` nodes support `"thread"`, `"user"`, and `"global"` knowledge scopes with strict cross-tenant ownership verification on `payload.thread_id`.
 - Code runs in a killable child process with a server-controlled module policy. This is **trusted-code execution**, not an operating-system sandbox for hostile code.
 - Run tests offline with `pytest`. Service-backed tests require `pytest --run-integration` and a disposable `TEST_DATABASE_URL`. Tests never initialize the configured application database implicitly.
 
@@ -118,6 +123,7 @@ Base-Agent/
 │   │   │   └── database_executor.py # Read-only parameterized SQL query runner
 │   │   ├── memory.py           # PostgreSQL checkpointer service (AsyncPostgresSaver)
 │   │   ├── thread_service.py   # Thread persistence, root user, and asset management
+│   │   ├── retrieval_service.py# Centralized RetrievalScope, scoped filtering, dual-layer LightRAG & RRF boosting
 │   │   ├── tools.py            # LangChain agent tool factory & backwards-compatible re-exports
 │   │   ├── rag_tools.py        # Modular RAG research tools (Exploitation & Exploration)
 │   │   ├── multi_query.py      # LLM query expansion & parallel cross-query RRF fusion
@@ -161,6 +167,7 @@ Base-Agent/
     ├── test_rag_tools.py       # Modular RAG research tools unit and integration tests
     ├── test_tools_api.py       # Tool Builder platform, executors, CRUD & workflow execution tests
     ├── test_taskiq.py          # Taskiq task queue and broker lifecycle tests
+    ├── test_thread_reliability.py # Thread knowledge reliability, scope isolation, dual-layer & durable deletion tests
     ├── test_workflow_compiler.py# Workflow topological validation & compiler tests
     ├── test_workflow_nodes.py  # Node builder unit tests (code sandboxing, chat, retrieval)
     └── test_workflows_api.py   # Workflow CRUD, execution & multi-tenant isolation tests
@@ -234,12 +241,14 @@ To avoid running duplicate connection pools and mismatched database drivers, bot
   - `execute_agent()` / `execute_workflow()`: Resumes state, executes nodes, writes new checkpoint.
   - `get_thread_messages()`: Fetches full message history directly from storage.
   - `delete_thread_memory()`: Drops all checkpoints for a thread upon user request.
-  - `delete_thread_cascade(db, thread_id, user_id)`: Atomic cascade purges all thread-scoped resources:
-    1. Vector chunks in PGVector (`delete_documents_by_metadata("document_id", ...)`)
-    2. LightRAG thread workspace (`thread_workspace(user_id, thread_id)`)
-    3. R2 raw files for thread documents and thread media assets
-    4. LangGraph checkpoint memory records
-    5. Thread database record (with SQL `ON DELETE CASCADE` to child tables)
+  - `delete_thread_cascade(db, thread_id, user_id)`: Durable, lock-safe cascade purging of all thread-scoped resources:
+    1. **Advisory Lock Coordination**: Acquires `document_lock` for all thread documents. If any document is actively `PARSING`, safely aborts it to `FAILED` with an explanation to avoid ingestion races.
+    2. **Vector Chunks**: Purges PGVector chunks via `delete_documents_by_metadata("document_id", ...)`.
+    3. **Knowledge Graph**: Purges LightRAG thread workspace (`thread_workspace(user_id, thread_id)`).
+    4. **Cloudflare R2 Objects**: Deletes raw files for both thread-scoped documents and thread media assets.
+    5. **LangGraph Checkpointer**: Purges checkpoints, checkpoint_blobs, and checkpoint_writes.
+    6. **Failure Resilience & Safety**: If any external service cleanup fails (R2, vector store, checkpointer), raises `RuntimeError` (HTTP 502 Bad Gateway) and **aborts without deleting the PostgreSQL Thread record**, preserving data so deletion can be retried safely without leaving orphaned resources.
+    7. **Thread Database Record**: Only after all external cleanup succeeds, deletes the `Thread` row (cascading in SQL to documents, chunks, and assets) and commits.
 
 ---
 
@@ -346,6 +355,19 @@ Rather than a rigid monolithic tool, **Deep Research** is an agentic pattern orc
 3. **Tier 3 (Workflow Engine Level)**:
    - **`ToolCallNode`**: Directly resolves and executes any RAG research tool by name (`hybrid_document_search`, `graph_rag_search`, `multi_query_search`) with argument normalization and retry backoff.
    - **`RetrieveNode`**: Configurable via `RetrieveNodeConfig.provider_name` (`"hybrid"`, `"lightrag"`, `"multi_query"`) with automatic workspace resolution (`user`, `thread`, `agent`, `global`).
+
+### 5. Centralized Retrieval Contract & Scope Architecture (`app/services/retrieval_service.py`)
+To prevent ad-hoc filter building across routes and tools, Base Agent centralizes all retrieval scoping, dual-layer graph queries, and RRF rank adjustments into a single authoritative service:
+
+| RetrievalScope | Description | Filter Expression |
+|---|---|---|
+| `GLOBAL_ONLY` | User global documents only (default when `thread_id` is omitted). Prevents thread documents from leaking into unscoped searches. | `user_id == user AND thread_id IS NULL` |
+| `THREAD_ONLY` | Documents strictly belonging to the active conversation thread. Requires `thread_id`. | `user_id == user AND thread_id == active_thread` |
+| `THREAD_WITH_GLOBAL` | Active thread documents prioritized, supplemented by user global documents. | `user_id == user AND (thread_id == active_thread OR thread_id IS NULL)` |
+| `ALL_USER` | Explicit cross-thread search spanning all documents owned by the user. | `user_id == user` |
+
+- **Reciprocal Rank Fusion (RRF) Thread Boost**: Chunks matching `active_thread_id` receive an additive `thread_boost=0.05` bonus, ensuring conversation-specific knowledge outranks generic global matches of equal textual relevance.
+- **Dual-Layer LightRAG Traversal (`query_graph_rag_dual_layer`)**: Traverses `thread_workspace(user_id, thread_id)` first, extracts thread-specific entity facts, then seamlessly queries `user_workspace(user_id)` as a fallback/supplement, deduplicating chunks and labeling contexts clearly.
 
 ---
 

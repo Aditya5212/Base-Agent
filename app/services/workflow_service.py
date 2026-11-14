@@ -322,6 +322,10 @@ async def execute_workflow(
             raise RuntimeError("Persistence is unavailable")
     except Exception as exc:
         raise HTTPException(status_code=503, detail="Workflow checkpointing is unavailable") from exc
+    if payload.thread_id and hasattr(session, "get"):
+        from app.services.thread_service import verify_thread_ownership
+        await verify_thread_ownership(session, payload.thread_id, user_id=user_id, allow_missing=True)
+
     run_id = uuid.uuid4()
     thread_id = payload.thread_id or f"wf_run_{run_id}"
     owner_key = hashlib.sha256(f"{user_id}:{workflow_id}".encode()).hexdigest()

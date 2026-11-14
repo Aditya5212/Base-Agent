@@ -2,6 +2,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from langchain_core.documents import Document
 from app.core.rag_config import get_rag_config
+from app.services.retrieval_service import RetrievalScope
 
 from app.services.workflow.nodes.chat import build_chat_node
 from app.services.workflow.nodes.code import build_code_node
@@ -105,11 +106,89 @@ async def test_retrieve_node_execution():
         mock_search.assert_awaited_once_with(
             query="Explain architecture",
             filter_dict={"user_id": "test_user"},
+            thread_id=None,
+            scope=RetrievalScope.GLOBAL_ONLY,
             config=get_rag_config(top_k_final=2, top_k_dense=20, top_k_sparse=20),
         )
         assert "Antigravity architecture guide" in res["variables"]["rag_context"]
         assert len(res["variables"]["rag_sources"]) == 2
         assert res["variables"]["rag_sources"][0]["source"] == "guide.md"
+
+
+@pytest.mark.asyncio
+async def test_retrieve_node_thread_scope():
+    retrieve_fn = build_retrieve_node(
+        node_id="ret_thread",
+        config_dict={
+            "query_template": "{{user_query}}",
+            "top_k": 3,
+            "workspace_type": "thread",
+            "output_variable": "rag_context",
+            "sources_variable": "rag_sources",
+        },
+    )
+
+    mock_docs = [
+        Document(
+            page_content="Thread-specific project requirements.",
+            metadata={"source": "spec.md", "is_thread_document": True},
+        ),
+    ]
+
+    with patch("app.services.workflow.nodes.retrieve.hybrid_search", new_callable=AsyncMock) as mock_search:
+        mock_search.return_value = mock_docs
+
+        state = {
+            "variables": {"user_query": "What are the specs?"},
+            "user_id": "user_alpha",
+            "thread_id": "conv-thread-99",
+            "node_history": [],
+        }
+
+        res = await retrieve_fn(state)
+        mock_search.assert_awaited_once_with(
+            query="What are the specs?",
+            filter_dict={"user_id": "user_alpha"},
+            thread_id="conv-thread-99",
+            scope=RetrievalScope.THREAD_WITH_GLOBAL,
+            config=get_rag_config(top_k_final=3, top_k_dense=20, top_k_sparse=20),
+        )
+        assert "Thread-specific project requirements" in res["variables"]["rag_context"]
+        assert "[Thread Doc]" in res["variables"]["rag_context"]
+        assert res["variables"]["rag_sources"][0]["is_thread_document"] is True
+
+
+@pytest.mark.asyncio
+async def test_retrieve_node_explicit_scope():
+    retrieve_fn = build_retrieve_node(
+        node_id="ret_explicit",
+        config_dict={
+            "query_template": "{{user_query}}",
+            "top_k": 5,
+            "scope": "thread_only",
+            "output_variable": "rag_context",
+            "sources_variable": "rag_sources",
+        },
+    )
+
+    with patch("app.services.workflow.nodes.retrieve.hybrid_search", new_callable=AsyncMock) as mock_search:
+        mock_search.return_value = []
+
+        state = {
+            "variables": {"user_query": "strictly thread"},
+            "user_id": "user_beta",
+            "thread_id": "thread-abc",
+            "node_history": [],
+        }
+
+        await retrieve_fn(state)
+        mock_search.assert_awaited_once_with(
+            query="strictly thread",
+            filter_dict={"user_id": "user_beta"},
+            thread_id="thread-abc",
+            scope=RetrievalScope.THREAD_ONLY,
+            config=get_rag_config(top_k_final=5, top_k_dense=20, top_k_sparse=20),
+        )
 
 
 @pytest.mark.asyncio
