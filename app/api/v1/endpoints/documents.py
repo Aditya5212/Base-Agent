@@ -37,7 +37,7 @@ from app.services.document_processor import process_document_pipeline
 from app.services.r2_storage import r2_storage_service
 from app.services.retriever import hybrid_search
 from app.services.text_splitter import split_markdown_document
-from app.services.thread_service import verify_thread_ownership
+from app.services.thread_service import verify_thread_admission, verify_thread_ownership
 from app.services.vector_store import delete_documents_by_metadata, index_documents
 from app.services.document_lock import document_lock
 
@@ -159,25 +159,34 @@ async def upload_document(
             detail="Storage upload failed. Please try again.",
         )
 
-    # Step 2: Record document in PostgreSQL with PARSING status
-    doc_record = Document(
-        id=doc_id,
-        user_id=effective_user_id,
-        thread_id=thread_id,
-        file_name=file_name,
-        r2_key=r2_key,
-        mime_type=content_type,
-        file_size=file_size,
-        status=DocumentStatus.PARSING,
-        indexing_config={"preset": preset, "index_graph": index_graph},
-        provider_status={"hybrid": "PARSING", **({"lightrag": "PARSING"} if index_graph else {})},
-    )
-    db.add(doc_record)
+    # Step 2: Atomic admission verification under shared lock & record document in PostgreSQL
     try:
+        if thread_id:
+            await verify_thread_admission(
+                db,
+                thread_id=thread_id,
+                user_id=effective_user_id,
+                is_admin=current_user.is_admin,
+                for_share=True,
+            )
+
+        doc_record = Document(
+            id=doc_id,
+            user_id=effective_user_id,
+            thread_id=thread_id,
+            file_name=file_name,
+            r2_key=r2_key,
+            mime_type=content_type,
+            file_size=file_size,
+            status=DocumentStatus.PARSING,
+            indexing_config={"preset": preset, "index_graph": index_graph},
+            provider_status={"hybrid": "PARSING", **({"lightrag": "PARSING"} if index_graph else {})},
+        )
+        db.add(doc_record)
         await db.commit()
     except Exception as db_exc:
         logger.error(
-            "Database commit failed after R2 upload; rolling back and cleaning up orphaned R2 file: %s",
+            "Admission check or database commit failed after R2 upload; rolling back and cleaning up orphaned R2 file: %s",
             db_exc,
             exc_info=True,
         )
@@ -186,6 +195,8 @@ async def upload_document(
             await r2_storage_service.delete_file(r2_key)
         except Exception as r2_cleanup_exc:
             logger.warning("Failed to clean up orphaned R2 file '%s': %s", r2_key, r2_cleanup_exc)
+        if isinstance(db_exc, HTTPException):
+            raise
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to persist document metadata in database.",
@@ -481,6 +492,7 @@ async def _reindex_document_locked(document_id, request, background_tasks, user_
     config = dict(doc.indexing_config or {})
     config["purge_graph"] = config.get("index_graph", False)
     config["preset"] = request.preset
+    config["pending_generation"] = str(uuid.uuid4())
     if request.index_graph is not None:
         config["index_graph"] = request.index_graph
     doc.indexing_config = config
@@ -591,6 +603,7 @@ async def _retry_document_locked(document_id, request, background_tasks, user_id
     config["preset"] = target_preset
     config["index_graph"] = target_index_graph
     config["purge_graph"] = target_index_graph
+    config["pending_generation"] = str(uuid.uuid4())
     doc.indexing_config = config
     doc.provider_status = {
         "hybrid": "PARSING",

@@ -4,13 +4,6 @@ import logging
 from typing import Any
 
 from app.core.rag.factory import get_provider
-from app.core.rag.protocols import RetrievalQuery
-from app.core.rag.workspace import (
-    agent_workspace,
-    global_workspace,
-    thread_workspace,
-    user_workspace,
-)
 from app.core.rag_config import get_rag_config
 from app.schemas.workflow import RetrieveNodeConfig
 from app.services.multi_query import multi_query_hybrid_search
@@ -23,19 +16,6 @@ from app.services.retriever import hybrid_search
 from app.services.workflow.state import WorkflowState, render_template
 
 logger = logging.getLogger(__name__)
-
-
-def _resolve_workspace(workspace_type: str, user_id: str, state: WorkflowState) -> str:
-    """Resolves the tenant workspace identifier for graph/knowledge isolation."""
-    if workspace_type == "thread":
-        thread_id = str(state.get("thread_id") or "default")
-        return thread_workspace(user_id, thread_id)
-    if workspace_type == "agent":
-        agent_id = str(state.get("agent_id") or "default")
-        return agent_workspace(user_id, agent_id)
-    if workspace_type == "global":
-        return global_workspace()
-    return user_workspace(user_id)
 
 
 def build_retrieve_node(node_id: str, config_dict: dict[str, Any]) -> Any:
@@ -52,6 +32,12 @@ def build_retrieve_node(node_id: str, config_dict: dict[str, Any]) -> Any:
         raise ValueError(f"Unsupported retrieval provider '{config.provider_name}'")
     if config.workspace_type not in ("user", "thread", "global"):
         raise ValueError(f"Unsupported knowledge scope '{config.workspace_type}'")
+    if config.provider_name in ("lightrag", "graph", "knowledge_graph") and config.scope == "all_user":
+        raise ValueError(
+            "Knowledge graph retrieval (LightRAG) does not support 'all_user' cross-thread scope. "
+            "LightRAG workspaces are isolated per thread and user. Please specify 'global_only', "
+            "'thread_only', or 'thread_with_global', or use hybrid search for cross-thread queries."
+        )
 
     async def retrieve_handler(state: WorkflowState) -> dict[str, Any]:
         logger.debug(
@@ -77,8 +63,6 @@ def build_retrieve_node(node_id: str, config_dict: dict[str, Any]) -> Any:
         else:
             resolved_scope = RetrievalScope.THREAD_WITH_GLOBAL if effective_thread_id else RetrievalScope.GLOBAL_ONLY
 
-        workspace = _resolve_workspace(config.workspace_type, user_id, state)
-
         variables = dict(state.get("variables") or {})
         history = list(state.get("node_history") or [])
         history.append(node_id)
@@ -96,37 +80,17 @@ def build_retrieve_node(node_id: str, config_dict: dict[str, Any]) -> Any:
             # 1. LightRAG Knowledge Graph Provider
             # ---------------------------------------------------------------
             if provider in ("lightrag", "graph", "knowledge_graph"):
-                if effective_thread_id and resolved_scope == RetrievalScope.THREAD_WITH_GLOBAL:
-                    formatted_context, sources = await query_graph_rag_dual_layer(
-                        query=rendered_query,
-                        user_id=user_id,
-                        thread_id=effective_thread_id,
-                        top_k=config.top_k,
-                        mode="mix",
-                        provider_getter=get_provider,
-                    )
-                    variables[config.output_variable] = formatted_context
-                    variables[config.sources_variable] = sources
-                else:
-                    rag_provider = await get_provider("lightrag", workspace=workspace)
-                    retrieval_query = RetrievalQuery(
-                        query=rendered_query,
-                        top_k=config.top_k,
-                        mode="mix",
-                    )
-                    res = await rag_provider.query(retrieval_query)
-                    formatted_context = res.context.strip() if res.context else ""
-                    sources = [
-                        {
-                            "index": idx,
-                            "source": chunk.source,
-                            "chunk_id": chunk.chunk_id,
-                            "metadata": chunk.metadata,
-                        }
-                        for idx, chunk in enumerate(res.chunks, 1)
-                    ]
-                    variables[config.output_variable] = formatted_context
-                    variables[config.sources_variable] = sources
+                formatted_context, sources = await query_graph_rag_dual_layer(
+                    user_id=user_id,
+                    query=rendered_query,
+                    mode="mix",
+                    top_k=config.top_k,
+                    thread_id=effective_thread_id,
+                    scope=resolved_scope,
+                    provider_getter=get_provider,
+                )
+                variables[config.output_variable] = formatted_context
+                variables[config.sources_variable] = sources
 
             # ---------------------------------------------------------------
             # 2. Multi-Query Exploration Provider (Agent-Provided Queries)

@@ -174,7 +174,7 @@ Interactive Swagger UI is available at `http://localhost:8000/docs`.
 | `GET` | `/api/v1/chat/{thread_id}/assets` | List uploaded images & documents in thread with signed URLs |
 | `GET` | `/api/v1/chat/{thread_id}/details` | Get thread metadata, ownership, and active assets |
 | `GET` | `/api/v1/chat/{thread_id}/history` | Retrieve stored conversation history |
-| `DELETE` | `/api/v1/chat/{thread_id}` | Durable cascade clear thread: aborts active ingestion, purges memory/checkpoints, thread-scoped documents in R2/PGVector/LightRAG, and thread media assets (preserves records on external failure for safe retry) |
+| `DELETE` | `/api/v1/chat/{thread_id}` | Durable cascade clear thread: locks thread `FOR UPDATE`, atomically enumerates docs/assets under lock and marks `DELETING` (blocking concurrent uploads with `FOR SHARE` / HTTP 409), aborts active ingestion workers, detects lock contention, purges memory/checkpoints, thread-scoped documents in R2/PGVector/LightRAG, and thread media assets (preserves records on external failure for safe retry) |
 
 ### Knowledge Base Management (`/api/v1/documents`)
 | Method | Endpoint | Description |

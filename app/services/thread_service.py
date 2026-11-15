@@ -47,11 +47,12 @@ async def get_or_create_thread(
     user_id: str = "root",
     title: str | None = None,
     is_admin: bool = False,
+    check_deleting: bool = True,
 ) -> Thread:
     """Retrieves an existing conversation thread or creates a new one bound to user_id.
 
     If the thread already exists, verifies ownership so one tenant cannot post into
-    another tenant's thread.
+    another tenant's thread. Rejects access if the thread is currently being deleted.
     """
     if thread_id.startswith("workflow:"):
         raise HTTPException(status_code=422, detail="Reserved workflow checkpoint namespace")
@@ -72,11 +73,17 @@ async def get_or_create_thread(
         db.add(thread)
         await db.commit()
         await db.refresh(thread)
-    elif thread.user_id != user_id and not is_admin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail=f"Access denied: Conversation thread '{thread_id}' belongs to user '{thread.user_id}'.",
-        )
+    else:
+        if thread.user_id != user_id and not is_admin:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=f"Access denied: Conversation thread '{thread_id}' belongs to user '{thread.user_id}'.",
+            )
+        if check_deleting and (thread.metadata_json or {}).get("status") == "DELETING":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Conversation thread '{thread_id}' is currently being deleted.",
+            )
     return thread
 
 
@@ -86,16 +93,30 @@ async def verify_thread_ownership(
     user_id: str,
     is_admin: bool = False,
     allow_missing: bool = False,
+    check_deleting: bool = True,
+    for_share: bool = False,
+    for_update: bool = False,
 ) -> Thread | None:
     """Verifies that the thread exists and is accessible by user_id.
 
     Raises:
         HTTPException(404) if the thread does not exist (unless is_admin or allow_missing is True).
         HTTPException(403) if the thread belongs to another user.
+        HTTPException(409) if the thread is currently marked DELETING.
     """
     if thread_id.startswith("workflow:"):
         raise HTTPException(status_code=422, detail="Reserved workflow checkpoint namespace")
-    thread = await db.get(Thread, thread_id)
+
+    thread = None
+    if (for_share or for_update) and hasattr(db, "get"):
+        opts = {"read": True} if for_share else True
+        try:
+            thread = await db.get(Thread, thread_id, with_for_update=opts)
+        except (TypeError, Exception):
+            thread = await db.get(Thread, thread_id)
+    else:
+        thread = await db.get(Thread, thread_id)
+
     if not thread:
         if allow_missing or is_admin:
             return None
@@ -103,10 +124,45 @@ async def verify_thread_ownership(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Conversation thread '{thread_id}' not found.",
         )
-    if thread.user_id != user_id and not is_admin:
+    if hasattr(thread, "user_id") and isinstance(thread.user_id, str) and thread.user_id != user_id and not is_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Access denied: Conversation thread '{thread_id}' belongs to user '{thread.user_id}'.",
+        )
+    meta = getattr(thread, "metadata_json", None) or {}
+    if check_deleting and isinstance(meta, dict) and meta.get("status") == "DELETING":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Conversation thread '{thread_id}' is currently being deleted.",
+        )
+    return thread
+
+
+async def verify_thread_admission(
+    db: AsyncSession,
+    thread_id: str,
+    user_id: str,
+    is_admin: bool = False,
+    for_share: bool = True,
+) -> Thread:
+    """Atomically validates thread accessibility and ensures the thread is not currently DELETING.
+
+    Acquires a PostgreSQL row-level shared lock (`FOR SHARE`) when `for_share=True` to serialize
+    with concurrent `delete_thread_cascade` transactions (`FOR UPDATE`).
+    """
+    thread = await verify_thread_ownership(
+        db,
+        thread_id=thread_id,
+        user_id=user_id,
+        is_admin=is_admin,
+        allow_missing=False,
+        check_deleting=True,
+        for_share=for_share,
+    )
+    if not thread:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Conversation thread '{thread_id}' not found.",
         )
     return thread
 
@@ -123,7 +179,7 @@ async def add_thread_asset(
     metadata: dict[str, Any] | None = None,
 ) -> ThreadAsset:
     """Registers an uploaded image or document to a specific conversation thread."""
-    await get_or_create_thread(db, thread_id=thread_id, user_id=user_id)
+    thread = await verify_thread_admission(db, thread_id=thread_id, user_id=user_id, for_share=True)
 
     if not asset_type:
         asset_type = "image" if mime_type.startswith("image/") else "document"
@@ -142,11 +198,9 @@ async def add_thread_asset(
     db.add(asset)
 
     # Update thread assets counter and timestamp
-    thread = await db.get(Thread, thread_id)
-    if thread:
-        meta = dict(thread.metadata_json or {})
-        meta["assets_count"] = meta.get("assets_count", 0) + 1
-        thread.metadata_json = meta
+    meta = dict(getattr(thread, "metadata_json", None) or {})
+    meta["assets_count"] = meta.get("assets_count", 0) + 1
+    thread.metadata_json = meta
 
     await db.commit()
     await db.refresh(asset)
@@ -245,17 +299,35 @@ async def delete_thread_cascade(db: AsyncSession, thread_id: str, user_id: str) 
     from app.services.memory import delete_thread_memory
     from app.services.vector_store import delete_documents_by_metadata
 
-    thread = await db.get(Thread, thread_id)
+    # 1. Acquire exclusive FOR UPDATE lock on the Thread record to serialize with concurrent uploads
+    try:
+        thread = await db.get(Thread, thread_id, with_for_update=True)
+    except (TypeError, Exception):
+        thread = await db.get(Thread, thread_id)
+
     if not thread:
         logger.info("Thread '%s' already does not exist; deletion idempotent.", thread_id)
         return True
 
+    # Mark thread as DELETING immediately to block concurrent chat, uploads, and workers
+    meta = dict(getattr(thread, "metadata_json", None) or {})
+    meta["status"] = "DELETING"
+    thread.metadata_json = meta
+
     cleanup_errors: list[str] = []
 
-    # 1. Fetch thread-scoped documents
+    # 2. Enumerate thread-scoped documents while holding the exclusive lock
     doc_stmt = select(Document).where(Document.thread_id == thread_id)
     doc_res = await db.execute(doc_stmt)
-    thread_docs = doc_res.scalars().all()
+    thread_docs = list(doc_res.scalars().all())
+
+    # 3. Enumerate thread assets while holding the exclusive lock
+    asset_stmt = select(ThreadAsset).where(ThreadAsset.thread_id == thread_id)
+    asset_res = await db.execute(asset_stmt)
+    thread_assets = list(asset_res.scalars().all())
+
+    # Commit status = DELETING and release row lock now that all documents and assets are enumerated
+    await db.commit()
 
     for doc in thread_docs:
         doc_id_str = str(doc.id)
@@ -279,14 +351,15 @@ async def delete_thread_cascade(db: AsyncSession, thread_id: str, user_id: str) 
                         logger.error("Failed to purge vector chunks for thread doc %s: %s", doc_id_str, exc)
                         cleanup_errors.append(f"Vector chunks for doc {doc_id_str}: {exc}")
 
-                    # B. Purge LightRAG entries
+                    # B. Purge LightRAG entries (treat failure as cleanup error)
                     try:
                         from app.core.rag.factory import get_provider
                         from app.core.rag.workspace import thread_workspace
                         lightrag_provider = await get_provider("lightrag", thread_workspace(user_id, thread_id))
                         await lightrag_provider.delete_document(doc_id_str)
                     except Exception as exc:
-                        logger.debug("LightRAG thread cleanup skipped for doc %s: %s", doc_id_str, exc)
+                        logger.error("LightRAG thread cleanup failed for doc %s: %s", doc_id_str, exc)
+                        cleanup_errors.append(f"LightRAG graph cleanup for doc {doc_id_str}: {exc}")
 
                     # C. Delete raw document from R2
                     if doc.r2_key:
@@ -299,22 +372,10 @@ async def delete_thread_cascade(db: AsyncSession, thread_id: str, user_id: str) 
             await asyncio.sleep(0.5)
 
         if not acquired:
-            logger.warning("Could not acquire lock for document %s during thread deletion; proceeding with best effort", doc_id_str)
-            try:
-                await delete_documents_by_metadata("document_id", doc_id_str)
-            except Exception as exc:
-                cleanup_errors.append(f"Vector chunks for doc {doc_id_str}: {exc}")
-            if doc.r2_key:
-                try:
-                    await r2_storage_service.delete_file(doc.r2_key)
-                except Exception as exc:
-                    cleanup_errors.append(f"R2 file for doc {doc_id_str} ({doc.r2_key}): {exc}")
+            logger.warning("Could not acquire lock for document %s during thread deletion; lock is busy", doc_id_str)
+            cleanup_errors.append(f"Document {doc_id_str} is busy in active ingestion; lock could not be acquired")
 
-    # 2. Fetch thread assets and delete from R2
-    asset_stmt = select(ThreadAsset).where(ThreadAsset.thread_id == thread_id)
-    asset_res = await db.execute(asset_stmt)
-    thread_assets = asset_res.scalars().all()
-
+    # 3. Delete thread media assets from R2
     for asset in thread_assets:
         if asset.r2_key:
             try:
@@ -323,14 +384,16 @@ async def delete_thread_cascade(db: AsyncSession, thread_id: str, user_id: str) 
                 logger.error("Failed to delete R2 file for thread asset %s: %s", asset.id, exc)
                 cleanup_errors.append(f"R2 asset {asset.id} ({asset.r2_key}): {exc}")
 
-    # 3. Purge checkpointer memory
+    # 4. Purge checkpointer memory (verify boolean return value)
     try:
-        await delete_thread_memory(thread_id)
+        mem_ok = await delete_thread_memory(thread_id)
+        if not mem_ok:
+            cleanup_errors.append(f"Checkpointer memory deletion failed for thread {thread_id}")
     except Exception as exc:
         logger.error("Failed to delete thread memory for thread %s: %s", thread_id, exc)
         cleanup_errors.append(f"Thread memory: {exc}")
 
-    # 4. Check for cleanup failures. If any occurred, DO NOT delete DB record!
+    # 5. Check for cleanup failures. If any occurred, DO NOT delete DB record!
     if cleanup_errors:
         err_detail = "; ".join(cleanup_errors)
         logger.error(
@@ -340,7 +403,7 @@ async def delete_thread_cascade(db: AsyncSession, thread_id: str, user_id: str) 
         )
         raise RuntimeError(f"Thread cleanup failed ({err_detail}). Records preserved for retry.")
 
-    # 5. Delete thread record from DB (cascades to remaining DB records)
+    # 6. Delete thread record from DB (cascades to remaining DB records)
     await db.delete(thread)
     await db.commit()
     logger.info("Thread %s and all associated assets/documents cleanly deleted.", thread_id)

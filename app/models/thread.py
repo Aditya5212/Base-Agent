@@ -33,6 +33,16 @@ class Thread(Base, TimestampMixin):
     is_pinned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     is_archived: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
+    @property
+    def status(self) -> str:
+        return (self.metadata_json or {}).get("status", "ACTIVE")
+
+    @status.setter
+    def status(self, value: str) -> None:
+        meta = dict(self.metadata_json or {})
+        meta["status"] = value
+        self.metadata_json = meta
+
     user: Mapped["User"] = relationship("User", back_populates="threads")
     assets: Mapped[list["ThreadAsset"]] = relationship(
         "ThreadAsset",

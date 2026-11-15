@@ -20,4 +20,5 @@ ENV/
 *.log
 data/
 .pytest_cache/
+.pytest_temp/
 *.pdf

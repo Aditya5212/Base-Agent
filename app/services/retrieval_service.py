@@ -46,20 +46,24 @@ def resolve_retrieval_scope(
     - If thread_id is supplied and thread_scoped_only is True: THREAD_ONLY.
     - If thread_id is supplied and thread_scoped_only is False: THREAD_WITH_GLOBAL.
     """
-    if scope:
+    if scope is not None:
         resolved = None
         if isinstance(scope, str):
             try:
                 resolved = RetrievalScope(scope.strip().lower())
             except ValueError:
-                logger.warning("Unrecognized retrieval scope '%s'; falling back to default", scope)
+                valid_scopes = [s.value for s in RetrievalScope]
+                raise ValueError(
+                    f"Invalid retrieval scope '{scope}'. Must be one of: {valid_scopes}"
+                )
         elif isinstance(scope, RetrievalScope):
             resolved = scope
+        else:
+            raise ValueError(f"Invalid retrieval scope type: {type(scope).__name__}")
 
-        if resolved is not None:
-            if resolved in (RetrievalScope.THREAD_ONLY, RetrievalScope.THREAD_WITH_GLOBAL) and not thread_id:
-                raise ValueError(f"RetrievalScope '{resolved.value}' requires a valid thread_id")
-            return resolved
+        if resolved in (RetrievalScope.THREAD_ONLY, RetrievalScope.THREAD_WITH_GLOBAL) and not thread_id:
+            raise ValueError(f"RetrievalScope '{resolved.value}' requires a valid thread_id")
+        return resolved
 
     if thread_id:
         return RetrievalScope.THREAD_ONLY if thread_scoped_only else RetrievalScope.THREAD_WITH_GLOBAL
@@ -148,6 +152,14 @@ async def query_graph_rag_dual_layer(
     """
     getter = provider_getter or get_provider
     active_scope = resolve_retrieval_scope(scope=scope, thread_id=thread_id)
+
+    if active_scope == RetrievalScope.ALL_USER:
+        raise ValueError(
+            "Knowledge graph retrieval (LightRAG) does not support 'all_user' cross-thread scope. "
+            "LightRAG workspaces are isolated per thread and user. Please specify 'global_only', "
+            "'thread_only', or 'thread_with_global', or use hybrid search for cross-thread queries."
+        )
+
     retrieval_query = RetrievalQuery(
         query=query,
         top_k=top_k,
@@ -159,7 +171,10 @@ async def query_graph_rag_dual_layer(
     sources: list[dict[str, Any]] = []
 
     # 1. Thread workspace query (if applicable)
-    if thread_id and active_scope in (RetrievalScope.THREAD_ONLY, RetrievalScope.THREAD_WITH_GLOBAL):
+    if thread_id and active_scope in (
+        RetrievalScope.THREAD_ONLY,
+        RetrievalScope.THREAD_WITH_GLOBAL,
+    ):
         try:
             ws_thread = thread_workspace(user_id, thread_id)
             thread_provider = await getter("lightrag", workspace=ws_thread)
@@ -182,7 +197,7 @@ async def query_graph_rag_dual_layer(
                 raise RuntimeError(f"Thread knowledge graph query failed: {exc}") from exc
 
     # 2. Global user workspace query (if applicable)
-    if active_scope in (RetrievalScope.GLOBAL_ONLY, RetrievalScope.THREAD_WITH_GLOBAL, RetrievalScope.ALL_USER):
+    if active_scope in (RetrievalScope.GLOBAL_ONLY, RetrievalScope.THREAD_WITH_GLOBAL):
         try:
             ws_global = user_workspace(user_id)
             user_provider = await getter("lightrag", workspace=ws_global)

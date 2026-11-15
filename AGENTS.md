@@ -12,9 +12,14 @@ The current supported capabilities are exposed by `GET /api/v1/workflows/capabil
 - Knowledge ingestion, storage, and retrieval support both **User Global Scope** and **Thread Scoped Isolation** managed by a centralized `retrieval_service`:
   - Four explicit retrieval modes: `global_only` (default when no thread is supplied, strictly preventing thread document leakage), `thread_only` (strictly scoped to the active conversation), `thread_with_global` (active thread knowledge supplemented by global documents), and `all_user` (cross-thread admin/user search).
   - Reciprocal Rank Fusion (RRF) and Multi-Query fusion award an active `thread_boost=0.05` bonus to conversation-specific chunks so they outrank generic global matches.
-  - Dual-layer LightRAG graph traversal (`query_graph_rag_dual_layer`) queries the thread workspace first, then seamlessly supplements with the user's global graph knowledge.
-  - Durable & lock-safe thread deletion coordinates with active background ingestion via PostgreSQL advisory locks (`document_lock`), aborts active `PARSING` jobs, verifies all external resources (PGVector, LightRAG, R2 documents, R2 media assets, LangGraph memory) are cleanly removed before deleting database records, and preserves records on external failure for safe retry.
-  - Workflow `retrieve` nodes support `"thread"`, `"user"`, and `"global"` knowledge scopes with strict cross-tenant ownership verification on `payload.thread_id`.
+  - Dual-layer LightRAG graph traversal (`query_graph_rag_dual_layer`) queries the thread workspace first, then seamlessly supplements with the user's global graph knowledge; explicitly rejects `all_user` cross-thread scope (supported via hybrid/vector search) to reflect LightRAG's per-thread workspace isolation.
+  - Durable & lock-safe thread deletion coordinates with active uploads and background ingestion via PostgreSQL row locks (`with_for_update` vs `FOR SHARE` admission lock), advisory locks (`document_lock`), and persisted `DELETING` status:
+    1. Acquires exclusive `FOR UPDATE` lock on `Thread` and atomically sets `status = "DELETING"` AND enumerates all documents and assets under that same lock before committing, closing the concurrency window with in-flight uploads.
+    2. Concurrent uploads perform atomic admission under `FOR SHARE` (`verify_thread_admission`), aborting with HTTP 409 Conflict and deleting any uploaded R2 file if the thread is marked `DELETING`.
+    3. Background document ingestion workers detect `DELETING` status at task start and chunk activation boundaries, aborting immediately to `FAILED` with an explanatory message.
+    4. Busy lock detection: if `document_lock` cannot be acquired due to active workers, deletion records are preserved for retry and HTTP 502 returned.
+    5. Verifies all external resources (PGVector chunks, LightRAG graph entities, R2 documents, R2 media assets, LangGraph memory) are cleanly removed before deleting database records, preserving records on external failure for safe retry via `DELETE` endpoint (`check_deleting=False`).
+  - Workflow `retrieve` nodes unify all providers (`hybrid`, `lightrag`, `multi_query`) under the single `RetrievalScope` contract, resolving graph workspaces strictly through authenticated user scopes rather than unauthenticated global namespaces.
 - Code runs in a killable child process with a server-controlled module policy. This is **trusted-code execution**, not an operating-system sandbox for hostile code.
 - Run tests offline with `pytest`. Service-backed tests require `pytest --run-integration` and a disposable `TEST_DATABASE_URL`. Tests never initialize the configured application database implicitly.
 
@@ -242,13 +247,16 @@ To avoid running duplicate connection pools and mismatched database drivers, bot
   - `get_thread_messages()`: Fetches full message history directly from storage.
   - `delete_thread_memory()`: Drops all checkpoints for a thread upon user request.
   - `delete_thread_cascade(db, thread_id, user_id)`: Durable, lock-safe cascade purging of all thread-scoped resources:
-    1. **Advisory Lock Coordination**: Acquires `document_lock` for all thread documents. If any document is actively `PARSING`, safely aborts it to `FAILED` with an explanation to avoid ingestion races.
-    2. **Vector Chunks**: Purges PGVector chunks via `delete_documents_by_metadata("document_id", ...)`.
-    3. **Knowledge Graph**: Purges LightRAG thread workspace (`thread_workspace(user_id, thread_id)`).
-    4. **Cloudflare R2 Objects**: Deletes raw files for both thread-scoped documents and thread media assets.
-    5. **LangGraph Checkpointer**: Purges checkpoints, checkpoint_blobs, and checkpoint_writes.
-    6. **Failure Resilience & Safety**: If any external service cleanup fails (R2, vector store, checkpointer), raises `RuntimeError` (HTTP 502 Bad Gateway) and **aborts without deleting the PostgreSQL Thread record**, preserving data so deletion can be retried safely without leaving orphaned resources.
-    7. **Thread Database Record**: Only after all external cleanup succeeds, deletes the `Thread` row (cascading in SQL to documents, chunks, and assets) and commits.
+    1. **Row Lock & Atomic Enumeration**: Acquires `SELECT ... FOR UPDATE` on `Thread` and atomically marks `thread.status = "DELETING"` AND enumerates all documents and media assets within the same locked transaction before committing, closing the concurrency window with in-flight uploads.
+    2. **Atomic Upload Admission**: In-flight uploads perform admission checks under `SELECT ... FOR SHARE` (`verify_thread_admission`). If deletion acquired the lock first, uploads wait and then abort with HTTP 409 Conflict, immediately cleaning up any uploaded R2 files.
+    3. **Worker Coordination & Advisory Locks**: Coordinates via `document_lock` for all thread documents. If any document is actively `PARSING`, safely aborts it to `FAILED`. If a lock is busy and cannot be acquired after retries, records the lock contention as a cleanup error.
+    4. **Ingestion Task Termination**: Background ingestion tasks (`process_document_pipeline`) check parent thread status both at pipeline start and at the chunk activation boundary, safely aborting to `FAILED` if the thread is `DELETING`.
+    5. **Vector Chunks**: Purges PGVector chunks via `delete_documents_by_metadata("document_id", ...)`.
+    6. **Knowledge Graph**: Purges LightRAG thread workspace (`thread_workspace(user_id, thread_id)`). Exceptions are treated as cleanup errors.
+    7. **Cloudflare R2 Objects**: Deletes raw files for both thread-scoped documents and thread media assets.
+    8. **LangGraph Checkpointer**: Purges checkpoints, checkpoint_blobs, and checkpoint_writes. Verifies boolean return value; failures are treated as cleanup errors.
+    9. **Failure Resilience & Safety**: If any external service cleanup fails (busy lock, R2, vector store, graph, checkpointer), raises `RuntimeError` (HTTP 502 Bad Gateway) and **aborts without deleting the PostgreSQL Thread record**, preserving data so deletion can be retried safely (`check_deleting=False` on the DELETE endpoint).
+    10. **Thread Database Record**: Only after all external cleanup succeeds, deletes the `Thread` row (cascading in SQL to documents, chunks, and assets) and commits.
 
 ---
 

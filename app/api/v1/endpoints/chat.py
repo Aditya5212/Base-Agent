@@ -284,6 +284,7 @@ async def upload_thread_asset(
         user_id=effective_user_id,
         is_admin=current_user.is_admin,
         allow_missing=True,
+        check_deleting=True,
     )
     # Stream the upload in chunks and enforce size limit before sending to R2,
     # avoiding reading an arbitrarily large file into memory all at once.
@@ -325,15 +326,28 @@ async def upload_thread_asset(
             detail="Storage upload failed. Please try again.",
         )
 
-    asset = await add_thread_asset(
-        db=db,
-        thread_id=thread_id,
-        user_id=effective_user_id,
-        file_name=file_name,
-        r2_key=r2_key,
-        mime_type=content_type,
-        file_size=len(contents),
-    )
+    try:
+        asset = await add_thread_asset(
+            db=db,
+            thread_id=thread_id,
+            user_id=effective_user_id,
+            file_name=file_name,
+            r2_key=r2_key,
+            mime_type=content_type,
+            file_size=len(contents),
+        )
+    except Exception as exc:
+        logger.error("Failed to add thread asset to database after R2 upload: %s", exc)
+        try:
+            await r2_storage_service.delete_file(r2_key)
+        except Exception as r2_cleanup_exc:
+            logger.warning("Failed to clean up orphaned R2 asset '%s': %s", r2_key, r2_cleanup_exc)
+        if isinstance(exc, HTTPException):
+            raise
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to register thread asset in database.",
+        )
 
     presigned_url = await r2_storage_service.generate_presigned_url(r2_key)
 
@@ -366,6 +380,7 @@ async def list_thread_assets(
         user_id=current_user.user_id,
         is_admin=current_user.is_admin,
         allow_missing=True,
+        check_deleting=True,
     )
     raw_assets = await get_thread_assets_with_signed_urls(thread_id, db=db)
     return [ThreadAssetItem(**a) for a in raw_assets]
@@ -423,6 +438,7 @@ async def get_history(
         user_id=current_user.user_id,
         is_admin=current_user.is_admin,
         allow_missing=True,
+        check_deleting=True,
     )
     try:
         raw_messages = await get_thread_messages(thread_id)
@@ -459,6 +475,7 @@ async def clear_memory(
         user_id=current_user.user_id,
         is_admin=current_user.is_admin,
         allow_missing=True,
+        check_deleting=False,
     )
     try:
         success = await delete_thread_cascade(db, thread_id=thread_id, user_id=current_user.user_id)

@@ -53,12 +53,23 @@ async def process_document_pipeline(
             if doc.user_id != user_id or doc.r2_key != r2_key:
                 raise ValueError("Document task does not match stored owner/source")
             effective_thread_id = thread_id if thread_id is not None else getattr(doc, "thread_id", None)
+            if effective_thread_id:
+                from app.models.thread import Thread
+                th = await session.get(Thread, effective_thread_id)
+                if th is None or (getattr(th, "metadata_json", None) or {}).get("status") == "DELETING":
+                    logger.info("Aborting ingestion for document %s: thread %s is deleted or deleting", parsed_id, effective_thread_id)
+                    doc.status = DocumentStatus.FAILED
+                    doc.error_message = "Aborted: Parent thread is being deleted."
+                    await session.commit()
+                    return 0
+
             config = dict(doc.indexing_config or {})
             config.setdefault("preset", preset)
             config.setdefault("index_graph", False)
             graph_ready = not config["index_graph"] or (doc.provider_status or {}).get("lightrag") == "INDEXED"
-            if not is_reindex and doc.status == DocumentStatus.INDEXED and graph_ready:
-                return (await session.execute(select(func.count(DocumentChunk.id)).where(DocumentChunk.document_id == parsed_id))).scalar_one()
+            if doc.status == DocumentStatus.INDEXED and graph_ready:
+                if not config.get("pending_generation") or config.get("pending_generation") == config.get("active_generation"):
+                    return (await session.execute(select(func.count(DocumentChunk.id)).where(DocumentChunk.document_id == parsed_id))).scalar_one()
             if not config.get("pending_generation") or config.get("pending_generation") == config.get("active_generation"):
                 config["pending_generation"] = str(uuid.uuid4())
             doc.indexing_config = config
@@ -126,6 +137,18 @@ async def _index_document(
     if config["index_graph"]:
         statuses["lightrag"] = "PARSING"
     async with async_session_factory() as session:
+        if thread_id:
+            from app.models.thread import Thread
+            th = await session.get(Thread, thread_id)
+            if th is None or (getattr(th, "metadata_json", None) or {}).get("status") == "DELETING":
+                logger.info("Aborting chunk activation for document %s: thread %s is deleted or deleting", parsed_id, thread_id)
+                doc = await session.get(Document, parsed_id)
+                if doc:
+                    doc.status = DocumentStatus.FAILED
+                    doc.error_message = "Aborted: Parent thread is being deleted."
+                    await session.commit()
+                return 0
+
         await session.execute(delete(DocumentChunk).where(DocumentChunk.document_id == parsed_id))
         for idx, chunk in enumerate(chunks):
             session.add(DocumentChunk(id=uuid.UUID(chunk.metadata["chunk_id"]), document_id=parsed_id,

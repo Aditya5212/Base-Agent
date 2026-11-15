@@ -58,6 +58,15 @@ def test_resolve_retrieval_scope_requires_thread():
         resolve_retrieval_scope("thread_with_global", thread_id=None)
 
 
+def test_resolve_retrieval_scope_rejects_invalid_scope():
+    # Invalid scope string must raise ValueError explicitly rather than falling back
+    with pytest.raises(ValueError, match="Invalid retrieval scope 'invalid_custom_scope'"):
+        resolve_retrieval_scope("invalid_custom_scope", thread_id="t1")
+
+    with pytest.raises(ValueError, match="Invalid retrieval scope"):
+        resolve_retrieval_scope("", thread_id="t1")
+
+
 # ==============================================================================
 # 2. Filter Scoping & Boundary Isolation (Thread A vs Thread B vs Global)
 # ==============================================================================
@@ -294,9 +303,10 @@ async def test_durable_thread_deletion_preserves_records_on_r2_failure():
         with pytest.raises(RuntimeError, match="Records preserved for retry"):
             await delete_thread_cascade(mock_db, thread_id=thread_id, user_id=user_id)
 
-        # Database record must NOT have been deleted
+        # Database record must NOT have been deleted; thread marked DELETING
         mock_db.delete.assert_not_called()
-        mock_db.commit.assert_not_called()
+        assert mock_thread.status == "DELETING"
+        mock_db.commit.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -343,9 +353,9 @@ async def test_durable_thread_deletion_succeeds_when_external_services_ok():
         success = await delete_thread_cascade(mock_db, thread_id=thread_id, user_id=user_id)
         assert success is True
 
-        # Database record cleanly deleted and committed
+        # Database record cleanly deleted and committed (DELETING commit + delete commit)
         mock_db.delete.assert_called_once_with(mock_thread)
-        mock_db.commit.assert_called_once()
+        assert mock_db.commit.call_count == 2
 
 
 # ==============================================================================
@@ -397,3 +407,356 @@ async def test_thread_deletion_aborts_active_ingestion():
         # Document status must have been transitioned to FAILED
         assert mock_doc.status == DocumentStatus.FAILED
         assert "Thread deleted during active ingestion" in mock_doc.error_message
+
+
+@pytest.mark.asyncio
+async def test_durable_thread_deletion_fails_when_lock_busy():
+    thread_id = "thread_lock_busy"
+    user_id = "user_busy"
+
+    mock_thread = Thread(id=thread_id, user_id=user_id, title="Busy Thread")
+    mock_doc = DBDocument(
+        id=uuid.uuid4(),
+        thread_id=thread_id,
+        user_id=user_id,
+        file_name="busy.pdf",
+        r2_key="documents/user_busy/threads/thread_lock_busy/busy.pdf",
+        status=DocumentStatus.INDEXED,
+    )
+
+    mock_db = AsyncMock()
+    mock_db.get.return_value = mock_thread
+
+    mock_doc_result = MagicMock()
+    mock_doc_result.scalars.return_value.all.return_value = [mock_doc]
+
+    mock_asset_result = MagicMock()
+    mock_asset_result.scalars.return_value.all.return_value = []
+
+    mock_db.execute.side_effect = [mock_doc_result, mock_asset_result]
+
+    with patch("app.services.r2_storage.r2_storage_service.delete_file", new_callable=AsyncMock) as mock_r2_del, \
+         patch("app.services.vector_store.delete_documents_by_metadata", new_callable=AsyncMock) as mock_vec_del, \
+         patch("app.services.memory.delete_thread_memory", new_callable=AsyncMock) as mock_mem_del, \
+         patch("app.core.rag.factory.get_provider", new_callable=AsyncMock) as mock_get_prov, \
+         patch("app.services.document_lock.document_lock") as mock_lock, \
+         patch("asyncio.sleep", new_callable=AsyncMock):
+
+        # Advisory lock cannot be acquired (busy in ingestion)
+        mock_ctx = AsyncMock()
+        mock_ctx.__aenter__.return_value = False
+        mock_ctx.__aexit__.return_value = None
+        mock_lock.return_value = mock_ctx
+
+        with pytest.raises(RuntimeError, match="lock could not be acquired"):
+            await delete_thread_cascade(mock_db, thread_id=thread_id, user_id=user_id)
+
+        # Database record must NOT have been deleted; records preserved for retry
+        mock_db.delete.assert_not_called()
+        assert mock_thread.status == "DELETING"
+
+
+@pytest.mark.asyncio
+async def test_durable_thread_deletion_fails_when_memory_delete_returns_false():
+    thread_id = "thread_mem_fail"
+    user_id = "user_mem"
+
+    mock_thread = Thread(id=thread_id, user_id=user_id, title="Mem Thread")
+
+    mock_db = AsyncMock()
+    mock_db.get.return_value = mock_thread
+
+    mock_doc_result = MagicMock()
+    mock_doc_result.scalars.return_value.all.return_value = []
+
+    mock_asset_result = MagicMock()
+    mock_asset_result.scalars.return_value.all.return_value = []
+
+    mock_db.execute.side_effect = [mock_doc_result, mock_asset_result]
+
+    with patch("app.services.memory.delete_thread_memory", new_callable=AsyncMock) as mock_mem_del:
+        mock_mem_del.return_value = False  # Checkpointer memory deletion failed
+
+        with pytest.raises(RuntimeError, match="Checkpointer memory deletion failed"):
+            await delete_thread_cascade(mock_db, thread_id=thread_id, user_id=user_id)
+
+        mock_db.delete.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_durable_thread_deletion_fails_when_graph_cleanup_raises():
+    thread_id = "thread_graph_fail"
+    user_id = "user_graph"
+
+    mock_thread = Thread(id=thread_id, user_id=user_id, title="Graph Thread")
+    mock_doc = DBDocument(
+        id=uuid.uuid4(),
+        thread_id=thread_id,
+        user_id=user_id,
+        file_name="graph.pdf",
+        r2_key="documents/user_graph/threads/thread_graph_fail/graph.pdf",
+        status=DocumentStatus.INDEXED,
+    )
+
+    mock_db = AsyncMock()
+    mock_db.get.return_value = mock_thread
+
+    mock_doc_result = MagicMock()
+    mock_doc_result.scalars.return_value.all.return_value = [mock_doc]
+
+    mock_asset_result = MagicMock()
+    mock_asset_result.scalars.return_value.all.return_value = []
+
+    mock_db.execute.side_effect = [mock_doc_result, mock_asset_result]
+
+    with patch("app.services.r2_storage.r2_storage_service.delete_file", new_callable=AsyncMock), \
+         patch("app.services.vector_store.delete_documents_by_metadata", new_callable=AsyncMock), \
+         patch("app.services.memory.delete_thread_memory", new_callable=AsyncMock) as mock_mem_del, \
+         patch("app.core.rag.factory.get_provider", new_callable=AsyncMock) as mock_get_prov, \
+         patch("app.services.document_lock.document_lock") as mock_lock:
+
+        mock_ctx = AsyncMock()
+        mock_ctx.__aenter__.return_value = True
+        mock_ctx.__aexit__.return_value = None
+        mock_lock.return_value = mock_ctx
+        mock_mem_del.return_value = True
+
+        mock_provider = AsyncMock()
+        mock_provider.delete_document.side_effect = Exception("Graph node purge failed")
+        mock_get_prov.return_value = mock_provider
+
+        with pytest.raises(RuntimeError, match="LightRAG graph cleanup"):
+            await delete_thread_cascade(mock_db, thread_id=thread_id, user_id=user_id)
+
+        mock_db.delete.assert_not_called()
+
+
+# ==============================================================================
+# 7. Persisted DELETING State Enforces Boundaries
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_verify_thread_ownership_blocks_deleting_thread():
+    from fastapi import HTTPException
+    from app.services.thread_service import verify_thread_ownership
+
+    thread_id = "thread_is_deleting"
+    user_id = "user_test"
+
+    deleting_thread = Thread(
+        id=thread_id,
+        user_id=user_id,
+        title="Deleting Thread",
+        metadata_json={"status": "DELETING"},
+    )
+
+    mock_db = AsyncMock()
+    mock_db.get.return_value = deleting_thread
+
+    # Standard call with check_deleting=True must raise 409 Conflict
+    with pytest.raises(HTTPException) as exc_info:
+        await verify_thread_ownership(mock_db, thread_id=thread_id, user_id=user_id, check_deleting=True)
+    assert exc_info.value.status_code == 409
+    assert "currently being deleted" in exc_info.value.detail
+
+    # Retry call with check_deleting=False allows accessing the thread
+    res = await verify_thread_ownership(mock_db, thread_id=thread_id, user_id=user_id, check_deleting=False)
+    assert res == deleting_thread
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_thread_blocks_deleting_thread():
+    from fastapi import HTTPException
+    from app.services.thread_service import get_or_create_thread
+
+    thread_id = "thread_is_deleting_chat"
+    user_id = "user_test"
+
+    deleting_thread = Thread(
+        id=thread_id,
+        user_id=user_id,
+        title="Deleting Thread Chat",
+        metadata_json={"status": "DELETING"},
+    )
+
+    mock_db = AsyncMock()
+    mock_db.get.return_value = deleting_thread
+
+    with patch("app.services.thread_service.get_or_create_user", new_callable=AsyncMock):
+        with pytest.raises(HTTPException) as exc_info:
+            await get_or_create_thread(mock_db, thread_id=thread_id, user_id=user_id)
+        assert exc_info.value.status_code == 409
+        assert "currently being deleted" in exc_info.value.detail
+
+
+# ==============================================================================
+# 8. Graph ALL_USER Scope Rejection & LightRAG Boundary Enforcement
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_query_graph_rag_dual_layer_rejects_all_user():
+    # Knowledge graph traversal (LightRAG) does not support all_user cross-thread scope
+    with pytest.raises(ValueError, match="does not support 'all_user' cross-thread scope"):
+        await query_graph_rag_dual_layer(
+            user_id="user_cross",
+            query="cross query",
+            thread_id="thread_cross",
+            scope=RetrievalScope.ALL_USER,
+        )
+
+
+def test_workflow_retrieve_node_rejects_lightrag_all_user():
+    from app.services.workflow.nodes.retrieve import build_retrieve_node
+
+    with pytest.raises(ValueError, match="does not support 'all_user' cross-thread scope"):
+        build_retrieve_node(
+            node_id="ret_graph",
+            config_dict={
+                "provider_name": "lightrag",
+                "scope": "all_user",
+            },
+        )
+
+
+# ==============================================================================
+# 9. Concurrency: Atomic Admission & R2 Cleanup on DELETING Thread Overlap
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_upload_document_aborts_and_cleans_up_r2_when_thread_is_deleting():
+    import io
+    from fastapi import HTTPException, UploadFile
+    from starlette.requests import Request
+    from app.api.v1.endpoints.documents import upload_document
+    from app.core.auth import UserContext
+
+    thread_id = "thread_deleting_upload"
+    user_id = "user_test"
+
+    mock_db = AsyncMock()
+    deleting_thread = Thread(
+        id=thread_id,
+        user_id=user_id,
+        metadata_json={"status": "DELETING"},
+    )
+    mock_db.get.return_value = deleting_thread
+
+    fake_file = UploadFile(
+        filename="test.md",
+        file=io.BytesIO(b"# Hello World"),
+        headers={"content-type": "text/markdown"},
+    )
+    mock_request = Request({"type": "http", "method": "POST", "path": "/api/v1/documents/upload", "headers": [], "client": ("127.0.0.1", 12345)})
+    mock_bg = MagicMock()
+    current_user = UserContext(user_id=user_id, role="user", is_admin=False)
+
+    with patch("app.api.v1.endpoints.documents.r2_storage_service.upload_file", new_callable=AsyncMock), \
+         patch("app.api.v1.endpoints.documents.r2_storage_service.delete_file", new_callable=AsyncMock) as mock_r2_del, \
+         patch("app.api.v1.endpoints.documents.verify_thread_ownership", new_callable=AsyncMock):
+
+        with pytest.raises(HTTPException) as exc_info:
+            await upload_document(
+                request=mock_request,
+                background_tasks=mock_bg,
+                file=fake_file,
+                thread_id=thread_id,
+                preset="balanced",
+                current_user=current_user,
+                db=mock_db,
+            )
+
+        assert exc_info.value.status_code == 409
+        assert "currently being deleted" in exc_info.value.detail
+        mock_r2_del.assert_called_once()
+        mock_db.commit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_upload_thread_asset_cleans_up_r2_when_thread_is_deleting():
+    import io
+    from fastapi import HTTPException, UploadFile
+    from starlette.requests import Request
+    from app.api.v1.endpoints.chat import upload_thread_asset
+    from app.core.auth import UserContext
+
+    thread_id = "thread_deleting_asset"
+    user_id = "user_test"
+
+    mock_db = AsyncMock()
+    deleting_thread = Thread(
+        id=thread_id,
+        user_id=user_id,
+        metadata_json={"status": "DELETING"},
+    )
+    mock_db.get.return_value = deleting_thread
+
+    fake_file = UploadFile(
+        filename="photo.png",
+        file=io.BytesIO(b"fake image bytes"),
+        headers={"content-type": "image/png"},
+    )
+    mock_request = Request({"type": "http", "method": "POST", "path": "/api/v1/chat/threads/assets", "headers": [], "client": ("127.0.0.1", 12345)})
+    current_user = UserContext(user_id=user_id, role="user", is_admin=False)
+
+    with patch("app.api.v1.endpoints.chat.r2_storage_service.upload_file", new_callable=AsyncMock), \
+         patch("app.api.v1.endpoints.chat.r2_storage_service.delete_file", new_callable=AsyncMock) as mock_r2_del, \
+         patch("app.api.v1.endpoints.chat.verify_thread_ownership", new_callable=AsyncMock):
+
+        with pytest.raises(HTTPException) as exc_info:
+            await upload_thread_asset(
+                request=mock_request,
+                file=fake_file,
+                thread_id=thread_id,
+                current_user=current_user,
+                db=mock_db,
+            )
+
+        assert exc_info.value.status_code == 409
+        assert "currently being deleted" in exc_info.value.detail
+        mock_r2_del.assert_called_once()
+        mock_db.commit.assert_not_called()
+
+
+# ==============================================================================
+# 9. Workflow Retrieve Node Unification Across Providers
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_workflow_retrieve_node_lightrag_routes_through_dual_layer():
+    from app.core.rag.factory import get_provider
+    from app.services.workflow.nodes.retrieve import build_retrieve_node
+
+    retrieve_fn = build_retrieve_node(
+        node_id="ret_graph",
+        config_dict={
+            "provider_name": "lightrag",
+            "query_template": "{{user_query}}",
+            "top_k": 4,
+            "workspace_type": "thread",
+            "output_variable": "graph_context",
+            "sources_variable": "graph_sources",
+        },
+    )
+
+    with patch("app.services.workflow.nodes.retrieve.query_graph_rag_dual_layer", new_callable=AsyncMock) as mock_graph:
+        mock_graph.return_value = ("Unified Graph Facts", [{"chunk_id": "c1", "source": "spec.md"}])
+
+        state = {
+            "variables": {"user_query": "Explain system architecture"},
+            "user_id": "wf_user",
+            "thread_id": "conv-thread-100",
+            "node_history": [],
+        }
+
+        res = await retrieve_fn(state)
+        mock_graph.assert_awaited_once_with(
+            user_id="wf_user",
+            query="Explain system architecture",
+            mode="mix",
+            top_k=4,
+            thread_id="conv-thread-100",
+            scope=RetrievalScope.THREAD_WITH_GLOBAL,
+            provider_getter=get_provider,
+        )
+        assert res["variables"]["graph_context"] == "Unified Graph Facts"
+        assert len(res["variables"]["graph_sources"]) == 1
