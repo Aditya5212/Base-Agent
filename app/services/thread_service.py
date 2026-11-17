@@ -107,13 +107,10 @@ async def verify_thread_ownership(
     if thread_id.startswith("workflow:"):
         raise HTTPException(status_code=422, detail="Reserved workflow checkpoint namespace")
 
-    thread = None
-    if (for_share or for_update) and hasattr(db, "get"):
-        opts = {"read": True} if for_share else True
-        try:
-            thread = await db.get(Thread, thread_id, with_for_update=opts)
-        except (TypeError, Exception):
-            thread = await db.get(Thread, thread_id)
+    if for_share:
+        thread = await db.get(Thread, thread_id, with_for_update={"read": True})
+    elif for_update:
+        thread = await db.get(Thread, thread_id, with_for_update=True)
     else:
         thread = await db.get(Thread, thread_id)
 
@@ -300,10 +297,7 @@ async def delete_thread_cascade(db: AsyncSession, thread_id: str, user_id: str) 
     from app.services.vector_store import delete_documents_by_metadata
 
     # 1. Acquire exclusive FOR UPDATE lock on the Thread record to serialize with concurrent uploads
-    try:
-        thread = await db.get(Thread, thread_id, with_for_update=True)
-    except (TypeError, Exception):
-        thread = await db.get(Thread, thread_id)
+    thread = await db.get(Thread, thread_id, with_for_update=True)
 
     if not thread:
         logger.info("Thread '%s' already does not exist; deletion idempotent.", thread_id)

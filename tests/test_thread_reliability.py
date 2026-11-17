@@ -358,6 +358,78 @@ async def test_durable_thread_deletion_succeeds_when_external_services_ok():
         assert mock_db.commit.call_count == 2
 
 
+@pytest.mark.asyncio
+async def test_durable_thread_deletion_retry_after_failure_succeeds():
+    """Verifies that after an external service failure preserves records, a subsequent retry cleanly deletes them."""
+    thread_id = "thread_del_retry"
+    user_id = "user_retry"
+
+    mock_thread = Thread(id=thread_id, user_id=user_id, title="Retry Thread", metadata_json={"status": "ACTIVE"})
+    mock_doc = DBDocument(
+        id=uuid.uuid4(),
+        thread_id=thread_id,
+        user_id=user_id,
+        file_name="doc.pdf",
+        r2_key="documents/user_retry/threads/thread_del_retry/doc.pdf",
+        status=DocumentStatus.INDEXED,
+    )
+
+    mock_db = AsyncMock()
+    mock_db.get.return_value = mock_thread
+
+    mock_doc_result1 = MagicMock()
+    mock_doc_result1.scalars.return_value.all.return_value = [mock_doc]
+    mock_asset_result1 = MagicMock()
+    mock_asset_result1.scalars.return_value.all.return_value = []
+
+    mock_doc_result2 = MagicMock()
+    mock_doc_result2.scalars.return_value.all.return_value = [mock_doc]
+    mock_asset_result2 = MagicMock()
+    mock_asset_result2.scalars.return_value.all.return_value = []
+
+    # Sequence of statement results for attempt 1 and attempt 2
+    mock_db.execute.side_effect = [
+        mock_doc_result1, mock_asset_result1,
+        mock_doc_result2, mock_asset_result2,
+    ]
+
+    with patch("app.services.r2_storage.r2_storage_service.delete_file", new_callable=AsyncMock) as mock_r2_del, \
+         patch("app.services.vector_store.delete_documents_by_metadata", new_callable=AsyncMock) as mock_vec_del, \
+         patch("app.services.memory.delete_thread_memory", new_callable=AsyncMock) as mock_mem_del, \
+         patch("app.core.rag.factory.get_provider", new_callable=AsyncMock) as mock_get_prov, \
+         patch("app.services.document_lock.document_lock") as mock_lock:
+
+        mock_ctx = AsyncMock()
+        mock_ctx.__aenter__.return_value = True
+        mock_ctx.__aexit__.return_value = None
+        mock_lock.return_value = mock_ctx
+
+        mock_vec_del.return_value = 1
+        mock_mem_del.return_value = True
+
+        # Attempt 1: External R2 failure
+        mock_r2_del.side_effect = RuntimeError("R2 Storage 503 Outage")
+        with pytest.raises(RuntimeError, match="Records preserved for retry"):
+            await delete_thread_cascade(mock_db, thread_id=thread_id, user_id=user_id)
+
+        # Database record must NOT be deleted yet, but status must be DELETING
+        mock_db.delete.assert_not_called()
+        assert mock_thread.status == "DELETING"
+        assert mock_db.commit.call_count == 1
+
+        # Attempt 2: R2 service recovered
+        mock_r2_del.side_effect = None
+        mock_r2_del.return_value = True
+
+        success = await delete_thread_cascade(mock_db, thread_id=thread_id, user_id=user_id)
+        assert success is True
+
+        # Now database record is cleanly deleted
+        mock_db.delete.assert_called_once_with(mock_thread)
+        # Total commits: attempt 1 DELETING commit + attempt 2 DELETING commit + attempt 2 delete commit
+        assert mock_db.commit.call_count == 3
+
+
 # ==============================================================================
 # 6. Concurrency Coordination: Deletion during Active Document Ingestion
 # ==============================================================================

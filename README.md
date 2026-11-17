@@ -213,6 +213,7 @@ Interactive Swagger UI is available at `http://localhost:8000/docs`.
 ### Dynamic Workflow Engine & Execution (`/api/v1/workflows`)
 | Method | Endpoint | Description |
 |---|---|---|
+| `GET` | `/api/v1/workflows/capabilities` | Returns supported node types, capabilities, and execution limits |
 | `POST` | `/api/v1/workflows` | Registers workflow with node & edge graph after topological validation |
 | `GET` | `/api/v1/workflows` | Lists user workflows with pagination and search |
 | `GET` | `/api/v1/workflows/{workflow_id}` | Retrieves graph topology, nodes, edges, and validation schemas |
@@ -223,6 +224,27 @@ Interactive Swagger UI is available at `http://localhost:8000/docs`.
 | `GET` | `/api/v1/workflows/{workflow_id}/runs` | Lists historical runs and outcomes for a workflow |
 | `GET` | `/api/v1/workflows/runs/{run_id}` | Inspects status, execution traces, node history, and error logs |
 | `POST` | `/api/v1/workflows/runs/{run_id}/resume` | Resumes an INTERRUPTED workflow with human decision input |
+
+### Dynamic Tool Builder (`/api/v1/tools`)
+| Method | Endpoint | Description |
+|---|---|---|
+| `GET` | `/api/v1/tools` | Lists user's custom tools with pagination and search |
+| `POST` | `/api/v1/tools` | Creates a custom tool (`http`, `code`, or `database`) with encrypted config |
+| `GET` | `/api/v1/tools/system` | Lists built-in system tools (`calculator`, `datetime`, `modular_rag`) |
+| `GET` | `/api/v1/tools/{tool_id}` | Retrieves tool definition and masked configuration |
+| `PUT` | `/api/v1/tools/{tool_id}` | Updates tool configuration, re-validates schemas, increments version |
+| `DELETE` | `/api/v1/tools/{tool_id}` | Deletes custom tool definition |
+| `POST` | `/api/v1/tools/{tool_id}/test` | Direct test execution of tool with runtime payload |
+
+### User Management (`/api/v1/users`)
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/api/v1/users` | Creates a new user record |
+| `GET` | `/api/v1/users` | Lists users (admin only) |
+| `GET` | `/api/v1/users/me` | Retrieves profile of currently authenticated user |
+| `GET` | `/api/v1/users/{user_id}` | Retrieves user profile by ID |
+| `PATCH` | `/api/v1/users/{user_id}` | Updates user profile or active status |
+| `DELETE` | `/api/v1/users/{user_id}` | Cascades deletion of user, threads, documents, workflows, and tools |
 
 ### Object Storage Management (`/api/v1/storage` — Admin Only)
 | Method | Endpoint | Description |
@@ -242,16 +264,19 @@ Interactive Swagger UI is available at `http://localhost:8000/docs`.
 The Workflow Engine (`app/services/workflow/`) translates declarative JSON graphs into LangGraph `StateGraph(WorkflowState)` state machines.
 
 ### Supported Node Types:
+Eight node types execute today (verified by `GET /api/v1/workflows/capabilities`):
 1. **`start`**: Ingests runtime inputs, validates against optional `input_schema`, and initializes default variables.
 2. **`end`**: Terminal exit node. Validates outputs against optional `output_schema` and returns the designated `response_variable`.
 3. **`chat`**: Invokes LLM with template-interpolated prompts (`{{variables.name}}`), conversation memory, and `ModelRetry`/`ModelFallback` middlewares.
-4. **`retrieve`**: Multi-tenant hybrid knowledge search querying PostgreSQL PGVector HNSW and FTS with citations.
+4. **`retrieve`**: Multi-tenant hybrid knowledge search querying PostgreSQL PGVector HNSW and FTS with citations (supports `global_only`, `thread_only`, `thread_with_global`, and `all_user`).
 5. **`conditional`**: Dynamic branch routing evaluating AST expressions, variable comparisons, regex, or fallback paths.
-6. **`code`**: Sandboxed Python script execution with AST forbidden call/import guards and execution timeouts.
+6. **`code`**: Trusted Python script execution in a dedicated child process with module whitelist and execution timeouts.
 7. **`human_approval`**: Human-in-the-loop review triggering LangGraph `interrupt()`, paused until resumed via API.
-8. **`tool_call`**: Invokes built-in tools (`calculator`, `datetime`) or hybrid search with retry and error catching.
-9. **`subgraph`**: Invokes another workflow as a child routine.
-10. **`parallel`**: Concurrently triggers multiple nodes with `wait_all` merging.
+8. **`tool_call`**: Invokes built-in tools (`calculator`, `datetime`), custom dynamic tools (`http`, `code`, `database`), or hybrid search with retry and error catching.
+
+*Reserved schema nodes (rejected until implemented in Phase 5 Orchestration):*
+- **`subgraph`**: Child workflow execution routine.
+- **`parallel`**: Concurrent node execution with fan-out/fan-in merge.
 
 ---
 

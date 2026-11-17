@@ -1,21 +1,61 @@
-# Base Agent — Future Enhancements & TODO
+# Base Agent — Architectural Roadmap & Enhancements
 
-This document tracks planned architectural enhancements, future infrastructure upgrades, and optimizations for Base Agent across upcoming development phases.
+This document tracks completed milestones, architectural capabilities, and the upcoming phased roadmap for Base Agent.
 
 ---
 
-## 🔍 Search & Retrieval Upgrades
+## 🚀 Execution Phases & Priority Order
 
-### 1. Upgrade Postgres FTS to ParadeDB (`pg_search`) Native BM25
+| Order | Phase | Concrete Deliverables | Status |
+|---|---|---|---|
+| **Phase 1** | **Thread Knowledge Reliability & Locking Stabilization** | Row-locked thread admission (`FOR SHARE`) and deletion (`FOR UPDATE`), atomic R2 upload rollback on 409, busy lock detection, retry preservation, LightRAG `all_user` rejection, comprehensive integration & offline tests | ✅ **Complete & Verified** |
+| **Phase 2 (Next)** | **Execution Visibility & Control** | Per-node execution records, timings, errors, tool calls, token usage, state inspection API (`GET /api/v1/workflows/runs/{run_id}`), overall run timeout, cancellation support (`POST /api/v1/workflows/runs/{run_id}/cancel`), correlation IDs, CI test setup | ⏳ **Ready to Implement** |
+| **Phase 3** | **Versioning Foundation** | Immutable agent, workflow, dynamic tool, and JSON schema revisions; pinned dependencies; version history, diffing, and rollback | 📅 Planned |
+| **Phase 4** | **Builder Frontend MVP** | Next.js agent editor, chat and thread-isolated document management, live dynamic tool testing, workflow run viewer, and React Flow visual graph editor for verified node types | 📅 Planned |
+| **Phase 5** | **Advanced Orchestration** | Subgraphs, parallel execution with deterministic merge behavior, error routing branches, and multi-agent supervisor workflows | 📅 Planned |
+| **Phase 6** | **Publishing & Deployment Readiness** | Verified production auth/RBAC (Clerk/OIDC), published REST endpoints, API keys, quota management, worker health monitoring, checkpoint retention, and disaster recovery | 📅 Planned |
+| **Phase 7** | **Expansion & Optimization** | Webhooks, cron schedules, template marketplace, JSON/YAML import/export, ParadeDB BM25 search, cross-encoder reranking, multimodal OCR parsing | 📅 Planned |
+
+---
+
+## ✅ Completed Milestones
+
+### 1. Thread Knowledge Reliability & Concurrency Serialization (Phase 1)
+- **Shared vs Exclusive Row Locks**:
+  - `verify_thread_admission(db, thread_id, user_id, for_share=True)` acquires `SELECT ... FOR SHARE` on `Thread`, serializing concurrent uploads and rejecting threads marked `DELETING` with HTTP 409 Conflict.
+  - `delete_thread_cascade(db, thread_id, user_id)` acquires `SELECT ... FOR UPDATE` on `Thread`, atomically sets `status = "DELETING"` AND enumerates all documents and media assets within the same locked transaction before committing, closing concurrency windows with in-flight uploads.
+  - Eliminated all catch-all exception handlers that retried reads without locks.
+- **Atomic Two-Phase R2 Rollback**:
+  - If thread admission fails or thread is `DELETING`, document upload (`/api/v1/documents/upload`) and thread asset upload (`/api/v1/chat/{thread_id}/assets`) immediately delete the uploaded R2 object and abort before database record creation.
+- **Background Worker & Lock Coordination**:
+  - Background document ingestion pipeline (`process_document_pipeline`) detects `DELETING` status at task start and chunk activation boundaries, aborting immediately to `FAILED`.
+  - Advisory locks (`document_lock`) coordinate deletion with active workers. If locks are busy or external cleanups fail, thread database records are preserved for safe retry via the `DELETE` endpoint (`check_deleting=False`).
+- **Scope Contract Integrity**:
+  - `query_graph_rag_dual_layer` and workflow `retrieve` nodes explicitly reject `RetrievalScope.ALL_USER` with `ValueError`, enforcing LightRAG's per-workspace isolation model while supporting cross-thread search via PGVector/FTS hybrid search.
+- **Regression Verification**:
+  - 170 passed offline tests, 0 failures.
+  - 3 disposable PostgreSQL integration tests verifying row-level lock serialization, ingestion termination on `DELETING`, and retry preservation.
+
+### 2. Custom Dynamic Tool Builder Platform (Phase 3 Roadmap Core)
+- **Database Persistence**: `tools` table supporting `HTTP`, `CODE`, and `DATABASE` tool types with Fernet-encrypted configuration and credentials.
+- **Dynamic Compilation**: `ToolRegistry` caching compiled LangChain `BaseTool` instances with runtime-synthesized Pydantic input schemas.
+- **Executors**:
+  - `HTTPExecutor`: Async `httpx.AsyncClient` with variable interpolation (`{{variables.name}}`), auth headers, and timeout handling.
+  - `CodeExecutor`: Python execution in isolated child processes with AST safety analysis, module whitelist, and process reaping on timeout.
+  - `DatabaseExecutor`: Read-only parameterized SQL query execution.
+- **Testing & Tool CRUD**: Live testing endpoints (`POST /api/v1/tools/{id}/test`), system tool registration, and agent/workflow tool attachment.
+
+---
+
+## 🔍 Search & Retrieval Upgrades (Phase 7 Roadmap)
+
+### 3. Upgrade Postgres FTS to ParadeDB (`pg_search`) Native BM25
 - **Current State**: Using PostgreSQL native Full-Text Search (`tsvector` + GIN index + `plainto_tsquery` / `websearch_to_tsquery` with `ts_rank_cd`). This requires zero extra extensions, is 100% native to Neon, fully transactional, and performs well for 95% of RAG use cases.
 - **Future Upgrade Trigger**: If users report that exact keyword lookups (e.g. specific alphanumeric error codes, part numbers, exact code snippets) require true BM25 scoring curves rather than standard TF-IDF `ts_rank`.
 - **Implementation in Neon**:
-  Neon natively supports the ParadeDB `pg_search` extension:
   ```sql
-  -- 1. Enable extension in Neon
   CREATE EXTENSION IF NOT EXISTS pg_search;
 
-  -- 2. Create BM25 index on document_chunks table
   CALL paradedb.create_bm25(
       index_name => 'document_chunks_search_idx',
       table_name => 'document_chunks',
@@ -23,19 +63,10 @@ This document tracks planned architectural enhancements, future infrastructure u
       text_fields => paradedb.field('content')
   );
   ```
-- **Query Pattern in Python / SQLAlchemy**:
-  ```python
-  stmt = (
-      select(DocumentChunk)
-      .where(text("document_chunks @@@ :query"))
-      .order_by(text("paradedb.score(id) DESC"))
-      .limit(10)
-  )
-  ```
 
 ---
 
-### 2. Optional Cross-Encoder Re-Ranker
+### 4. Optional Cross-Encoder Re-Ranker
 - Add an optional post-retrieval neural re-ranking step after Reciprocal Rank Fusion (RRF):
   - Local cross-encoder (e.g. `flashrank` for zero-overhead, sub-50ms CPU re-ranking).
   - Hosted API re-ranker (e.g. Cohere Rerank or BGE Reranker).
@@ -43,39 +74,31 @@ This document tracks planned architectural enhancements, future infrastructure u
 
 ---
 
-### 3. Advanced Multimodal Parsing
+### 5. Advanced Multimodal Parsing
 - Enable MarkItDown's optional LLM-assisted image description / OCR pipeline for scanned PDFs or images containing complex diagrams.
 
 ---
 
-## 📊 Observability & Monitoring (Phase 7 Roadmap)
+## 📊 Observability & Monitoring Details (Execution Visibility & Phase 6)
 
-### 4. LangSmith Tracing & Evaluators
-- Fine-grained run tracing for LangGraph nodes (`retrieve_node`, `chat_node`).
+### 6. LangSmith Tracing & Evaluators
+- Fine-grained run tracing for LangGraph nodes (`retrieve_node`, `chat_node`, workflow nodes).
 - Token cost tracking, latency attribution, and automated LLM output evaluation datasets.
 
-### 5. OpenTelemetry & Prometheus Metrics
+### 7. OpenTelemetry & Prometheus Metrics
 - Standard OTel ASGI middleware exposing metrics (`/metrics`) for Prometheus scraping.
 - Histograms for LLM generation latency, retrieval timing, and embedding batch durations.
 
-### 6. Structured JSON Logging with Trace Correlation IDs
+### 8. Structured JSON Logging with Trace Correlation IDs
 - Standardized logging format with request trace IDs linking FastAPI HTTP requests, Taskiq background jobs, and LangGraph checkpoints.
 
-### 7. Sentry Error Tracking
+### 9. Sentry Error Tracking
 - Production exception tracking with unhandled error alerting and stack trace capture.
 
 ---
 
-## 🔐 Auth & Platform Features (Upcoming Phases)
+## 🔐 Auth & Platform Features (Phase 6 Roadmap)
 
-### 8. Production Clerk / OIDC Authentication
+### 10. Production Clerk / OIDC Authentication
 - Swap the header-based mock implementation in `app/core/auth.py` (`get_current_user`) for Clerk SDK JWT validation.
 - All downstream route signatures (`UserContext = Depends(get_current_user)`) remain 100% stable with zero endpoint refactoring required.
-
-### 9. Custom Tool Builder Platform (Phase 3 Roadmap)
-- Implement dynamic `tools` persistence table (id, user_id, name, description, type, input_schema, output_schema, config).
-- Build `ToolRegistry` caching compiled LangChain tools dynamically.
-- Implement HTTP/REST API tool executor using `httpx.AsyncClient` with auth credentials and response mapping.
-- Implement isolated Python code tool execution (subprocess sandbox).
-- Implement read-only SQL query tools for external databases.
-- Dynamic per-node knowledge base attachment API (`POST /workflows/{id}/nodes/{node_id}/knowledge`).
