@@ -28,7 +28,12 @@ from app.core.json_validation import validate_payload
 from app.services.schema_service import validate_json_schema
 from app.services.thread_service import get_or_create_user
 from app.services.workflow.compiler import WorkflowCompiler
-from app.services.workflow.tracing import set_execution_session, reset_execution_session
+from app.services.workflow.tracing import (
+    WorkflowCancelledError,
+    record_run_event,
+    reset_execution_session,
+    set_execution_session,
+)
 from app.services.workflow.validator import GraphValidationError, validate_workflow_graph
 
 logger = logging.getLogger(__name__)
@@ -271,14 +276,34 @@ def _record_execution_result(run: WorkflowRun, state: dict[str, Any], definition
     if interrupts:
         now = datetime.now(timezone.utc)
         entry["interrupts"] = []
+
+        def _get_val(it: Any) -> Any:
+            if hasattr(it, "value"):
+                return it.value
+            if isinstance(it, dict) and "value" in it:
+                return it["value"]
+            return it
+
         for item in interrupts:
-            value = getattr(item, "value", item)
+            value = _get_val(item)
             timeout = value.get("timeout_seconds", 86400) if isinstance(value, dict) else 86400
             entry["interrupts"].append({
-                "id": getattr(item, "id", None), "value": value,
+                "id": getattr(item, "id", None) or (item.get("id") if isinstance(item, dict) else None),
+                "value": value,
                 "expires_at": (now + timedelta(seconds=timeout)).isoformat(),
             })
-        run.status = "INTERRUPTED"
+
+        # Differentiate manual pause from approval requirements
+        is_manual_pause = any(
+            isinstance(i, dict) and isinstance(i.get("value"), dict) and i["value"].get("type") == "manual_pause"
+            for i in entry["interrupts"]
+        )
+        if is_manual_pause:
+            run.status = "PAUSED"
+            run.control_request = None
+        else:
+            run.status = "INTERRUPTED"
+
         run.output_data = None
         run.completed_at = None
     else:
@@ -384,8 +409,14 @@ async def execute_workflow(
             reset_execution_session(session_token)
 
     except GraphInterrupt as interrupt_exc:
-        logger.info("Workflow run '%s' was paused by human-in-the-loop interrupt", run_id)
+        logger.info("Workflow run '%s' was paused by interrupt", run_id)
         _record_execution_result(run, {"__interrupt__": interrupt_exc.args[0]}, definition)
+    except WorkflowCancelledError as cancel_exc:
+        logger.info("Workflow run '%s' was cancelled: %s", run_id, cancel_exc)
+        run.status = "CANCELLED"
+        run.control_request = None
+        run.completed_at = datetime.now(timezone.utc)
+        run.error_message = str(cancel_exc)
     except Exception as exc:
         logger.error("Workflow run '%s' execution failed: %s", run_id, exc, exc_info=True)
         run.status = "FAILED"
@@ -403,24 +434,26 @@ async def resume_workflow_run(
     user_id: str,
     payload: WorkflowResumeRequest,
 ) -> WorkflowRun:
-    """Resumes an interrupted workflow execution run."""
+    """Resumes an interrupted or paused workflow execution run."""
     run = await get_workflow_run(session, run_id, user_id, for_update=True)
-    if run.status != "INTERRUPTED":
+    if run.status not in ("INTERRUPTED", "PAUSED"):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Workflow run is in status '{run.status}', only 'INTERRUPTED' runs can be resumed.",
+            detail=f"Workflow run is in status '{run.status}', only 'INTERRUPTED' or 'PAUSED' runs can be resumed.",
         )
 
     if not run.definition_snapshot or not run.checkpoint_id:
         raise HTTPException(status_code=409, detail="This legacy run has no pinned definition or isolated checkpoint. Start a new run.")
     definition = run.definition_snapshot
-    pending = (run.execution_log or [{}])[-1].get("interrupts", [])
-    if any(datetime.fromisoformat(item["expires_at"]) <= datetime.now(timezone.utc) for item in pending):
-        run.status = "EXPIRED"
-        run.completed_at = datetime.now(timezone.utc)
-        run.error_message = "Approval deadline expired"
-        await session.commit()
-        return run
+
+    if run.status == "INTERRUPTED":
+        pending = (run.execution_log or [{}])[-1].get("interrupts", [])
+        if any(datetime.fromisoformat(item["expires_at"]) <= datetime.now(timezone.utc) for item in pending):
+            run.status = "EXPIRED"
+            run.completed_at = datetime.now(timezone.utc)
+            run.error_message = "Approval deadline expired"
+            await session.commit()
+            return run
 
     try:
         checkpointer = await get_checkpointer()
@@ -443,6 +476,7 @@ async def resume_workflow_run(
     }
 
     run.status = "RUNNING"
+    run.control_request = None
     await session.commit()
 
     try:
@@ -459,6 +493,12 @@ async def resume_workflow_run(
     except GraphInterrupt as interrupt_exc:
         logger.info("Workflow run '%s' interrupted again", run_id)
         _record_execution_result(run, {"__interrupt__": interrupt_exc.args[0]}, definition, resumed=True)
+    except WorkflowCancelledError as cancel_exc:
+        logger.info("Resumed workflow run '%s' execution cancelled: %s", run_id, cancel_exc)
+        run.status = "CANCELLED"
+        run.control_request = None
+        run.completed_at = datetime.now(timezone.utc)
+        run.error_message = str(cancel_exc)
     except Exception as exc:
         logger.error("Error resuming workflow run '%s': %s", run_id, exc, exc_info=True)
         run.status = "FAILED"
@@ -618,4 +658,99 @@ async def get_workflow_run_state(
         "supported_controls": supported_controls,
         "version": (run.definition_snapshot or {}).get("version") if run.definition_snapshot else None,
     }
+
+
+async def pause_workflow_run(
+    session: AsyncSession,
+    run_id: uuid.UUID,
+    user_id: str,
+) -> WorkflowRun:
+    """Requests execution of a running workflow to pause at the next node boundary."""
+    run = await get_workflow_run(session, run_id, user_id, for_update=True)
+    if run.status in ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT", "EXPIRED"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot pause workflow run in terminal status '{run.status}'.",
+        )
+    if run.status == "PAUSED" or run.control_request == "pause_requested":
+        return run
+    if run.status != "RUNNING":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot pause workflow run in status '{run.status}', only 'RUNNING' runs can be paused.",
+        )
+
+    run.control_request = "pause_requested"
+    run.control_set_at = datetime.now(timezone.utc)
+    from app.services.workflow.tracing import record_run_event
+    await record_run_event(
+        run_id=run.id,
+        sequence=(run.events[-1].sequence + 1) if hasattr(run, "events") and run.events else 1,
+        invocation_id=uuid.uuid4(),
+        node_id="system",
+        node_type="system",
+        event_type="pause_requested",
+        status="pause_requested",
+    )
+    await session.commit()
+    await session.refresh(run)
+    logger.info("Pause requested for workflow run '%s'", run_id)
+    return run
+
+
+async def cancel_workflow_run(
+    session: AsyncSession,
+    run_id: uuid.UUID,
+    user_id: str,
+) -> WorkflowRun:
+    """Requests cancellation of a workflow run. Inactive runs cancel immediately."""
+    run = await get_workflow_run(session, run_id, user_id, for_update=True)
+    if run.status in ("COMPLETED", "FAILED", "CANCELLED", "TIMED_OUT", "EXPIRED"):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Cannot cancel workflow run in terminal status '{run.status}'.",
+        )
+
+    from app.services.workflow.tracing import record_run_event
+
+    if run.status in ("PAUSED", "INTERRUPTED", "PENDING"):
+        # Inactive run cancels immediately
+        run.status = "CANCELLED"
+        run.control_request = None
+        run.completed_at = datetime.now(timezone.utc)
+        await record_run_event(
+            run_id=run.id,
+            sequence=(run.events[-1].sequence + 1) if hasattr(run, "events") and run.events else 1,
+            invocation_id=uuid.uuid4(),
+            node_id="system",
+            node_type="system",
+            event_type="cancelled",
+            status="cancelled",
+        )
+        await session.commit()
+        await session.refresh(run)
+        logger.info("Cancelled inactive workflow run '%s'", run_id)
+        return run
+
+    if run.status == "RUNNING":
+        run.control_request = "cancel_requested"
+        run.control_set_at = datetime.now(timezone.utc)
+        await record_run_event(
+            run_id=run.id,
+            sequence=(run.events[-1].sequence + 1) if hasattr(run, "events") and run.events else 1,
+            invocation_id=uuid.uuid4(),
+            node_id="system",
+            node_type="system",
+            event_type="cancel_requested",
+            status="cancel_requested",
+        )
+        await session.commit()
+        await session.refresh(run)
+        logger.info("Cancellation requested for running workflow run '%s'", run_id)
+        return run
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"Cannot cancel workflow run in status '{run.status}'.",
+    )
 

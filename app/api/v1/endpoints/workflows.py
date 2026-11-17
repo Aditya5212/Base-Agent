@@ -17,6 +17,7 @@ from app.schemas.workflow import (
     WorkflowNodeKnowledgeConfig,
     WorkflowResponse,
     WorkflowResumeRequest,
+    WorkflowRunControlResponse,
     WorkflowRunEventListResponse,
     WorkflowRunEventResponse,
     WorkflowRunListResponse,
@@ -28,6 +29,7 @@ from app.schemas.workflow import (
 from app.services.workflow.validator import validate_workflow_graph
 from app.services.workflow_service import (
     attach_node_knowledge,
+    cancel_workflow_run,
     create_workflow,
     delete_workflow,
     execute_workflow,
@@ -37,6 +39,7 @@ from app.services.workflow_service import (
     get_workflow_run_state,
     list_workflow_runs,
     list_workflows,
+    pause_workflow_run,
     resume_workflow_run,
     update_workflow,
 )
@@ -58,6 +61,7 @@ async def execution_capabilities(current_user: UserContext = Depends(get_current
         "agent_tools": True, "structured_output_validation": True,
         "long_term_memory": False, "automatic_summarization": False,
         "execution_events": True, "state_inspection": True,
+        "manual_pause": True, "cancellation": True,
         "streaming": {"text": "tokens", "tools_or_output_validation": "buffered"},
     }
 
@@ -209,8 +213,8 @@ async def get_workflow_run_state_endpoint(
 @router.post(
     "/runs/{run_id}/resume",
     response_model=WorkflowRunResponse,
-    summary="Resume interrupted workflow run",
-    description="Resumes execution of an INTERRUPTED workflow (e.g. human-in-the-loop approval).",
+    summary="Resume interrupted or paused workflow run",
+    description="Resumes execution of an INTERRUPTED or PAUSED workflow run.",
 )
 @limiter.limit("20/minute")
 async def resume_workflow_run_endpoint(
@@ -227,6 +231,57 @@ async def resume_workflow_run_endpoint(
         payload=payload,
     )
     return WorkflowRunResponse.model_validate(run)
+
+
+@router.post(
+    "/runs/{run_id}/pause",
+    response_model=WorkflowRunControlResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Pause active workflow run",
+    description="Requests execution of a RUNNING workflow to pause at the next safe node boundary.",
+)
+@limiter.limit("20/minute")
+async def pause_workflow_run_endpoint(
+    request: Request,
+    run_id: uuid.UUID,
+    current_user: UserContext = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WorkflowRunControlResponse:
+    run = await pause_workflow_run(session=db, run_id=run_id, user_id=current_user.user_id)
+    return WorkflowRunControlResponse(
+        run_id=run.id,
+        status=run.status,
+        control_request=run.control_request,
+        message="Workflow pause requested; execution will suspend at next node boundary.",
+    )
+
+
+@router.post(
+    "/runs/{run_id}/cancel",
+    response_model=WorkflowRunControlResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    summary="Cancel workflow run",
+    description="Requests cancellation of a workflow run. Inactive paused/interrupted runs cancel immediately.",
+)
+@limiter.limit("20/minute")
+async def cancel_workflow_run_endpoint(
+    request: Request,
+    run_id: uuid.UUID,
+    current_user: UserContext = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WorkflowRunControlResponse:
+    run = await cancel_workflow_run(session=db, run_id=run_id, user_id=current_user.user_id)
+    msg = (
+        "Workflow run cancelled immediately."
+        if run.status == "CANCELLED"
+        else "Workflow cancellation requested; execution will stop at next boundary."
+    )
+    return WorkflowRunControlResponse(
+        run_id=run.id,
+        status=run.status,
+        control_request=run.control_request,
+        message=msg,
+    )
 
 
 @router.get(

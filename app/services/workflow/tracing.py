@@ -177,6 +177,11 @@ async def record_run_event(
         return None
 
 
+class WorkflowCancelledError(Exception):
+    """Raised when workflow execution is cooperatively cancelled at a node boundary."""
+    pass
+
+
 def wrap_node_with_tracing(node_id: str, node_type: str, handler: Callable) -> Callable:
     """Wraps a workflow node handler with automated lifecycle tracing and duration timing."""
 
@@ -185,6 +190,52 @@ def wrap_node_with_tracing(node_id: str, node_type: str, handler: Callable) -> C
         if not raw_run_id:
             # If run_id is not in state (e.g. standalone test execution), execute directly
             return await handler(state)
+
+        # -------------------------------------------------------------------
+        # Cooperative boundary check: evaluate pause / cancel requests
+        # -------------------------------------------------------------------
+        ctrl_req = state.get("control_request")
+        if not ctrl_req:
+            active_sess = _CURRENT_DB_SESSION.get()
+            if active_sess is not None and hasattr(active_sess, "get"):
+                try:
+                    from app.models.workflow import WorkflowRun
+                    r_uuid = uuid.UUID(str(raw_run_id))
+                    run_row = await active_sess.get(WorkflowRun, r_uuid)
+                    if run_row:
+                        ctrl_req = run_row.control_request
+                except Exception:
+                    pass
+
+        if ctrl_req == "cancel_requested":
+            c_seq = state.get("event_sequence", 0) + 1
+            inv_id = uuid.uuid4()
+            await record_run_event(
+                run_id=raw_run_id,
+                sequence=c_seq,
+                invocation_id=inv_id,
+                node_id=node_id,
+                node_type=node_type,
+                event_type="cancelled",
+                status="cancelled",
+                error_message="Workflow execution was cancelled by user request",
+            )
+            raise WorkflowCancelledError(f"Workflow execution cancelled before node '{node_id}'")
+
+        if ctrl_req == "pause_requested":
+            p_seq = state.get("event_sequence", 0) + 1
+            inv_id = uuid.uuid4()
+            await record_run_event(
+                run_id=raw_run_id,
+                sequence=p_seq,
+                invocation_id=inv_id,
+                node_id=node_id,
+                node_type=node_type,
+                event_type="paused",
+                status="interrupted",
+            )
+            from langgraph.types import interrupt
+            interrupt({"type": "manual_pause", "node_id": node_id, "reason": "user_requested"})
 
         invocation_id = uuid.uuid4()
         current_seq = state.get("event_sequence", 0)

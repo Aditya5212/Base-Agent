@@ -481,6 +481,8 @@ class WorkflowRunResponse(BaseModel):
     checkpoint_id: str | None = None
     definition_snapshot: dict[str, Any] | None = None
     status: str
+    control_request: str | None = None
+    control_set_at: datetime | None = None
     input_data: dict[str, Any]
     output_data: dict[str, Any] | None
     error_message: str | None
@@ -557,3 +559,11 @@ class WorkflowRunStateResponse(BaseModel):
     node_history: list[str] = Field(default_factory=list)
     supported_controls: list[str] = Field(default_factory=list)
     version: int | None = None
+
+
+class WorkflowRunControlResponse(BaseModel):
+    """Response returned when a lifecycle control action is requested."""
+    run_id: uuid.UUID
+    status: str
+    control_request: str | None = None
+    message: str
