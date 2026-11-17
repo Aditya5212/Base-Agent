@@ -19,6 +19,8 @@ def test_all_migrations_render_offline_with_execution_and_indexing_columns():
     assert "audit_execution_identity" in ddl
     assert "workflow_run_events" in ddl
     assert "control_request" in ddl
+    assert "budget_seconds" in ddl
+    assert "lease_expires_at" in ddl
 
 
 @pytest.mark.asyncio

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 import uuid
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -83,6 +83,11 @@ class WorkflowRun(Base, TimestampMixin):
     status: Mapped[str] = mapped_column(String(50), default="PENDING", nullable=False, index=True)
     control_request: Mapped[str | None] = mapped_column(String(50), nullable=True, index=True)
     control_set_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    budget_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    consumed_seconds: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    execution_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     input_data: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
     output_data: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)

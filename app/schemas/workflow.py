@@ -464,6 +464,12 @@ class WorkflowRunRequest(BaseModel):
     """Payload to execute a workflow."""
     input_data: dict[str, Any] = Field(default_factory=dict, description="Input variables passed to workflow START node.")
     thread_id: str | None = Field(default=None, description="Optional thread session ID for memory checkpointing.")
+    budget_seconds: int | None = Field(
+        default=None,
+        ge=1,
+        le=86400,
+        description="Overall execution budget in seconds. If exceeded, run transitions to TIMED_OUT.",
+    )
 
 
 class WorkflowResumeRequest(BaseModel):
@@ -483,6 +489,11 @@ class WorkflowRunResponse(BaseModel):
     status: str
     control_request: str | None = None
     control_set_at: datetime | None = None
+    budget_seconds: int | None = None
+    consumed_seconds: float = 0.0
+    execution_started_at: datetime | None = None
+    worker_id: str | None = None
+    lease_expires_at: datetime | None = None
     input_data: dict[str, Any]
     output_data: dict[str, Any] | None
     error_message: str | None

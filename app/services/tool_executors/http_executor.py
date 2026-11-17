@@ -102,6 +102,10 @@ class HttpToolExecutor:
         for k, v in self.config.headers_template.items():
             headers[k] = _interpolate_string(v, args)
 
+        idempotency_key = args.pop("__idempotency_key__", None) or args.get("idempotency_key")
+        if idempotency_key and "X-Idempotency-Key" not in headers:
+            headers["X-Idempotency-Key"] = str(idempotency_key)
+
         # Decrypt auth token if configured
         auth_token = self.config.auth_token
         if auth_token:

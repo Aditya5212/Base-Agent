@@ -182,6 +182,11 @@ class WorkflowCancelledError(Exception):
     pass
 
 
+class WorkflowTimeoutError(Exception):
+    """Raised when workflow execution exceeds its configured budget_seconds."""
+    pass
+
+
 def wrap_node_with_tracing(node_id: str, node_type: str, handler: Callable) -> Callable:
     """Wraps a workflow node handler with automated lifecycle tracing and duration timing."""
 
@@ -190,6 +195,64 @@ def wrap_node_with_tracing(node_id: str, node_type: str, handler: Callable) -> C
         if not raw_run_id:
             # If run_id is not in state (e.g. standalone test execution), execute directly
             return await handler(state)
+
+        # -------------------------------------------------------------------
+        # Cooperative boundary check: execution budget / timeout
+        # -------------------------------------------------------------------
+        budget_sec = state.get("budget_seconds")
+        consumed_sec = float(state.get("consumed_seconds", 0.0) or 0.0)
+        started_at = state.get("execution_started_at")
+
+        active_sess = _CURRENT_DB_SESSION.get()
+        if active_sess is not None and hasattr(active_sess, "get"):
+            try:
+                from app.models.workflow import WorkflowRun
+                r_uuid = uuid.UUID(str(raw_run_id))
+                run_row = await active_sess.get(WorkflowRun, r_uuid)
+                if run_row and isinstance(run_row, WorkflowRun):
+                    if budget_sec is None and run_row.budget_seconds:
+                        budget_sec = run_row.budget_seconds
+                    if run_row.consumed_seconds is not None:
+                        consumed_sec = float(run_row.consumed_seconds)
+                    if run_row.execution_started_at is not None:
+                        started_at = run_row.execution_started_at
+            except Exception:
+                pass
+
+        if budget_sec and not isinstance(budget_sec, (int, float)):
+            try:
+                budget_sec = float(budget_sec)
+            except (ValueError, TypeError):
+                budget_sec = None
+
+        if budget_sec is not None and budget_sec > 0:
+            active_elapsed = 0.0
+            if started_at:
+                if isinstance(started_at, str):
+                    try:
+                        started_at = datetime.fromisoformat(started_at)
+                    except Exception:
+                        started_at = None
+                if isinstance(started_at, datetime):
+                    now = datetime.now(timezone.utc)
+                    if started_at.tzinfo is None:
+                        started_at = started_at.replace(tzinfo=timezone.utc)
+                    active_elapsed = max(0.0, (now - started_at).total_seconds())
+            total_active = consumed_sec + active_elapsed
+            if total_active > float(budget_sec):
+                t_seq = state.get("event_sequence", 0) + 1
+                inv_id = uuid.uuid4()
+                await record_run_event(
+                    run_id=raw_run_id,
+                    sequence=t_seq,
+                    invocation_id=inv_id,
+                    node_id=node_id,
+                    node_type=node_type,
+                    event_type="timed_out",
+                    status="timed_out",
+                    error_message=f"Execution budget of {budget_sec}s exceeded (consumed {total_active:.2f}s)",
+                )
+                raise WorkflowTimeoutError(f"Workflow execution timed out: budget of {budget_sec}s exceeded")
 
         # -------------------------------------------------------------------
         # Cooperative boundary check: evaluate pause / cancel requests
@@ -202,7 +265,7 @@ def wrap_node_with_tracing(node_id: str, node_type: str, handler: Callable) -> C
                     from app.models.workflow import WorkflowRun
                     r_uuid = uuid.UUID(str(raw_run_id))
                     run_row = await active_sess.get(WorkflowRun, r_uuid)
-                    if run_row:
+                    if run_row and isinstance(run_row, WorkflowRun):
                         ctrl_req = run_row.control_request
                 except Exception:
                     pass
@@ -240,6 +303,10 @@ def wrap_node_with_tracing(node_id: str, node_type: str, handler: Callable) -> C
         invocation_id = uuid.uuid4()
         current_seq = state.get("event_sequence", 0)
 
+        # Attach invocation_id to state for tool nodes or downstream introspection
+        state["current_invocation_id"] = str(invocation_id)
+        tool_invocation_id = f"{raw_run_id}:{node_id}:{invocation_id}:1" if node_type == "tool_call" else None
+
         # 1. Event: node_started
         start_seq = current_seq + 1
         input_snapshot = dict(state.get("variables") or {})
@@ -251,6 +318,7 @@ def wrap_node_with_tracing(node_id: str, node_type: str, handler: Callable) -> C
             node_type=node_type,
             event_type="node_started",
             input_summary=redact_value(input_snapshot, max_str_len=500),
+            tool_invocation_id=tool_invocation_id,
         )
 
         t0 = time.perf_counter()
@@ -327,6 +395,7 @@ def wrap_node_with_tracing(node_id: str, node_type: str, handler: Callable) -> C
                 status=status,
                 error_code=exc.__class__.__name__,
                 error_message=redact_error_message(str(exc)),
+                tool_invocation_id=tool_invocation_id,
             )
             # Re-raise so LangGraph handles interrupt / error
             raise

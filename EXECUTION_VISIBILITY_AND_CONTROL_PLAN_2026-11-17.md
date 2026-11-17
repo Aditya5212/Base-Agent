@@ -152,22 +152,22 @@ Ensure workflows survive network disconnects, background worker restarts, and ru
 ## 5. Verification & Completion Gates
 
 ### Increment 1
-- [ ] Database migration applies cleanly with `workflow_run_events` table and unique constraint on `(run_id, sequence)`.
-- [ ] Sequential events emitted for start, end, chat, retrieve, code, and tool nodes.
-- [ ] Loop iterations and retries receive distinct `invocation_id` values.
-- [ ] Redaction verified: Sensitive keys and signed URLs are never written in plaintext.
-- [ ] Cursor pagination advances monotonically via `?after_sequence=`.
-- [ ] 100% offline test suite passes without breaking existing run response contracts.
+- [x] Database migration applies cleanly with `workflow_run_events` table and unique constraint on `(run_id, sequence)`.
+- [x] Sequential events emitted for start, end, chat, retrieve, code, and tool nodes.
+- [x] Loop iterations and retries receive distinct `invocation_id` values.
+- [x] Redaction verified: Sensitive keys and signed URLs are never written in plaintext.
+- [x] Cursor pagination advances monotonically via `?after_sequence=`.
+- [x] 100% offline test suite passes without breaking existing run response contracts.
 
 ### Increment 2
-- [ ] Pause request at node boundary suspends execution to `PAUSED` with checkpoint intact.
-- [ ] Resume from `PAUSED` executes next node without re-running completed nodes.
-- [ ] Approval resume still strictly enforces approval schemas and deadlines.
-- [ ] Concurrency: Two simultaneous resume calls serialize; only one executor enters.
-- [ ] Cancel on active run stops at next boundary and records `CANCELLED`.
-- [ ] Cancel on `PAUSED`/`INTERRUPTED` run cancels immediately.
+- [x] Pause request at node boundary suspends execution to `PAUSED` with checkpoint intact.
+- [x] Resume from `PAUSED` executes next node without re-running completed nodes.
+- [x] Approval resume still strictly enforces approval schemas and deadlines.
+- [x] Concurrency: Two simultaneous resume calls serialize; only one executor enters.
+- [x] Cancel on active run stops at next boundary and records `CANCELLED`.
+- [x] Cancel on `PAUSED`/`INTERRUPTED` run cancels immediately.
 
 ### Increment 3
-- [ ] Execution budget correctly deducts active runtime while ignoring paused duration.
-- [ ] Expired worker lease recovery detects stalled runs and marks them `FAILED`.
-- [ ] Disposable PostgreSQL integration tests verify leases, recovery, and timeouts.
+- [x] Execution budget correctly deducts active runtime while ignoring paused duration.
+- [x] Expired worker lease recovery detects stalled runs and marks them `FAILED`.
+- [x] Disposable PostgreSQL integration tests verify leases, recovery, and timeouts.

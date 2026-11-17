@@ -76,6 +76,13 @@ def build_tool_call_node(node_id: str, config_dict: dict[str, Any]):
             else:
                 resolved_args[arg_key] = rendered
 
+        # Attach deterministic tool idempotency key for HTTP/tool execution
+        run_id = state.get("run_id")
+        if run_id:
+            inv_id = state.get("current_invocation_id") or "1"
+            tool_idempotency_key = f"{run_id}:{node_id}:{inv_id}:1"
+            resolved_args.setdefault("__idempotency_key__", tool_idempotency_key)
+
         # Outside the error/retry wrapper: interrupts must reach the graph runtime.
         if config.requires_approval:
             decision = interrupt({"type": "tool_approval", "node_id": node_id,

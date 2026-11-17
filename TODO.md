@@ -9,8 +9,8 @@ This document tracks completed milestones, architectural capabilities, and the u
 | Order | Phase | Concrete Deliverables | Status |
 |---|---|---|---|
 | **Phase 1** | **Thread Knowledge Reliability & Locking Stabilization** | Row-locked thread admission (`FOR SHARE`) and deletion (`FOR UPDATE`), atomic R2 upload rollback on 409, busy lock detection, retry preservation, LightRAG `all_user` rejection, comprehensive integration & offline tests | ✅ **Complete & Verified** |
-| **Phase 2 (Next)** | **Execution Visibility & Control** | Per-node execution records, timings, errors, tool calls, token usage, state inspection API (`GET /api/v1/workflows/runs/{run_id}`), overall run timeout, cancellation support (`POST /api/v1/workflows/runs/{run_id}/cancel`), correlation IDs, CI test setup | ⏳ **Ready to Implement** |
-| **Phase 3** | **Versioning Foundation** | Immutable agent, workflow, dynamic tool, and JSON schema revisions; pinned dependencies; version history, diffing, and rollback | 📅 Planned |
+| **Phase 2** | **Execution Visibility & Control** | Append-only execution events with per-run sequence, automated redaction, state inspection (`GET /runs/{run_id}/state`), manual pause/resume, cancellation, active runtime budgets, worker lease heartbeats & recovery | ✅ **Complete & Verified** |
+| **Phase 3 (Next)** | **Versioning Foundation** | Immutable agent, workflow, dynamic tool, and JSON schema revisions; pinned dependencies; version history, diffing, and rollback | ⏳ **Ready to Implement** |
 | **Phase 4** | **Builder Frontend MVP** | Next.js agent editor, chat and thread-isolated document management, live dynamic tool testing, workflow run viewer, and React Flow visual graph editor for verified node types | 📅 Planned |
 | **Phase 5** | **Advanced Orchestration** | Subgraphs, parallel execution with deterministic merge behavior, error routing branches, and multi-agent supervisor workflows | 📅 Planned |
 | **Phase 6** | **Publishing & Deployment Readiness** | Verified production auth/RBAC (Clerk/OIDC), published REST endpoints, API keys, quota management, worker health monitoring, checkpoint retention, and disaster recovery | 📅 Planned |
@@ -44,6 +44,27 @@ This document tracks completed milestones, architectural capabilities, and the u
   - `CodeExecutor`: Python execution in isolated child processes with AST safety analysis, module whitelist, and process reaping on timeout.
   - `DatabaseExecutor`: Read-only parameterized SQL query execution.
 - **Testing & Tool CRUD**: Live testing endpoints (`POST /api/v1/tools/{id}/test`), system tool registration, and agent/workflow tool attachment.
+
+### 3. Execution Visibility & Transactional Lifecycle Control (Phase 2)
+- **Increment 1 — History & State Inspection**:
+  - `workflow_run_events` table with monotonic per-run sequence numbers (`1, 2, 3...`), unique `invocation_id` per node attempt/loop, and composite unique constraint on `(run_id, sequence)`.
+  - Automated compile-time node wrapping (`wrap_node_with_tracing`) capturing inputs, outputs, errors, durations, LLM token counts, and tool invocations.
+  - Multi-tier recursive redaction masking sensitive keys (`api_key`, `token`, `password`, `secret`), presigned URLs (`X-Amz-Signature`), and database connection URIs.
+  - Cursor-paginated events endpoint (`GET /api/v1/workflows/runs/{run_id}/events?after_sequence=`) and state inspection endpoint (`GET /api/v1/workflows/runs/{run_id}/state`).
+- **Increment 2 — Manual Pause/Resume & Cancellation**:
+  - Cooperative node boundary checks evaluating `control_request` before node handler execution.
+  - Manual pause (`POST /runs/{run_id}/pause`) suspending runs to `PAUSED` via LangGraph checkpointing interrupt.
+  - Row-locked resume (`POST /runs/{run_id}/resume`) with concurrency serialization (`SELECT ... FOR UPDATE`), discriminating between manual pause resume and approval resume with deadline checks.
+  - Active and inactive cancellation (`POST /runs/{run_id}/cancel`) transitioning running executions at boundaries and inactive runs immediately.
+- **Increment 3 — Durable Execution, Timeouts, and Worker Recovery**:
+  - Active execution budget tracking (`budget_seconds`, `consumed_seconds`, `execution_started_at`) strictly deducting running slices while ignoring paused/interrupted duration.
+  - Boundary timeout enforcement transitioning over-budget runs to `TIMED_OUT` with `timed_out` trace event.
+  - Deterministic tool idempotency keys (`{run_id}:{node_id}:{invocation_id}:{attempt}`) injected as `X-Idempotency-Key` headers on HTTP tool executions.
+  - Worker lease and heartbeat tracking (`worker_id`, `lease_expires_at`) with stale lease recovery sweeper (`reconcile_stale_workflow_runs`) marking abandoned executions `FAILED`.
+  - Taskiq background execution worker task (`execute_workflow_task`).
+  - Capabilities advertisement (`GET /api/v1/workflows/capabilities`) reporting supported visibility, control, budget, and recovery features.
+- **Regression Verification**:
+  - 194 passed offline tests, 0 failures across the entire test suite.
 
 ---
 

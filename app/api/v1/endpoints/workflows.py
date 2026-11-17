@@ -62,6 +62,7 @@ async def execution_capabilities(current_user: UserContext = Depends(get_current
         "long_term_memory": False, "automatic_summarization": False,
         "execution_events": True, "state_inspection": True,
         "manual_pause": True, "cancellation": True,
+        "execution_budgets": True, "worker_recovery": True,
         "streaming": {"text": "tokens", "tools_or_output_validation": "buffered"},
     }
 

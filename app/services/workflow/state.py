@@ -23,6 +23,10 @@ class WorkflowState(TypedDict, total=False):
     thread_id: str
     run_id: str
     event_sequence: int
+    control_request: str | None
+    budget_seconds: int | None
+    consumed_seconds: float
+    execution_started_at: Any
     node_history: list[str]
     error: str | None
 

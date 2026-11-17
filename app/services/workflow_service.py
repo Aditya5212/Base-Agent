@@ -30,6 +30,7 @@ from app.services.thread_service import get_or_create_user
 from app.services.workflow.compiler import WorkflowCompiler
 from app.services.workflow.tracing import (
     WorkflowCancelledError,
+    WorkflowTimeoutError,
     record_run_event,
     reset_execution_session,
     set_execution_session,
@@ -269,6 +270,15 @@ async def delete_workflow(
 
 def _record_execution_result(run: WorkflowRun, state: dict[str, Any], definition: dict[str, Any], resumed: bool = False) -> None:
     """Interpret LangGraph's returned interrupts before declaring completion."""
+    now = datetime.now(timezone.utc)
+    if run.execution_started_at:
+        start_time = run.execution_started_at
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=timezone.utc)
+        elapsed = (now - start_time).total_seconds()
+        run.consumed_seconds = (run.consumed_seconds or 0.0) + max(0.0, elapsed)
+        run.execution_started_at = None
+
     entry: dict[str, Any] = {"node_history": state.get("node_history", [])}
     if resumed:
         entry["resumed"] = True
@@ -357,6 +367,8 @@ async def execute_workflow(
     owner_key = hashlib.sha256(f"{user_id}:{workflow_id}".encode()).hexdigest()
     checkpoint_id = f"workflow:{owner_key}:{run_id}"
 
+    now = datetime.now(timezone.utc)
+
     # 1. Initialize run record
     run = WorkflowRun(
         id=run_id,
@@ -368,7 +380,10 @@ async def execute_workflow(
         execution_log=[],
         status="RUNNING",
         input_data=payload.input_data,
-        started_at=datetime.now(timezone.utc),
+        started_at=now,
+        budget_seconds=payload.budget_seconds,
+        consumed_seconds=0.0,
+        execution_started_at=now,
     )
     session.add(run)
     await session.commit()
@@ -393,6 +408,9 @@ async def execute_workflow(
             "event_sequence": 0,
             "node_history": [],
             "error": None,
+            "budget_seconds": payload.budget_seconds,
+            "consumed_seconds": 0.0,
+            "execution_started_at": now.isoformat(),
         }
 
         exec_config: RunnableConfig = {
@@ -415,13 +433,43 @@ async def execute_workflow(
         logger.info("Workflow run '%s' was cancelled: %s", run_id, cancel_exc)
         run.status = "CANCELLED"
         run.control_request = None
-        run.completed_at = datetime.now(timezone.utc)
+        now_c = datetime.now(timezone.utc)
+        run.completed_at = now_c
+        if run.execution_started_at:
+            start_time = run.execution_started_at
+            if start_time.tzinfo is None:
+                start_time = start_time.replace(tzinfo=timezone.utc)
+            elapsed = (now_c - start_time).total_seconds()
+            run.consumed_seconds = (run.consumed_seconds or 0.0) + max(0.0, elapsed)
+            run.execution_started_at = None
         run.error_message = str(cancel_exc)
+    except WorkflowTimeoutError as timeout_exc:
+        logger.info("Workflow run '%s' timed out: %s", run_id, timeout_exc)
+        run.status = "TIMED_OUT"
+        run.control_request = None
+        now_t = datetime.now(timezone.utc)
+        run.completed_at = now_t
+        if run.execution_started_at:
+            start_time = run.execution_started_at
+            if start_time.tzinfo is None:
+                start_time = start_time.replace(tzinfo=timezone.utc)
+            elapsed = (now_t - start_time).total_seconds()
+            run.consumed_seconds = (run.consumed_seconds or 0.0) + max(0.0, elapsed)
+            run.execution_started_at = None
+        run.error_message = str(timeout_exc)
     except Exception as exc:
         logger.error("Workflow run '%s' execution failed: %s", run_id, exc, exc_info=True)
         run.status = "FAILED"
         run.error_message = str(exc)
-        run.completed_at = datetime.now(timezone.utc)
+        now_e = datetime.now(timezone.utc)
+        run.completed_at = now_e
+        if run.execution_started_at:
+            start_time = run.execution_started_at
+            if start_time.tzinfo is None:
+                start_time = start_time.replace(tzinfo=timezone.utc)
+            elapsed = (now_e - start_time).total_seconds()
+            run.consumed_seconds = (run.consumed_seconds or 0.0) + max(0.0, elapsed)
+            run.execution_started_at = None
 
     await session.commit()
     await session.refresh(run)
@@ -475,8 +523,10 @@ async def resume_workflow_run(
         "recursion_limit": definition["recursion_limit"],
     }
 
+    now_r = datetime.now(timezone.utc)
     run.status = "RUNNING"
     run.control_request = None
+    run.execution_started_at = now_r
     await session.commit()
 
     try:
@@ -497,13 +547,43 @@ async def resume_workflow_run(
         logger.info("Resumed workflow run '%s' execution cancelled: %s", run_id, cancel_exc)
         run.status = "CANCELLED"
         run.control_request = None
-        run.completed_at = datetime.now(timezone.utc)
+        now_c = datetime.now(timezone.utc)
+        run.completed_at = now_c
+        if run.execution_started_at:
+            start_time = run.execution_started_at
+            if start_time.tzinfo is None:
+                start_time = start_time.replace(tzinfo=timezone.utc)
+            elapsed = (now_c - start_time).total_seconds()
+            run.consumed_seconds = (run.consumed_seconds or 0.0) + max(0.0, elapsed)
+            run.execution_started_at = None
         run.error_message = str(cancel_exc)
+    except WorkflowTimeoutError as timeout_exc:
+        logger.info("Resumed workflow run '%s' timed out: %s", run_id, timeout_exc)
+        run.status = "TIMED_OUT"
+        run.control_request = None
+        now_t = datetime.now(timezone.utc)
+        run.completed_at = now_t
+        if run.execution_started_at:
+            start_time = run.execution_started_at
+            if start_time.tzinfo is None:
+                start_time = start_time.replace(tzinfo=timezone.utc)
+            elapsed = (now_t - start_time).total_seconds()
+            run.consumed_seconds = (run.consumed_seconds or 0.0) + max(0.0, elapsed)
+            run.execution_started_at = None
+        run.error_message = str(timeout_exc)
     except Exception as exc:
         logger.error("Error resuming workflow run '%s': %s", run_id, exc, exc_info=True)
         run.status = "FAILED"
         run.error_message = str(exc)
-        run.completed_at = datetime.now(timezone.utc)
+        now_e = datetime.now(timezone.utc)
+        run.completed_at = now_e
+        if run.execution_started_at:
+            start_time = run.execution_started_at
+            if start_time.tzinfo is None:
+                start_time = start_time.replace(tzinfo=timezone.utc)
+            elapsed = (now_e - start_time).total_seconds()
+            run.consumed_seconds = (run.consumed_seconds or 0.0) + max(0.0, elapsed)
+            run.execution_started_at = None
 
     await session.commit()
     await session.refresh(run)
@@ -753,4 +833,124 @@ async def cancel_workflow_run(
         status_code=status.HTTP_400_BAD_REQUEST,
         detail=f"Cannot cancel workflow run in status '{run.status}'.",
     )
+
+
+# ---------------------------------------------------------------------------
+# Worker Lease & Recovery Functions
+# ---------------------------------------------------------------------------
+
+async def claim_workflow_run(
+    session: AsyncSession,
+    run_id: uuid.UUID,
+    worker_id: str,
+    lease_seconds: int = 30,
+) -> bool:
+    """Claims a pending or unassigned running workflow execution for a worker."""
+    stmt = (
+        select(WorkflowRun)
+        .where(WorkflowRun.id == run_id)
+        .with_for_update()
+    )
+    res = await session.execute(stmt)
+    run = res.scalar_one_or_none()
+    if not run or run.status not in ("PENDING", "RUNNING"):
+        return False
+    now = datetime.now(timezone.utc)
+    if run.worker_id and run.worker_id != worker_id:
+        if run.lease_expires_at and run.lease_expires_at > now:
+            return False
+    run.worker_id = worker_id
+    run.lease_expires_at = now + timedelta(seconds=lease_seconds)
+    await session.commit()
+    return True
+
+
+async def heartbeat_workflow_run(
+    session: AsyncSession,
+    run_id: uuid.UUID,
+    worker_id: str,
+    lease_seconds: int = 30,
+) -> bool:
+    """Renews worker lease on a running workflow execution."""
+    stmt = (
+        select(WorkflowRun)
+        .where(WorkflowRun.id == run_id, WorkflowRun.status == "RUNNING")
+        .with_for_update()
+    )
+    res = await session.execute(stmt)
+    run = res.scalar_one_or_none()
+    if not run:
+        return False
+    if run.worker_id and run.worker_id != worker_id:
+        return False
+    run.worker_id = worker_id
+    run.lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
+    await session.commit()
+    return True
+
+
+async def reconcile_stale_workflow_runs(
+    session: AsyncSession,
+    threshold_seconds: int = 0,
+) -> list[uuid.UUID]:
+    """Sweeps and recovers stalled workflow runs whose worker lease has expired."""
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(seconds=threshold_seconds)
+
+    stmt = (
+        select(WorkflowRun)
+        .where(
+            WorkflowRun.status == "RUNNING",
+            WorkflowRun.lease_expires_at.is_not(None),
+            WorkflowRun.lease_expires_at < cutoff,
+        )
+        .with_for_update(skip_locked=True)
+    )
+    result = await session.execute(stmt)
+    stale_runs = list(result.scalars().all())
+
+    from app.services.workflow.tracing import record_run_event
+
+    recovered_ids = []
+    for run in stale_runs:
+        expired_at_str = run.lease_expires_at.isoformat() if run.lease_expires_at else "unknown"
+        run.status = "FAILED"
+        run.completed_at = now
+        run.error_message = f"Worker heartbeat expired (lease expired at {expired_at_str})"
+
+        if run.execution_started_at:
+            start_time = run.execution_started_at
+            if start_time.tzinfo is None:
+                start_time = start_time.replace(tzinfo=timezone.utc)
+            if run.lease_expires_at:
+                l_exp = run.lease_expires_at
+                if l_exp.tzinfo is None:
+                    l_exp = l_exp.replace(tzinfo=timezone.utc)
+                elapsed = (l_exp - start_time).total_seconds()
+            else:
+                elapsed = (now - start_time).total_seconds()
+            run.consumed_seconds = (run.consumed_seconds or 0.0) + max(0.0, elapsed)
+            run.execution_started_at = None
+
+        seq_stmt = select(func.coalesce(func.max(WorkflowRunEvent.sequence), 0)).where(WorkflowRunEvent.run_id == run.id)
+        max_seq = (await session.execute(seq_stmt)).scalar() or 0
+
+        await record_run_event(
+            run_id=run.id,
+            sequence=max_seq + 1,
+            invocation_id=uuid.uuid4(),
+            node_id="system",
+            node_type="system",
+            event_type="lease_expired",
+            status="failed",
+            error_message=run.error_message,
+        )
+        recovered_ids.append(run.id)
+
+    if recovered_ids:
+        await session.commit()
+        logger.warning("Reconciled %d stale workflow runs: %s", len(recovered_ids), recovered_ids)
+
+    return recovered_ids
+
 
