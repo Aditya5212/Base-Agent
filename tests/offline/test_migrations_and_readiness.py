@@ -17,6 +17,7 @@ def test_all_migrations_render_offline_with_execution_and_indexing_columns():
     for column in ("checkpoint_id", "definition_snapshot", "indexing_config", "provider_status"):
         assert column in ddl
     assert "audit_execution_identity" in ddl
+    assert "workflow_run_events" in ddl
 
 
 @pytest.mark.asyncio

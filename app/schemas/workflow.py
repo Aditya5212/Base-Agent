@@ -506,3 +506,54 @@ class GraphValidationResponse(BaseModel):
     warnings: list[str] = Field(default_factory=list)
     node_count: int
     edge_count: int
+
+
+# ---------------------------------------------------------------------------
+# Execution Visibility & Control Schemas (Phase 2)
+# ---------------------------------------------------------------------------
+
+class WorkflowRunEventResponse(BaseModel):
+    """Public representation of an execution trace event."""
+    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
+
+    id: uuid.UUID
+    run_id: uuid.UUID
+    sequence: int
+    invocation_id: uuid.UUID
+    node_id: str
+    node_type: str
+    attempt: int = 1
+    event_type: str
+    occurred_at: datetime
+    duration_ms: int | None = None
+    status: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    input_summary: dict[str, Any] | None = None
+    output_summary: dict[str, Any] | None = None
+    model_id: str | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    tool_name: str | None = None
+    tool_invocation_id: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict, alias="metadata_json")
+
+
+class WorkflowRunEventListResponse(BaseModel):
+    """Cursor-paginated list of execution trace events."""
+    items: list[WorkflowRunEventResponse]
+    total: int
+    next_cursor: int | None = None
+
+
+class WorkflowRunStateResponse(BaseModel):
+    """Redacted state inspection response for a workflow run."""
+    run_id: uuid.UUID
+    workflow_id: uuid.UUID
+    status: str
+    current_node: str | None = None
+    pending_approval: dict[str, Any] | None = None
+    variables: dict[str, Any] = Field(default_factory=dict)
+    node_history: list[str] = Field(default_factory=list)
+    supported_controls: list[str] = Field(default_factory=list)
+    version: int | None = None

@@ -17,9 +17,12 @@ from app.schemas.workflow import (
     WorkflowNodeKnowledgeConfig,
     WorkflowResponse,
     WorkflowResumeRequest,
+    WorkflowRunEventListResponse,
+    WorkflowRunEventResponse,
     WorkflowRunListResponse,
     WorkflowRunRequest,
     WorkflowRunResponse,
+    WorkflowRunStateResponse,
     WorkflowUpdate,
 )
 from app.services.workflow.validator import validate_workflow_graph
@@ -30,6 +33,8 @@ from app.services.workflow_service import (
     execute_workflow,
     get_workflow_by_id,
     get_workflow_run,
+    get_workflow_run_events,
+    get_workflow_run_state,
     list_workflow_runs,
     list_workflows,
     resume_workflow_run,
@@ -52,6 +57,7 @@ async def execution_capabilities(current_user: UserContext = Depends(get_current
         "parallel_execution": False, "subgraph_execution": False,
         "agent_tools": True, "structured_output_validation": True,
         "long_term_memory": False, "automatic_summarization": False,
+        "execution_events": True, "state_inspection": True,
         "streaming": {"text": "tokens", "tools_or_output_validation": "buffered"},
     }
 
@@ -148,6 +154,56 @@ async def get_workflow_run_endpoint(
 ) -> WorkflowRunResponse:
     run = await get_workflow_run(session=db, run_id=run_id, user_id=current_user.user_id)
     return WorkflowRunResponse.model_validate(run)
+
+
+@router.get(
+    "/runs/{run_id}/events",
+    response_model=WorkflowRunEventListResponse,
+    summary="Get workflow execution run trace events",
+    description="Retrieves cursor-paginated granular node and lifecycle events for a specific run.",
+)
+@limiter.limit("60/minute")
+async def get_workflow_run_events_endpoint(
+    request: Request,
+    run_id: uuid.UUID,
+    after_sequence: int | None = Query(None, ge=0, description="Fetch events with sequence greater than this cursor"),
+    limit: int = Query(50, ge=1, le=200, description="Maximum events to return"),
+    current_user: UserContext = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WorkflowRunEventListResponse:
+    events, total, next_cursor = await get_workflow_run_events(
+        session=db,
+        run_id=run_id,
+        user_id=current_user.user_id,
+        after_sequence=after_sequence,
+        limit=limit,
+    )
+    return WorkflowRunEventListResponse(
+        items=[WorkflowRunEventResponse.model_validate(e) for e in events],
+        total=total,
+        next_cursor=next_cursor,
+    )
+
+
+@router.get(
+    "/runs/{run_id}/state",
+    response_model=WorkflowRunStateResponse,
+    summary="Get workflow execution run state",
+    description="Inspects redacted state variables, current node, pending approval, and supported controls.",
+)
+@limiter.limit("60/minute")
+async def get_workflow_run_state_endpoint(
+    request: Request,
+    run_id: uuid.UUID,
+    current_user: UserContext = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> WorkflowRunStateResponse:
+    state_data = await get_workflow_run_state(
+        session=db,
+        run_id=run_id,
+        user_id=current_user.user_id,
+    )
+    return WorkflowRunStateResponse(**state_data)
 
 
 @router.post(

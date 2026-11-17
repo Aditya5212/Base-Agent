@@ -15,7 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.workflow import Workflow, WorkflowRun
+from app.models.workflow import Workflow, WorkflowRun, WorkflowRunEvent
 from app.schemas.workflow import (
     WorkflowCreate,
     WorkflowNodeKnowledgeConfig,
@@ -28,6 +28,7 @@ from app.core.json_validation import validate_payload
 from app.services.schema_service import validate_json_schema
 from app.services.thread_service import get_or_create_user
 from app.services.workflow.compiler import WorkflowCompiler
+from app.services.workflow.tracing import set_execution_session, reset_execution_session
 from app.services.workflow.validator import GraphValidationError, validate_workflow_graph
 
 logger = logging.getLogger(__name__)
@@ -363,6 +364,8 @@ async def execute_workflow(
             "user_id": user_id,
             "workflow_id": str(workflow_id),
             "thread_id": thread_id,
+            "run_id": str(run_id),
+            "event_sequence": 0,
             "node_history": [],
             "error": None,
         }
@@ -373,9 +376,12 @@ async def execute_workflow(
         }
 
         # Execute StateGraph
-        final_state = await compiled_graph.ainvoke(initial_state, config=exec_config)
-
-        _record_execution_result(run, final_state, definition)
+        session_token = set_execution_session(session)
+        try:
+            final_state = await compiled_graph.ainvoke(initial_state, config=exec_config)
+            _record_execution_result(run, final_state, definition)
+        finally:
+            reset_execution_session(session_token)
 
     except GraphInterrupt as interrupt_exc:
         logger.info("Workflow run '%s' was paused by human-in-the-loop interrupt", run_id)
@@ -441,12 +447,15 @@ async def resume_workflow_run(
 
     try:
         # Resume LangGraph execution with human decision payload
-        final_state = await compiled_graph.ainvoke(
-            Command(resume=payload.resume_data),
-            config=exec_config,
-        )
-
-        _record_execution_result(run, final_state, definition, resumed=True)
+        session_token = set_execution_session(session)
+        try:
+            final_state = await compiled_graph.ainvoke(
+                Command(resume=payload.resume_data),
+                config=exec_config,
+            )
+            _record_execution_result(run, final_state, definition, resumed=True)
+        finally:
+            reset_execution_session(session_token)
     except GraphInterrupt as interrupt_exc:
         logger.info("Workflow run '%s' interrupted again", run_id)
         _record_execution_result(run, {"__interrupt__": interrupt_exc.args[0]}, definition, resumed=True)
@@ -520,4 +529,93 @@ async def list_workflow_runs(
     items = list(result.scalars().all())
 
     return items, total
+
+
+async def get_workflow_run_events(
+    session: AsyncSession,
+    run_id: uuid.UUID,
+    user_id: str,
+    after_sequence: int | None = None,
+    limit: int = 50,
+) -> tuple[list[WorkflowRunEvent], int, int | None]:
+    """Retrieves cursor-paginated execution trace events for a workflow run enforcing tenant ownership."""
+    run = await get_workflow_run(session, run_id, user_id)
+
+    total_query = select(func.count(WorkflowRunEvent.id)).where(WorkflowRunEvent.run_id == run.id)
+    total_res = await session.execute(total_query)
+    total = total_res.scalar_one() or 0
+
+    query = select(WorkflowRunEvent).where(WorkflowRunEvent.run_id == run.id)
+    if after_sequence is not None:
+        query = query.where(WorkflowRunEvent.sequence > after_sequence)
+
+    query = query.order_by(WorkflowRunEvent.sequence.asc()).limit(limit)
+    result = await session.execute(query)
+    events = list(result.scalars().all())
+
+    next_cursor = events[-1].sequence if events and len(events) == limit else None
+    return events, total, next_cursor
+
+
+async def get_workflow_run_state(
+    session: AsyncSession,
+    run_id: uuid.UUID,
+    user_id: str,
+) -> dict[str, Any]:
+    """Inspects redacted state, current node, pending approval, and supported controls for a workflow run."""
+    run = await get_workflow_run(session, run_id, user_id)
+
+    checkpoint_state = None
+    if run.checkpoint_id:
+        try:
+            checkpointer = await get_checkpointer()
+            if checkpointer:
+                config = {"configurable": {"thread_id": run.checkpoint_id}}
+                checkpoint_tuple = await checkpointer.aget_tuple(config)
+                if checkpoint_tuple and checkpoint_tuple.checkpoint:
+                    checkpoint_state = checkpoint_tuple.checkpoint.get("channel_values", {})
+        except Exception as exc:
+            logger.warning("Could not read checkpoint state for run %s: %s", run_id, exc)
+
+    raw_variables = {}
+    node_history = []
+    if checkpoint_state:
+        raw_variables = checkpoint_state.get("variables") or {}
+        node_history = checkpoint_state.get("node_history") or []
+    else:
+        raw_variables = run.output_data or run.input_data or {}
+        if run.execution_log:
+            node_history = (run.execution_log[-1] or {}).get("node_history") or []
+
+    from app.services.workflow.tracing import redact_value
+    redacted_variables = redact_value(raw_variables, max_depth=5, max_str_len=500)
+
+    pending_approval = None
+    if run.status == "INTERRUPTED" and run.execution_log:
+        last_entry = run.execution_log[-1]
+        interrupts = last_entry.get("interrupts") or []
+        if interrupts:
+            pending_approval = interrupts[0]
+
+    supported_controls = []
+    if run.status == "INTERRUPTED":
+        supported_controls = ["resume"]
+    elif run.status == "RUNNING":
+        supported_controls = ["pause", "cancel"]
+    elif run.status == "PAUSED":
+        supported_controls = ["resume", "cancel"]
+
+    current_node = node_history[-1] if node_history else None
+
+    return {
+        "run_id": run.id,
+        "workflow_id": run.workflow_id,
+        "status": run.status,
+        "current_node": current_node,
+        "pending_approval": pending_approval,
+        "variables": redacted_variables if isinstance(redacted_variables, dict) else {},
+        "node_history": node_history,
+        "supported_controls": supported_controls,
+        "version": (run.definition_snapshot or {}).get("version") if run.definition_snapshot else None,
+    }
 

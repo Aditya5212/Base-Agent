@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 import uuid
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB, UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -90,3 +90,59 @@ class WorkflowRun(Base, TimestampMixin):
 
     workflow: Mapped["Workflow"] = relationship("Workflow", back_populates="runs")
     user: Mapped["User"] = relationship("User", back_populates="workflow_runs")
+    events: Mapped[list["WorkflowRunEvent"]] = relationship(
+        "WorkflowRunEvent",
+        back_populates="run",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+        order_by="WorkflowRunEvent.sequence",
+    )
+
+
+class WorkflowRunEvent(Base):
+    """Granular execution trace event for a workflow run."""
+
+    __tablename__ = "workflow_run_events"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+    )
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("workflow_runs.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    invocation_id: Mapped[uuid.UUID] = mapped_column(PG_UUID(as_uuid=True), default=uuid.uuid4, nullable=False)
+    node_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    node_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    event_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    status: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    input_summary: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    output_summary: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+    model_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tool_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    tool_invocation_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSONB, default=dict, nullable=False)
+
+    run: Mapped["WorkflowRun"] = relationship("WorkflowRun", back_populates="events")
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "sequence", name="uq_workflow_run_events_run_sequence"),
+        Index("ix_workflow_run_events_run_node", "run_id", "node_id"),
+        Index("ix_workflow_run_events_run_sequence", "run_id", "sequence"),
+    )

@@ -19,6 +19,7 @@ from app.services.workflow.nodes import (
     build_tool_call_node,
 )
 from app.services.workflow.state import WorkflowState
+from app.services.workflow.tracing import wrap_node_with_tracing
 from app.services.workflow.validator import GraphValidationError, validate_workflow_graph
 
 logger = logging.getLogger(__name__)
@@ -90,6 +91,7 @@ class WorkflowCompiler:
             else:
                 raise GraphValidationError([f"Unsupported node type '{node_type}' for node '{node_id}'."])
 
+            handler = wrap_node_with_tracing(node_id, node_type, handler)
             builder.add_node(node_id, handler)
 
         # 2. Connect Entry Point

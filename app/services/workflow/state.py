@@ -21,6 +21,8 @@ class WorkflowState(TypedDict, total=False):
     user_id: str
     workflow_id: str
     thread_id: str
+    run_id: str
+    event_sequence: int
     node_history: list[str]
     error: str | None
 
