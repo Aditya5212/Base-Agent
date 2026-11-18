@@ -1,6 +1,7 @@
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from datetime import datetime, timezone
 import uuid
 
 import pytest
@@ -42,10 +43,28 @@ async def test_two_approvals_and_resume_are_pinned_to_original_definition():
         # Changes to the draft must not affect an existing run.
         wf.nodes[1]["type"] = "unsupported"
         with patch.object(svc, "get_workflow_run", AsyncMock(return_value=run)):
-            await svc.resume_workflow_run(db, run.id, "alice", WorkflowResumeRequest(resume_data={"approved": True}))
+            dispatch = svc.WorkflowDispatch(run_id=run.id)
+            queue_db = session()
+            queue_db.execute = AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: dispatch))
+            await svc.resume_workflow_run(queue_db, run.id, "alice", WorkflowResumeRequest(resume_data={"approved": True}))
+            assert run.status == "PENDING"
+            run.status = "RUNNING"
+            run.worker_id = "offline-worker"
+            run.generation = (run.generation or 0) + 1
+            run.execution_started_at = datetime.now(timezone.utc)
+            await svc.execute_claimed_run(db, run.id, "offline-worker", run_instance=run, resume_payload=dispatch.resume_payload)
             assert run.status == "INTERRUPTED"
             assert run.execution_log[-1]["interrupts"][0]["value"]["node_id"] == "h2"
-            await svc.resume_workflow_run(db, run.id, "alice", WorkflowResumeRequest(resume_data={"approved": True}))
+            dispatch = svc.WorkflowDispatch(run_id=run.id)
+            queue_db = session()
+            queue_db.execute = AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: dispatch))
+            await svc.resume_workflow_run(queue_db, run.id, "alice", WorkflowResumeRequest(resume_data={"approved": True}))
+            assert run.status == "PENDING"
+            run.status = "RUNNING"
+            run.worker_id = "offline-worker"
+            run.generation = (run.generation or 0) + 1
+            run.execution_started_at = datetime.now(timezone.utc)
+            await svc.execute_claimed_run(db, run.id, "offline-worker", run_instance=run, resume_payload=dispatch.resume_payload)
             assert run.status == "COMPLETED"
             assert run.completed_at is not None
             with pytest.raises(HTTPException) as exc:

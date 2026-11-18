@@ -27,6 +27,11 @@ class WorkflowState(TypedDict, total=False):
     budget_seconds: int | None
     consumed_seconds: float
     execution_started_at: Any
+    worker_id: str | None
+    generation: int | None
+    node_invocations: dict[str, str]
+    node_occurrences: dict[str, int]
+    current_invocation_id: str | None
     node_history: list[str]
     error: str | None
 

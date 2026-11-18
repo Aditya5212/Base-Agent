@@ -179,7 +179,7 @@ def test_execute_workflow_run():
 
     # Run workflow with input_data (VIP tier)
     run_resp = client.post(
-        f"/api/v1/workflows/{wf_id}/run",
+        f"/api/v1/workflows/{wf_id}/run?wait=true",
         json={"input_data": {"tier": "vip"}},
         headers=headers,
     )

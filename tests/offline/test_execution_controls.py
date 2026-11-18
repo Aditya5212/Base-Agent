@@ -192,11 +192,16 @@ async def test_cooperative_pause_and_resume_lifecycle():
 
         # Step 2: Resume from PAUSED status
         with patch.object(svc, "get_workflow_run", AsyncMock(return_value=run)):
+            dispatch = svc.WorkflowDispatch(run_id=run.id)
+            from types import SimpleNamespace
+            db.execute = AsyncMock(return_value=SimpleNamespace(scalar_one_or_none=lambda: dispatch))
             resumed_run = await svc.resume_workflow_run(
                 db, run.id, "alice", WorkflowResumeRequest(resume_data={})
             )
-            assert resumed_run.status == "COMPLETED"
-            assert resumed_run.completed_at is not None
+            assert resumed_run.status == "PENDING"
+            assert resumed_run.completed_at is None
+            assert dispatch.resume_payload == {"resume_data": {}}
+            assert dispatch.state == "PENDING"
 
 
 @pytest.mark.asyncio

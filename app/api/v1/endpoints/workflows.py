@@ -4,10 +4,10 @@ import logging
 from typing import Any
 import uuid
 
-from fastapi import APIRouter, Depends, Query, Request, status
+from fastapi import APIRouter, Depends, Query, Request, Response, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.auth import UserContext, get_current_user
+from app.core.auth import UserContext, get_current_user, require_admin
 from app.core.database import get_db
 from app.core.rate_limit import limiter
 from app.schemas.workflow import (
@@ -31,7 +31,9 @@ from app.services.workflow_service import (
     attach_node_knowledge,
     cancel_workflow_run,
     create_workflow,
+    create_workflow_run,
     delete_workflow,
+    dispatch_workflow_run,
     execute_workflow,
     get_workflow_by_id,
     get_workflow_run,
@@ -40,7 +42,9 @@ from app.services.workflow_service import (
     list_workflow_runs,
     list_workflows,
     pause_workflow_run,
+    reconcile_stale_workflow_runs,
     resume_workflow_run,
+    retry_pending_dispatches,
     update_workflow,
 )
 
@@ -214,8 +218,9 @@ async def get_workflow_run_state_endpoint(
 @router.post(
     "/runs/{run_id}/resume",
     response_model=WorkflowRunResponse,
+    status_code=status.HTTP_202_ACCEPTED,
     summary="Resume interrupted or paused workflow run",
-    description="Resumes execution of an INTERRUPTED or PAUSED workflow run.",
+    description="Queues continuation of an INTERRUPTED or PAUSED workflow run; inspect the run for its result.",
 )
 @limiter.limit("20/minute")
 async def resume_workflow_run_endpoint(
@@ -344,25 +349,71 @@ async def delete_workflow_endpoint(
 @router.post(
     "/{workflow_id}/run",
     response_model=WorkflowRunResponse,
-    status_code=status.HTTP_200_OK,
+    status_code=status.HTTP_202_ACCEPTED,
     summary="Execute workflow",
-    description="Compiles and executes the workflow with input variables, returning execution output.",
+    description="Creates a workflow execution run and dispatches it to background workers, or executes synchronously if wait=True.",
 )
 @limiter.limit("20/minute")
 async def run_workflow_endpoint(
     request: Request,
     workflow_id: uuid.UUID,
     payload: WorkflowRunRequest,
+    response: Response,
+    wait: bool = Query(False, description="If True, executes synchronously and waits for completion (HTTP 200). If False (default), returns HTTP 202 promptly."),
     current_user: UserContext = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> WorkflowRunResponse:
-    run = await execute_workflow(
+    if wait:
+        response.status_code = status.HTTP_200_OK
+        run = await execute_workflow(
+            session=db,
+            workflow_id=workflow_id,
+            user_id=current_user.user_id,
+            payload=payload,
+        )
+        return WorkflowRunResponse.model_validate(run)
+
+    run, _ = await create_workflow_run(
         session=db,
         workflow_id=workflow_id,
         user_id=current_user.user_id,
         payload=payload,
     )
+    await dispatch_workflow_run(session=db, run_id=run.id)
+    response.status_code = status.HTTP_202_ACCEPTED
     return WorkflowRunResponse.model_validate(run)
+
+
+@router.post(
+    "/reconcile-stale",
+    summary="Reconcile stale workflow runs",
+    description="Sweeps stalled workflow executions whose worker lease has expired, transitioning them to FAILED.",
+)
+@limiter.limit("10/minute")
+async def reconcile_stale_endpoint(
+    request: Request,
+    threshold_seconds: int = Query(0, ge=0, description="Grace period beyond lease expiration in seconds"),
+    current_user: UserContext = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    reconciled = await reconcile_stale_workflow_runs(db, threshold_seconds=threshold_seconds)
+    return {"reconciled_count": len(reconciled), "reconciled_run_ids": [str(r) for r in reconciled]}
+
+
+@router.post(
+    "/dispatches/retry",
+    summary="Retry pending workflow dispatches",
+    description="Sweeps unsent dispatch outbox records and retries submission to worker queue.",
+)
+@limiter.limit("10/minute")
+async def retry_dispatches_endpoint(
+    request: Request,
+    limit: int = Query(50, ge=1, le=200, description="Maximum dispatches to retry"),
+    current_user: UserContext = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    retried = await retry_pending_dispatches(db, limit=limit)
+    return {"retried_count": len(retried), "retried_run_ids": [str(r) for r in retried]}
 
 
 @router.get(

@@ -9,7 +9,7 @@ This document tracks completed milestones, architectural capabilities, and the u
 | Order | Phase | Concrete Deliverables | Status |
 |---|---|---|---|
 | **Phase 1** | **Thread Knowledge Reliability & Locking Stabilization** | Row-locked thread admission (`FOR SHARE`) and deletion (`FOR UPDATE`), atomic R2 upload rollback on 409, busy lock detection, retry preservation, LightRAG `all_user` rejection, comprehensive integration & offline tests | ✅ **Complete & Verified** |
-| **Phase 2** | **Execution Visibility & Control** | Append-only execution events with per-run sequence, automated redaction, state inspection (`GET /runs/{run_id}/state`), manual pause/resume, cancellation, active runtime budgets, worker lease heartbeats & recovery | ✅ **Complete & Verified** |
+| **Phase 2** | **Execution Visibility & Control** | Append-only execution events with per-run sequence, automated redaction, state inspection (`GET /runs/{run_id}/state`), manual pause/resume, cancellation, active runtime budgets, worker lease heartbeats & recovery | Recovery corrections implemented; disposable PostgreSQL verification pending |
 | **Phase 3 (Next)** | **Versioning Foundation** | Immutable agent, workflow, dynamic tool, and JSON schema revisions; pinned dependencies; version history, diffing, and rollback | ⏳ **Ready to Implement** |
 | **Phase 4** | **Builder Frontend MVP** | Next.js agent editor, chat and thread-isolated document management, live dynamic tool testing, workflow run viewer, and React Flow visual graph editor for verified node types | 📅 Planned |
 | **Phase 5** | **Advanced Orchestration** | Subgraphs, parallel execution with deterministic merge behavior, error routing branches, and multi-agent supervisor workflows | 📅 Planned |
@@ -59,12 +59,17 @@ This document tracks completed milestones, architectural capabilities, and the u
 - **Increment 3 — Durable Execution, Timeouts, and Worker Recovery**:
   - Active execution budget tracking (`budget_seconds`, `consumed_seconds`, `execution_started_at`) strictly deducting running slices while ignoring paused/interrupted duration.
   - Boundary timeout enforcement transitioning over-budget runs to `TIMED_OUT` with `timed_out` trace event.
-  - Deterministic tool idempotency keys (`{run_id}:{node_id}:{invocation_id}:{attempt}`) injected as `X-Idempotency-Key` headers on HTTP tool executions.
-  - Worker lease and heartbeat tracking (`worker_id`, `lease_expires_at`) with stale lease recovery sweeper (`reconcile_stale_workflow_runs`) marking abandoned executions `FAILED`.
-  - Taskiq background execution worker task (`execute_workflow_task`).
-  - Capabilities advertisement (`GET /api/v1/workflows/capabilities`) reporting supported visibility, control, budget, and recovery features.
-- **Regression Verification**:
+  - Worker lease, heartbeat tracking, and fencing token generation (`worker_id`, `lease_expires_at`, `generation`) preventing stale or zombie workers from mutating runs (`WorkerFencedError`).
+  - Stale lease recovery sweeper (`reconcile_stale_workflow_runs`) detecting expired worker leases and transitioning abandoned executions to `FAILED`.
+  - Transactional outbox dispatch table (`workflow_dispatches`) ensuring runs are created in `PENDING` and queued reliably with retry backoff (`retry_pending_dispatches`).
+  - Asynchronous HTTP 202 Accepted response on `POST /workflows/{id}/run` returning immediately while background workers claim and execute the run.
+  - Autonomous short-transaction event persistence with atomic monotonic sequence allocation (`WorkflowRun.next_event_sequence`) ensuring live visibility and zero sequence collisions.
+  - Persisted tool invocation table (`workflow_tool_invocations`) recording identity, logical occurrence, and idempotency key (`{run_id}:{node_id}:{invocation_id}:{occurrence}`), allowing safe replay and reuse of succeeded results without duplicate external calls.
+  - Decoupled execution metadata propagation injecting `X-Idempotency-Key` headers in `HttpToolExecutor` without polluting validated tool argument schemas.
+  - Capabilities advertisement (`GET /api/v1/workflows/capabilities`) reporting supported visibility, control, budget, worker recovery, and dispatch features.
+- **Regression & Integration Verification**:
   - 194 passed offline tests, 0 failures across the entire test suite.
+  - 8 PostgreSQL integration tests in `tests/integration/test_workflow_execution_recovery.py` verifying duplicate claim mutual exclusion, cross-session pause boundary detection, checkpoint progress preservation on resume, live event visibility, atomic sequence uniqueness under concurrent writers, heartbeat fencing, tool replay idempotency, and outbox dispatch retry recovery.
 
 ---
 

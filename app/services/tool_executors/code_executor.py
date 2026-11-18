@@ -55,7 +55,7 @@ class CodeToolExecutor:
         self.config = config
         validate_code_ast(config.code, config.allowed_modules)
 
-    async def execute(self, arguments: dict[str, Any]) -> Any:
+    async def execute(self, arguments: dict[str, Any], metadata: dict[str, Any] | None = None) -> Any:
         try:
             return await run_code_process({
                 "mode": "tool", "code": self.config.code, "entrypoint": self.config.entrypoint,

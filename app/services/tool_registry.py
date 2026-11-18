@@ -10,7 +10,9 @@ import logging
 from collections import OrderedDict
 from copy import deepcopy
 from typing import Any
+import inspect
 import uuid
+from contextvars import ContextVar
 
 from langchain_core.tools import BaseTool, StructuredTool
 from pydantic import BaseModel, ConfigDict, Field, create_model, model_validator
@@ -35,6 +37,17 @@ logger = logging.getLogger(__name__)
 # In-memory compiled tool cache: (user_id, tool_id_str, version) -> BaseTool
 _COMPILED_TOOL_CACHE: OrderedDict[tuple[str, str, int], BaseTool] = OrderedDict()
 _MAX_COMPILED_TOOLS = 256
+_TOOL_EXECUTION_METADATA: ContextVar[dict[str, Any] | None] = ContextVar("_TOOL_EXECUTION_METADATA", default=None)
+
+
+def set_tool_execution_metadata(metadata: dict[str, Any] | None):
+    """Sets the execution metadata contextvar for the current task."""
+    return _TOOL_EXECUTION_METADATA.set(metadata)
+
+
+def reset_tool_execution_metadata(token):
+    """Resets the execution metadata contextvar."""
+    _TOOL_EXECUTION_METADATA.reset(token)
 
 
 def json_schema_to_pydantic_model(schema: dict[str, Any], model_name: str) -> type[BaseModel]:
@@ -171,7 +184,8 @@ class ToolRegistry:
         # 3. Create async execution handler
         async def _execute_coroutine(**kwargs: Any) -> Any:
             validate_payload(kwargs, tool_orm.input_schema, "Tool arguments")
-            res = await executor.execute(kwargs)
+            meta = _TOOL_EXECUTION_METADATA.get()
+            res = await executor.execute(kwargs, metadata=meta)
             validate_payload(res, tool_orm.output_schema, "Tool output")
             return res
 

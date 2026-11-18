@@ -282,7 +282,7 @@ async def test_claim_and_heartbeat_workflow_run():
         user_id="bob",
         workflow_id=uuid.uuid4(),
         thread_id="t2",
-        status="RUNNING",
+        status="PENDING",
         worker_id=None,
         lease_expires_at=None,
         execution_log=[],

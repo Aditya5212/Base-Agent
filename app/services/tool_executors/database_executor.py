@@ -54,7 +54,7 @@ class DatabaseToolExecutor:
         self.config = config
         validate_readonly_sql(self.config.query_template)
 
-    async def execute(self, arguments: dict[str, Any]) -> list[dict[str, Any]]:
+    async def execute(self, arguments: dict[str, Any], metadata: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """Executes the query with parameterized inputs and returns rows as dictionaries."""
         raw_conn = self.config.connection_string
         resolved_connection = decrypt_secret(raw_conn) if raw_conn.startswith("gAAAAA") else raw_conn

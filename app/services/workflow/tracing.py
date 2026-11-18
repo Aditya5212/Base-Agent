@@ -10,6 +10,7 @@ from typing import Any, Callable
 import uuid
 
 from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import AsyncSessionLocal
 from app.models.workflow import WorkflowRunEvent
 from app.services.workflow.state import WorkflowState
@@ -93,11 +94,11 @@ def redact_error_message(error: str | None) -> str | None:
 
 async def record_run_event(
     run_id: str | uuid.UUID,
-    sequence: int,
-    invocation_id: str | uuid.UUID,
-    node_id: str,
-    node_type: str,
-    event_type: str,
+    sequence: int | None = None,
+    invocation_id: str | uuid.UUID | None = None,
+    node_id: str = "system",
+    node_type: str = "system",
+    event_type: str = "node_started",
     attempt: int = 1,
     duration_ms: int | None = None,
     status: str | None = None,
@@ -111,15 +112,20 @@ async def record_run_event(
     tool_name: str | None = None,
     tool_invocation_id: str | None = None,
     metadata_json: dict[str, Any] | None = None,
+    event_session: AsyncSession | None = None,
 ) -> WorkflowRunEvent | None:
     """Persists a single immutable execution trace event."""
     try:
         run_uuid = uuid.UUID(str(run_id)) if not isinstance(run_id, uuid.UUID) else run_id
-        inv_uuid = uuid.UUID(str(invocation_id)) if not isinstance(invocation_id, uuid.UUID) else invocation_id
+        inv_uuid = (
+            uuid.UUID(str(invocation_id))
+            if invocation_id is not None and not isinstance(invocation_id, uuid.UUID)
+            else (invocation_id or uuid.uuid4())
+        )
 
         event = WorkflowRunEvent(
             run_id=run_uuid,
-            sequence=sequence,
+            sequence=sequence or 1,
             invocation_id=inv_uuid,
             node_id=node_id,
             node_type=node_type,
@@ -149,23 +155,54 @@ async def record_run_event(
                 hook(event)
             return event
 
-        # 2. Check active ambient database session
+        # 2. Check ambient mock session (offline unit tests)
         active_session = _CURRENT_DB_SESSION.get()
-        if active_session is not None and hasattr(active_session, "add"):
-            active_session.add(event)
-            if hasattr(active_session, "flush") and asyncio.iscoroutinefunction(active_session.flush):
-                try:
-                    await active_session.flush()
-                except Exception:
-                    pass
+        if active_session is not None and not isinstance(active_session, AsyncSession):
+            if hasattr(active_session, "add"):
+                if sequence is None:
+                    next_s = getattr(active_session, "_seq_counter", 0) + 1
+                    setattr(active_session, "_seq_counter", next_s)
+                    event.sequence = next_s
+                active_session.add(event)
             return event
 
-        # 3. Fallback to independent connection session with timeout
-        async with asyncio.timeout(2.0):
-            async with AsyncSessionLocal() as session:
-                session.add(event)
-                await session.commit()
-                return event
+        # Control transitions already hold the run lock; append in that transaction.
+        if event_session is not None:
+            from app.models.workflow import WorkflowRun
+            from sqlalchemy import update
+
+            allocated = await event_session.execute(
+                update(WorkflowRun).where(WorkflowRun.id == run_uuid)
+                .values(next_event_sequence=WorkflowRun.next_event_sequence + 1)
+                .returning(WorkflowRun.next_event_sequence)
+            )
+            event.sequence = allocated.scalar_one() - 1
+            event_session.add(event)
+            await event_session.flush()
+            return event
+
+        # 3. Persist independently in an autonomous short transaction with atomic sequence allocation
+        try:
+            from app.models.workflow import WorkflowRun
+            from sqlalchemy import select
+
+            async with asyncio.timeout(3.0):
+                async with AsyncSessionLocal() as session:
+                    stmt = select(WorkflowRun).where(WorkflowRun.id == run_uuid).with_for_update()
+                    res = await session.execute(stmt)
+                    run_row = res.scalar_one_or_none()
+                    if run_row is not None:
+                        allocated_seq = run_row.next_event_sequence or 1
+                        event.sequence = allocated_seq
+                        run_row.next_event_sequence = allocated_seq + 1
+                    elif sequence is not None:
+                        event.sequence = sequence
+
+                    session.add(event)
+                    await session.commit()
+                    return event
+        except Exception as db_exc:
+            raise ExecutionObservabilityDegradedError("Execution event could not be committed") from db_exc
     except Exception as exc:
         logger.warning(
             "Failed to record execution trace event [run_id=%s, node_id=%s, event=%s]: %s",
@@ -174,7 +211,7 @@ async def record_run_event(
             event_type,
             exc,
         )
-        return None
+        raise ExecutionObservabilityDegradedError("Execution event persistence failed") from exc
 
 
 class WorkflowCancelledError(Exception):
@@ -184,6 +221,16 @@ class WorkflowCancelledError(Exception):
 
 class WorkflowTimeoutError(Exception):
     """Raised when workflow execution exceeds its configured budget_seconds."""
+    pass
+
+
+class WorkerFencedError(Exception):
+    """Raised when worker lease is lost or fenced by another worker."""
+    pass
+
+
+class ExecutionObservabilityDegradedError(Exception):
+    """Raised when execution events cannot be persisted to storage."""
     pass
 
 
@@ -197,14 +244,70 @@ def wrap_node_with_tracing(node_id: str, node_type: str, handler: Callable) -> C
             return await handler(state)
 
         # -------------------------------------------------------------------
-        # Cooperative boundary check: execution budget / timeout
+        # Cooperative boundary check: read fresh persisted control & fencing state
         # -------------------------------------------------------------------
         budget_sec = state.get("budget_seconds")
         consumed_sec = float(state.get("consumed_seconds", 0.0) or 0.0)
         started_at = state.get("execution_started_at")
+        ctrl_req = state.get("control_request")
+        current_worker_id = state.get("worker_id")
+        current_generation = state.get("generation")
 
         active_sess = _CURRENT_DB_SESSION.get()
-        if active_sess is not None and hasattr(active_sess, "get"):
+        if active_sess is not None and isinstance(active_sess, AsyncSession):
+            # Real database execution: query fresh state bypassing identity map
+            try:
+                from app.models.workflow import WorkflowRun
+                from sqlalchemy import select
+                r_uuid = uuid.UUID(str(raw_run_id))
+
+                async with AsyncSessionLocal() as read_sess:
+                    stmt = select(
+                        WorkflowRun.control_request,
+                        WorkflowRun.status,
+                        WorkflowRun.budget_seconds,
+                        WorkflowRun.consumed_seconds,
+                        WorkflowRun.execution_started_at,
+                        WorkflowRun.worker_id,
+                        WorkflowRun.generation,
+                        WorkflowRun.lease_expires_at,
+                    ).where(WorkflowRun.id == r_uuid)
+                    row_res = await read_sess.execute(stmt)
+                    row = row_res.first()
+                    if row:
+                        ctrl_req = row.control_request
+                        run_status = row.status
+                        if budget_sec is None and row.budget_seconds:
+                            budget_sec = row.budget_seconds
+                        if row.consumed_seconds is not None:
+                            consumed_sec = float(row.consumed_seconds)
+                        if row.execution_started_at is not None:
+                            started_at = row.execution_started_at
+
+                        # Fencing check: ensure another worker hasn't claimed or recovered the run
+                        if current_worker_id and row.worker_id and row.worker_id != current_worker_id:
+                            raise WorkerFencedError(
+                                f"Worker fenced: run '{raw_run_id}' claimed by worker '{row.worker_id}', "
+                                f"current worker is '{current_worker_id}'"
+                            )
+                        if current_generation is not None and row.generation is not None and row.generation != current_generation:
+                            raise WorkerFencedError(
+                                f"Worker fenced: run '{raw_run_id}' generation is {row.generation}, "
+                                f"current worker generation is {current_generation}"
+                            )
+                        if current_worker_id and (
+                            row.lease_expires_at is None
+                            or row.lease_expires_at <= datetime.now(timezone.utc)
+                        ):
+                            raise WorkerFencedError("Worker lease expired before node execution")
+                        if run_status in ("FAILED", "TIMED_OUT", "CANCELLED"):
+                            raise WorkerFencedError(f"Worker fenced: run '{raw_run_id}' is in terminal status '{run_status}'")
+            except WorkerFencedError:
+                raise
+            except Exception as exc:
+                raise WorkerFencedError("Cannot verify current execution ownership") from exc
+        elif active_sess is not None and hasattr(active_sess, "get"):
+            # Offline test mode with mock session: read directly from mock session or state without network calls
             try:
                 from app.models.workflow import WorkflowRun
                 r_uuid = uuid.UUID(str(raw_run_id))
@@ -216,6 +319,8 @@ def wrap_node_with_tracing(node_id: str, node_type: str, handler: Callable) -> C
                         consumed_sec = float(run_row.consumed_seconds)
                     if run_row.execution_started_at is not None:
                         started_at = run_row.execution_started_at
+                    if run_row.control_request:
+                        ctrl_req = run_row.control_request
             except Exception:
                 pass
 
@@ -240,11 +345,11 @@ def wrap_node_with_tracing(node_id: str, node_type: str, handler: Callable) -> C
                     active_elapsed = max(0.0, (now - started_at).total_seconds())
             total_active = consumed_sec + active_elapsed
             if total_active > float(budget_sec):
-                t_seq = state.get("event_sequence", 0) + 1
                 inv_id = uuid.uuid4()
+                current_seq = (state.get("event_sequence", 0) or 0) + 1
                 await record_run_event(
                     run_id=raw_run_id,
-                    sequence=t_seq,
+                    sequence=current_seq,
                     invocation_id=inv_id,
                     node_id=node_id,
                     node_type=node_type,
@@ -254,28 +359,12 @@ def wrap_node_with_tracing(node_id: str, node_type: str, handler: Callable) -> C
                 )
                 raise WorkflowTimeoutError(f"Workflow execution timed out: budget of {budget_sec}s exceeded")
 
-        # -------------------------------------------------------------------
-        # Cooperative boundary check: evaluate pause / cancel requests
-        # -------------------------------------------------------------------
-        ctrl_req = state.get("control_request")
-        if not ctrl_req:
-            active_sess = _CURRENT_DB_SESSION.get()
-            if active_sess is not None and hasattr(active_sess, "get"):
-                try:
-                    from app.models.workflow import WorkflowRun
-                    r_uuid = uuid.UUID(str(raw_run_id))
-                    run_row = await active_sess.get(WorkflowRun, r_uuid)
-                    if run_row and isinstance(run_row, WorkflowRun):
-                        ctrl_req = run_row.control_request
-                except Exception:
-                    pass
-
         if ctrl_req == "cancel_requested":
-            c_seq = state.get("event_sequence", 0) + 1
             inv_id = uuid.uuid4()
+            current_seq = (state.get("event_sequence", 0) or 0) + 1
             await record_run_event(
                 run_id=raw_run_id,
-                sequence=c_seq,
+                sequence=current_seq,
                 invocation_id=inv_id,
                 node_id=node_id,
                 node_type=node_type,
@@ -286,11 +375,11 @@ def wrap_node_with_tracing(node_id: str, node_type: str, handler: Callable) -> C
             raise WorkflowCancelledError(f"Workflow execution cancelled before node '{node_id}'")
 
         if ctrl_req == "pause_requested":
-            p_seq = state.get("event_sequence", 0) + 1
             inv_id = uuid.uuid4()
+            current_seq = (state.get("event_sequence", 0) or 0) + 1
             await record_run_event(
                 run_id=raw_run_id,
-                sequence=p_seq,
+                sequence=current_seq,
                 invocation_id=inv_id,
                 node_id=node_id,
                 node_type=node_type,
@@ -300,17 +389,28 @@ def wrap_node_with_tracing(node_id: str, node_type: str, handler: Callable) -> C
             from langgraph.types import interrupt
             interrupt({"type": "manual_pause", "node_id": node_id, "reason": "user_requested"})
 
-        invocation_id = uuid.uuid4()
-        current_seq = state.get("event_sequence", 0)
+        # Persist invocation identity deterministically across checkpoints & replays
+        node_occurrences = dict(state.get("node_occurrences") or {})
+        occurrence = node_occurrences.get(node_id, 0) + 1
+        node_occurrences[node_id] = occurrence
+
+        node_invocations = dict(state.get("node_invocations") or {})
+        occ_key = f"{node_id}:{occurrence}"
+        if occ_key not in node_invocations:
+            node_invocations[occ_key] = str(uuid.uuid5(uuid.UUID(str(raw_run_id)), occ_key))
+        invocation_id = uuid.UUID(node_invocations[occ_key])
 
         # Attach invocation_id to state for tool nodes or downstream introspection
         state["current_invocation_id"] = str(invocation_id)
-        tool_invocation_id = f"{raw_run_id}:{node_id}:{invocation_id}:1" if node_type == "tool_call" else None
+        state["node_occurrences"] = node_occurrences
+        state["node_invocations"] = node_invocations
+        tool_invocation_id = f"{raw_run_id}:{node_id}:{invocation_id}:{occurrence}" if node_type == "tool_call" else None
 
         # 1. Event: node_started
-        start_seq = current_seq + 1
         input_snapshot = dict(state.get("variables") or {})
-        await record_run_event(
+        start_seq = (state.get("event_sequence", 0) or 0) + 1
+        state["event_sequence"] = start_seq
+        start_ev = await record_run_event(
             run_id=raw_run_id,
             sequence=start_seq,
             invocation_id=invocation_id,
@@ -350,13 +450,14 @@ def wrap_node_with_tracing(node_id: str, node_type: str, handler: Callable) -> C
 
             elif node_type == "tool_call":
                 tool_name = (output_snapshot or {}).get("tool") or node_id
-                tool_invocation_id = f"{raw_run_id}:{node_id}:{invocation_id}:1"
+                tool_invocation_id = f"{raw_run_id}:{node_id}:{invocation_id}:{occurrence}"
 
             # 2. Event: node_completed
-            complete_seq = start_seq + 1
-            await record_run_event(
+            done_seq = (state.get("event_sequence", 0) or 0) + 1
+            state["event_sequence"] = done_seq
+            comp_ev = await record_run_event(
                 run_id=raw_run_id,
-                sequence=complete_seq,
+                sequence=done_seq,
                 invocation_id=invocation_id,
                 node_id=node_id,
                 node_type=node_type,
@@ -372,21 +473,24 @@ def wrap_node_with_tracing(node_id: str, node_type: str, handler: Callable) -> C
             )
 
             if isinstance(result, dict):
-                result["event_sequence"] = complete_seq
+                result["node_occurrences"] = node_occurrences
+                result["node_invocations"] = node_invocations
+                result["event_sequence"] = comp_ev.sequence if (comp_ev is not None and isinstance(getattr(comp_ev, "sequence", None), int)) else done_seq
             return result
 
         except Exception as exc:
             duration_ms = int((time.perf_counter() - t0) * 1000)
-            failed_seq = start_seq + 1
 
             # Check if this is an expected interrupt (human-in-the-loop)
             is_interrupt = exc.__class__.__name__ == "GraphInterrupt"
             event_type = "approval_requested" if is_interrupt else "node_failed"
             status = "interrupted" if is_interrupt else "failed"
 
+            fail_seq = (state.get("event_sequence", 0) or 0) + 1
+            state["event_sequence"] = fail_seq
             await record_run_event(
                 run_id=raw_run_id,
-                sequence=failed_seq,
+                sequence=fail_seq,
                 invocation_id=invocation_id,
                 node_id=node_id,
                 node_type=node_type,

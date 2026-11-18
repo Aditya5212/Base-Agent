@@ -5,7 +5,7 @@ from app.models.structured_schema import StructuredSchema
 from app.models.thread import Thread, ThreadAsset
 from app.models.tool import Tool
 from app.models.user import User
-from app.models.workflow import Workflow, WorkflowRun, WorkflowRunEvent
+from app.models.workflow import Workflow, WorkflowRun, WorkflowRunEvent, WorkflowDispatch, WorkflowToolInvocation
 
 __all__ = [
     "Agent",
@@ -22,5 +22,7 @@ __all__ = [
     "Workflow",
     "WorkflowRun",
     "WorkflowRunEvent",
+    "WorkflowDispatch",
+    "WorkflowToolInvocation",
 ]
 

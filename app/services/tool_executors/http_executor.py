@@ -90,7 +90,11 @@ class HttpToolExecutor:
     def __init__(self, config: HttpToolConfig):
         self.config = config
 
-    async def execute(self, arguments: dict[str, Any]) -> Any:
+    async def execute(
+        self,
+        arguments: dict[str, Any],
+        metadata: dict[str, Any] | None = None,
+    ) -> Any:
         """Executes the HTTP request using the resolved arguments."""
         args = dict(arguments or {})
 
@@ -102,7 +106,12 @@ class HttpToolExecutor:
         for k, v in self.config.headers_template.items():
             headers[k] = _interpolate_string(v, args)
 
-        idempotency_key = args.pop("__idempotency_key__", None) or args.get("idempotency_key")
+        idempotency_key = (
+            (metadata or {}).get("idempotency_key")
+            or (metadata or {}).get("tool_idempotency_key")
+            or args.pop("__idempotency_key__", None)
+            or args.get("idempotency_key")
+        )
         if idempotency_key and "X-Idempotency-Key" not in headers:
             headers["X-Idempotency-Key"] = str(idempotency_key)
 

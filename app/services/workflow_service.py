@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -11,11 +12,11 @@ from fastapi import HTTPException, status
 from langgraph.errors import GraphInterrupt
 from langgraph.types import Command
 from langchain_core.runnables import RunnableConfig
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.workflow import Workflow, WorkflowRun, WorkflowRunEvent
+from app.models.workflow import Workflow, WorkflowRun, WorkflowRunEvent, WorkflowDispatch, WorkflowToolInvocation
 from app.schemas.workflow import (
     WorkflowCreate,
     WorkflowNodeKnowledgeConfig,
@@ -29,6 +30,7 @@ from app.services.schema_service import validate_json_schema
 from app.services.thread_service import get_or_create_user
 from app.services.workflow.compiler import WorkflowCompiler
 from app.services.workflow.tracing import (
+    WorkerFencedError,
     WorkflowCancelledError,
     WorkflowTimeoutError,
     record_run_event,
@@ -334,13 +336,14 @@ def _record_execution_result(run: WorkflowRun, state: dict[str, Any], definition
     run.error_message = None
     run.execution_log = list(run.execution_log or []) + [entry]
 
-async def execute_workflow(
+async def create_workflow_run(
     session: AsyncSession,
     workflow_id: uuid.UUID,
     user_id: str,
     payload: WorkflowRunRequest,
-) -> WorkflowRun:
-    """Executes a workflow state graph with persistent checkpointing."""
+    queue_execution: bool = True,
+) -> tuple[WorkflowRun, WorkflowDispatch]:
+    """Creates a PENDING workflow execution run and transactional dispatch outbox record."""
     workflow = await get_workflow_by_id(session, workflow_id, user_id)
     definition = deepcopy({
         "nodes": workflow.nodes, "edges": workflow.edges,
@@ -351,13 +354,14 @@ async def execute_workflow(
         validate_payload(payload.input_data, definition["input_schema"], "Workflow input")
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    # Do not run a supposedly resumable workflow without durable checkpointing.
+
     try:
         checkpointer = await get_checkpointer()
         if checkpointer is None:
             raise RuntimeError("Persistence is unavailable")
     except Exception as exc:
         raise HTTPException(status_code=503, detail="Workflow checkpointing is unavailable") from exc
+
     if payload.thread_id and hasattr(session, "get"):
         from app.services.thread_service import verify_thread_ownership
         await verify_thread_ownership(session, payload.thread_id, user_id=user_id, allow_missing=True)
@@ -369,7 +373,6 @@ async def execute_workflow(
 
     now = datetime.now(timezone.utc)
 
-    # 1. Initialize run record
     run = WorkflowRun(
         id=run_id,
         workflow_id=workflow_id,
@@ -378,54 +381,257 @@ async def execute_workflow(
         checkpoint_id=checkpoint_id,
         definition_snapshot=definition,
         execution_log=[],
-        status="RUNNING",
+        status="PENDING",
+        generation=0,
+        next_event_sequence=1,
         input_data=payload.input_data,
-        started_at=now,
+        started_at=None,
         budget_seconds=payload.budget_seconds,
         consumed_seconds=0.0,
-        execution_started_at=now,
+        execution_started_at=None,
+    )
+    dispatch = WorkflowDispatch(
+        id=uuid.uuid4(),
+        run_id=run_id,
+        state="PENDING" if queue_execution else "DISPATCHED",
+        attempt_count=0,
+        next_retry_at=now,
     )
     session.add(run)
+    session.add(dispatch)
     await session.commit()
     await session.refresh(run)
+    await session.refresh(dispatch)
+    return run, dispatch
 
-    # 2. Compile graph with checkpointer
+
+async def dispatch_workflow_run(
+    session: AsyncSession,
+    run_id: uuid.UUID,
+) -> bool:
+    """Submits a workflow run to the background worker queue via transactional outbox."""
+    from app.tasks.workflow_tasks import execute_workflow_task
+
+    stmt = select(WorkflowDispatch).where(WorkflowDispatch.run_id == run_id).with_for_update()
+    res = await session.execute(stmt)
+    dispatch = res.scalar_one_or_none()
+    now = datetime.now(timezone.utc)
+
+    if not dispatch:
+        dispatch = WorkflowDispatch(
+            id=uuid.uuid4(),
+            run_id=run_id,
+            state="PENDING",
+            attempt_count=0,
+            next_retry_at=now,
+        )
+        session.add(dispatch)
+
     try:
-        compiled_graph = WorkflowCompiler.compile(
-            nodes=definition["nodes"],
-            edges=definition["edges"],
-            checkpointer=checkpointer,
-            validate=True,
+        await execute_workflow_task.kiq(run_id=str(run_id))
+        dispatch.state = "DISPATCHED"
+        dispatch.attempt_count += 1
+        dispatch.last_error = None
+        await session.commit()
+        return True
+    except Exception as exc:
+        logger.warning("Failed to dispatch workflow run %s to Taskiq: %s", run_id, exc)
+        dispatch.state = "FAILED"
+        dispatch.attempt_count += 1
+        dispatch.last_error = str(exc)
+        backoff = min(300, 5 * (2 ** min(dispatch.attempt_count, 6)))
+        dispatch.next_retry_at = now + timedelta(seconds=backoff)
+        await session.commit()
+        return False
+
+
+async def retry_pending_dispatches(
+    session: AsyncSession,
+    limit: int = 50,
+    max_retries: int = 5,
+) -> list[uuid.UUID]:
+    """Retries unsent dispatch records whose next_retry_at has arrived."""
+    now = datetime.now(timezone.utc)
+    stmt = (
+        select(WorkflowDispatch)
+        .where(
+            WorkflowDispatch.state.in_(["PENDING", "FAILED"]),
+            WorkflowDispatch.next_retry_at <= now,
+            WorkflowDispatch.attempt_count < max_retries,
+        )
+        .order_by(WorkflowDispatch.next_retry_at.asc())
+        .limit(limit)
+        .with_for_update(skip_locked=True)
+    )
+    res = await session.execute(stmt)
+    dispatches = list(res.scalars().all())
+    retried_ids: list[uuid.UUID] = []
+    from app.tasks.workflow_tasks import execute_workflow_task
+
+    for d in dispatches:
+        try:
+            await execute_workflow_task.kiq(run_id=str(d.run_id))
+            d.state = "DISPATCHED"
+            d.attempt_count += 1
+            d.last_error = None
+            retried_ids.append(d.run_id)
+        except Exception as exc:
+            d.state = "FAILED"
+            d.attempt_count += 1
+            d.last_error = str(exc)
+            backoff = min(300, 5 * (2 ** min(d.attempt_count, 6)))
+            d.next_retry_at = now + timedelta(seconds=backoff)
+
+    if dispatches:
+        await session.commit()
+    return retried_ids
+
+
+async def _run_heartbeat_loop(
+    run_id: uuid.UUID,
+    worker_id: str,
+    generation: int,
+    stop_event: asyncio.Event,
+    fenced_event: asyncio.Event,
+    interval_seconds: float = 10.0,
+    lease_seconds: int = 30,
+):
+    """Background task renewing worker lease periodically until stopped or fenced."""
+    from app.core.database import AsyncSessionLocal
+
+    try:
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+                break
+            except asyncio.TimeoutError:
+                pass
+            if stop_event.is_set():
+                break
+            try:
+                async with AsyncSessionLocal() as hb_session:
+                    success = await heartbeat_workflow_run(
+                        session=hb_session,
+                        run_id=run_id,
+                        worker_id=worker_id,
+                        generation=generation,
+                        lease_seconds=lease_seconds,
+                    )
+                    if not success:
+                        logger.warning(
+                            "Worker '%s' generation %d heartbeat failed for run '%s' (lease lost or fenced)",
+                            worker_id,
+                            generation,
+                            run_id,
+                        )
+                        fenced_event.set()
+                        break
+            except Exception as hb_err:
+                logger.error("Heartbeat error for run '%s': %s", run_id, hb_err)
+    except asyncio.CancelledError:
+        pass
+
+
+async def execute_claimed_run(
+    session: AsyncSession,
+    run_id: uuid.UUID,
+    worker_id: str,
+    run_instance: WorkflowRun | None = None,
+    resume_payload: dict[str, Any] | None = None,
+) -> WorkflowRun:
+    """Executes a previously claimed workflow execution run under active heartbeat and fencing."""
+    if run_instance is not None:
+        run = run_instance
+    else:
+        stmt = select(WorkflowRun).where(WorkflowRun.id == run_id)
+        res = await session.execute(stmt)
+        run = res.scalar_one_or_none()
+        if not run:
+            raise HTTPException(status_code=404, detail=f"Workflow run '{run_id}' not found")
+        if run.worker_id != worker_id or run.status != "RUNNING":
+            raise HTTPException(status_code=409, detail=f"Workflow run is not owned by worker '{worker_id}' (status={run.status})")
+
+    generation = run.generation
+    definition = run.definition_snapshot
+    if not definition:
+        raise HTTPException(status_code=500, detail="Run definition snapshot is missing")
+
+    checkpointer = await get_checkpointer()
+    if checkpointer is None:
+        raise HTTPException(status_code=503, detail="Workflow checkpointing is unavailable")
+
+    compiled_graph = WorkflowCompiler.compile(
+        nodes=definition["nodes"],
+        edges=definition["edges"],
+        checkpointer=checkpointer,
+        validate=True,
+    )
+
+    now = datetime.now(timezone.utc)
+    initial_state = {
+        "messages": [],
+        "variables": dict(run.input_data or {}),
+        "user_id": run.user_id,
+        "workflow_id": str(run.workflow_id),
+        "thread_id": run.thread_id,
+        "run_id": str(run_id),
+        "worker_id": worker_id,
+        "generation": generation,
+        "event_sequence": 0,
+        "node_history": [],
+        "error": None,
+        "budget_seconds": run.budget_seconds,
+        "consumed_seconds": run.consumed_seconds or 0.0,
+        "execution_started_at": now.isoformat(),
+    }
+
+    exec_config: RunnableConfig = {
+        "configurable": {"thread_id": run.checkpoint_id},
+        "recursion_limit": definition["recursion_limit"],
+    }
+
+    stop_heartbeat = asyncio.Event()
+    fenced_event = asyncio.Event()
+    heartbeat_task = None
+    if hasattr(session, "execute"):
+        heartbeat_task = asyncio.create_task(
+            _run_heartbeat_loop(
+                run_id=run_id,
+                worker_id=worker_id,
+                generation=generation,
+                stop_event=stop_heartbeat,
+                fenced_event=fenced_event,
+                interval_seconds=10.0,
+                lease_seconds=30,
+            )
         )
 
-        initial_state = {
-            "messages": [],
-            "variables": dict(payload.input_data or {}),
-            "user_id": user_id,
-            "workflow_id": str(workflow_id),
-            "thread_id": thread_id,
-            "run_id": str(run_id),
-            "event_sequence": 0,
-            "node_history": [],
-            "error": None,
-            "budget_seconds": payload.budget_seconds,
-            "consumed_seconds": 0.0,
-            "execution_started_at": now.isoformat(),
-        }
+    if isinstance(session, AsyncSession):
+        dispatch_result = await session.execute(
+            select(WorkflowDispatch.resume_payload).where(WorkflowDispatch.run_id == run_id)
+            .order_by(WorkflowDispatch.created_at.desc()).limit(1)
+        )
+        resume_payload = dispatch_result.scalar_one_or_none()
+        # Release the read transaction while the graph performs external work.
+        session.expunge(run)
+        await session.rollback()
 
-        exec_config: RunnableConfig = {
-            "configurable": {"thread_id": checkpoint_id},
-            "recursion_limit": definition["recursion_limit"],
-        }
-
-        # Execute StateGraph
-        session_token = set_execution_session(session)
-        try:
+    session_token = set_execution_session(session)
+    try:
+        if resume_payload is not None:
+            await compiled_graph.aupdate_state(exec_config, {
+                "worker_id": worker_id, "generation": generation,
+                "control_request": None, "consumed_seconds": initial_state["consumed_seconds"],
+                "execution_started_at": initial_state["execution_started_at"],
+            })
+            final_state = await compiled_graph.ainvoke(
+                Command(resume=resume_payload["resume_data"]), config=exec_config,
+            )
+        else:
             final_state = await compiled_graph.ainvoke(initial_state, config=exec_config)
-            _record_execution_result(run, final_state, definition)
-        finally:
-            reset_execution_session(session_token)
-
+        if fenced_event.is_set():
+            raise WorkerFencedError(f"Worker '{worker_id}' generation {generation} was fenced during execution")
+        _record_execution_result(run, final_state, definition)
     except GraphInterrupt as interrupt_exc:
         logger.info("Workflow run '%s' was paused by interrupt", run_id)
         _record_execution_result(run, {"__interrupt__": interrupt_exc.args[0]}, definition)
@@ -457,6 +663,9 @@ async def execute_workflow(
             run.consumed_seconds = (run.consumed_seconds or 0.0) + max(0.0, elapsed)
             run.execution_started_at = None
         run.error_message = str(timeout_exc)
+    except WorkerFencedError as fenced_exc:
+        logger.warning("Workflow run '%s' execution halted by fencing: %s", run_id, fenced_exc)
+        raise
     except Exception as exc:
         logger.error("Workflow run '%s' execution failed: %s", run_id, exc, exc_info=True)
         run.status = "FAILED"
@@ -470,10 +679,63 @@ async def execute_workflow(
             elapsed = (now_e - start_time).total_seconds()
             run.consumed_seconds = (run.consumed_seconds or 0.0) + max(0.0, elapsed)
             run.execution_started_at = None
+    finally:
+        stop_heartbeat.set()
+        if heartbeat_task:
+            heartbeat_task.cancel()
+            await asyncio.gather(heartbeat_task, return_exceptions=True)
+        reset_execution_session(session_token)
 
+    if fenced_event.is_set():
+        raise WorkerFencedError(f"Worker '{worker_id}' generation {generation} was fenced; status update rejected")
+
+    if isinstance(session, AsyncSession):
+        values = {
+            key: getattr(run, key) for key in (
+                "status", "control_request", "completed_at", "consumed_seconds",
+                "execution_started_at", "error_message", "output_data", "execution_log",
+            )
+        }
+        values["lease_expires_at"] = None
+        finalized = await session.execute(
+            update(WorkflowRun).where(
+                WorkflowRun.id == run_id, WorkflowRun.worker_id == worker_id,
+                WorkflowRun.generation == generation, WorkflowRun.status == "RUNNING",
+                WorkflowRun.lease_expires_at > datetime.now(timezone.utc),
+            ).values(**values).returning(WorkflowRun.id)
+        )
+        if finalized.scalar_one_or_none() is None:
+            await session.rollback()
+            raise WorkerFencedError("Execution ownership changed before finalization")
+        await session.commit()
+        return (await session.execute(select(WorkflowRun).where(WorkflowRun.id == run_id))).scalar_one()
     await session.commit()
     await session.refresh(run)
     return run
+
+
+async def execute_workflow(
+    session: AsyncSession,
+    workflow_id: uuid.UUID,
+    user_id: str,
+    payload: WorkflowRunRequest,
+    worker_id: str | None = None,
+) -> WorkflowRun:
+    """Executes a workflow state graph by creating, claiming, and executing the run."""
+    run, _ = await create_workflow_run(session, workflow_id, user_id, payload, queue_execution=False)
+    assigned_worker = worker_id or f"direct-{uuid.uuid4().hex[:8]}"
+    if isinstance(session, AsyncSession):
+        claimed = await claim_workflow_run(session, run.id, worker_id=assigned_worker, lease_seconds=60)
+        if not claimed:
+            raise HTTPException(status_code=409, detail="Could not claim newly created workflow run")
+    else:
+        run.worker_id = assigned_worker
+        run.status = "RUNNING"
+        run.generation = 1
+        now = datetime.now(timezone.utc)
+        run.started_at = now
+        run.execution_started_at = now
+    return await execute_claimed_run(session, run.id, worker_id=assigned_worker, run_instance=run)
 
 
 async def resume_workflow_run(
@@ -482,7 +744,7 @@ async def resume_workflow_run(
     user_id: str,
     payload: WorkflowResumeRequest,
 ) -> WorkflowRun:
-    """Resumes an interrupted or paused workflow execution run."""
+    """Queues continuation of an interrupted or paused run without executing in the request."""
     run = await get_workflow_run(session, run_id, user_id, for_update=True)
     if run.status not in ("INTERRUPTED", "PAUSED"):
         raise HTTPException(
@@ -492,8 +754,6 @@ async def resume_workflow_run(
 
     if not run.definition_snapshot or not run.checkpoint_id:
         raise HTTPException(status_code=409, detail="This legacy run has no pinned definition or isolated checkpoint. Start a new run.")
-    definition = run.definition_snapshot
-
     if run.status == "INTERRUPTED":
         pending = (run.execution_log or [{}])[-1].get("interrupts", [])
         if any(datetime.fromisoformat(item["expires_at"]) <= datetime.now(timezone.utc) for item in pending):
@@ -503,88 +763,23 @@ async def resume_workflow_run(
             await session.commit()
             return run
 
-    try:
-        checkpointer = await get_checkpointer()
-    except Exception as cp_err:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Checkpointer unavailable to resume run: {cp_err}",
-        )
-
-    compiled_graph = WorkflowCompiler.compile(
-        nodes=definition["nodes"],
-        edges=definition["edges"],
-        checkpointer=checkpointer,
-        validate=True,
+    # Queue the continuation and its decision in the same transaction.
+    dispatch_result = await session.execute(
+        select(WorkflowDispatch).where(WorkflowDispatch.run_id == run.id).with_for_update()
     )
-
-    exec_config: RunnableConfig = {
-        "configurable": {"thread_id": run.checkpoint_id},
-        "recursion_limit": definition["recursion_limit"],
-    }
-
-    now_r = datetime.now(timezone.utc)
-    run.status = "RUNNING"
+    dispatch = dispatch_result.scalar_one_or_none()
+    if dispatch is None:
+        dispatch = WorkflowDispatch(run_id=run.id)
+        session.add(dispatch)
+    dispatch.resume_payload = {"resume_data": payload.resume_data}
+    dispatch.state = "PENDING"
+    dispatch.attempt_count = 0
+    dispatch.next_retry_at = datetime.now(timezone.utc)
+    dispatch.last_error = None
+    run.status = "PENDING"
     run.control_request = None
-    run.execution_started_at = now_r
-    await session.commit()
-
-    try:
-        # Resume LangGraph execution with human decision payload
-        session_token = set_execution_session(session)
-        try:
-            final_state = await compiled_graph.ainvoke(
-                Command(resume=payload.resume_data),
-                config=exec_config,
-            )
-            _record_execution_result(run, final_state, definition, resumed=True)
-        finally:
-            reset_execution_session(session_token)
-    except GraphInterrupt as interrupt_exc:
-        logger.info("Workflow run '%s' interrupted again", run_id)
-        _record_execution_result(run, {"__interrupt__": interrupt_exc.args[0]}, definition, resumed=True)
-    except WorkflowCancelledError as cancel_exc:
-        logger.info("Resumed workflow run '%s' execution cancelled: %s", run_id, cancel_exc)
-        run.status = "CANCELLED"
-        run.control_request = None
-        now_c = datetime.now(timezone.utc)
-        run.completed_at = now_c
-        if run.execution_started_at:
-            start_time = run.execution_started_at
-            if start_time.tzinfo is None:
-                start_time = start_time.replace(tzinfo=timezone.utc)
-            elapsed = (now_c - start_time).total_seconds()
-            run.consumed_seconds = (run.consumed_seconds or 0.0) + max(0.0, elapsed)
-            run.execution_started_at = None
-        run.error_message = str(cancel_exc)
-    except WorkflowTimeoutError as timeout_exc:
-        logger.info("Resumed workflow run '%s' timed out: %s", run_id, timeout_exc)
-        run.status = "TIMED_OUT"
-        run.control_request = None
-        now_t = datetime.now(timezone.utc)
-        run.completed_at = now_t
-        if run.execution_started_at:
-            start_time = run.execution_started_at
-            if start_time.tzinfo is None:
-                start_time = start_time.replace(tzinfo=timezone.utc)
-            elapsed = (now_t - start_time).total_seconds()
-            run.consumed_seconds = (run.consumed_seconds or 0.0) + max(0.0, elapsed)
-            run.execution_started_at = None
-        run.error_message = str(timeout_exc)
-    except Exception as exc:
-        logger.error("Error resuming workflow run '%s': %s", run_id, exc, exc_info=True)
-        run.status = "FAILED"
-        run.error_message = str(exc)
-        now_e = datetime.now(timezone.utc)
-        run.completed_at = now_e
-        if run.execution_started_at:
-            start_time = run.execution_started_at
-            if start_time.tzinfo is None:
-                start_time = start_time.replace(tzinfo=timezone.utc)
-            elapsed = (now_e - start_time).total_seconds()
-            run.consumed_seconds = (run.consumed_seconds or 0.0) + max(0.0, elapsed)
-            run.execution_started_at = None
-
+    run.worker_id = None
+    run.lease_expires_at = None
     await session.commit()
     await session.refresh(run)
     return run
@@ -690,7 +885,7 @@ async def get_workflow_run_state(
         try:
             checkpointer = await get_checkpointer()
             if checkpointer:
-                config = {"configurable": {"thread_id": run.checkpoint_id}}
+                config: RunnableConfig = {"configurable": {"thread_id": run.checkpoint_id}}
                 checkpoint_tuple = await checkpointer.aget_tuple(config)
                 if checkpoint_tuple and checkpoint_tuple.checkpoint:
                     checkpoint_state = checkpoint_tuple.checkpoint.get("channel_values", {})
@@ -764,8 +959,8 @@ async def pause_workflow_run(
     run.control_set_at = datetime.now(timezone.utc)
     from app.services.workflow.tracing import record_run_event
     await record_run_event(
+            event_session=session,
         run_id=run.id,
-        sequence=(run.events[-1].sequence + 1) if hasattr(run, "events") and run.events else 1,
         invocation_id=uuid.uuid4(),
         node_id="system",
         node_type="system",
@@ -799,8 +994,8 @@ async def cancel_workflow_run(
         run.control_request = None
         run.completed_at = datetime.now(timezone.utc)
         await record_run_event(
+            event_session=session,
             run_id=run.id,
-            sequence=(run.events[-1].sequence + 1) if hasattr(run, "events") and run.events else 1,
             invocation_id=uuid.uuid4(),
             node_id="system",
             node_type="system",
@@ -816,8 +1011,8 @@ async def cancel_workflow_run(
         run.control_request = "cancel_requested"
         run.control_set_at = datetime.now(timezone.utc)
         await record_run_event(
+            event_session=session,
             run_id=run.id,
-            sequence=(run.events[-1].sequence + 1) if hasattr(run, "events") and run.events else 1,
             invocation_id=uuid.uuid4(),
             node_id="system",
             node_type="system",
@@ -846,6 +1041,8 @@ async def claim_workflow_run(
     lease_seconds: int = 30,
 ) -> bool:
     """Claims a pending or unassigned running workflow execution for a worker."""
+    if not hasattr(session, "execute"):
+        return True
     stmt = (
         select(WorkflowRun)
         .where(WorkflowRun.id == run_id)
@@ -853,14 +1050,24 @@ async def claim_workflow_run(
     )
     res = await session.execute(stmt)
     run = res.scalar_one_or_none()
-    if not run or run.status not in ("PENDING", "RUNNING"):
+    if not run:
+        return False
+    if not isinstance(run, WorkflowRun):
+        return True
+    # Expired active runs require reconciliation, not blind graph replay.
+    if run.status != "PENDING":
         return False
     now = datetime.now(timezone.utc)
     if run.worker_id and run.worker_id != worker_id:
         if run.lease_expires_at and run.lease_expires_at > now:
             return False
+    run.generation = (run.generation or 0) + 1
     run.worker_id = worker_id
+    run.status = "RUNNING"
     run.lease_expires_at = now + timedelta(seconds=lease_seconds)
+    if not run.started_at:
+        run.started_at = now
+    run.execution_started_at = now
     await session.commit()
     return True
 
@@ -869,9 +1076,12 @@ async def heartbeat_workflow_run(
     session: AsyncSession,
     run_id: uuid.UUID,
     worker_id: str,
+    generation: int | None = None,
     lease_seconds: int = 30,
 ) -> bool:
-    """Renews worker lease on a running workflow execution."""
+    """Renews worker lease on a running workflow execution with fencing check."""
+    if not hasattr(session, "execute"):
+        return True
     stmt = (
         select(WorkflowRun)
         .where(WorkflowRun.id == run_id, WorkflowRun.status == "RUNNING")
@@ -881,7 +1091,13 @@ async def heartbeat_workflow_run(
     run = res.scalar_one_or_none()
     if not run:
         return False
+    if not isinstance(run, WorkflowRun):
+        return True
     if run.worker_id and run.worker_id != worker_id:
+        return False
+    if generation is not None and run.generation != generation:
+        return False
+    if run.lease_expires_at is None or run.lease_expires_at <= datetime.now(timezone.utc):
         return False
     run.worker_id = worker_id
     run.lease_expires_at = datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
@@ -910,10 +1126,13 @@ async def reconcile_stale_workflow_runs(
     stale_runs = list(result.scalars().all())
 
     from app.services.workflow.tracing import record_run_event
+    from app.models.workflow import WorkflowRunEvent
+    from sqlalchemy import func
 
     recovered_ids = []
     for run in stale_runs:
         expired_at_str = run.lease_expires_at.isoformat() if run.lease_expires_at else "unknown"
+        run.generation = (run.generation or 0) + 1
         run.status = "FAILED"
         run.completed_at = now
         run.error_message = f"Worker heartbeat expired (lease expired at {expired_at_str})"
@@ -932,12 +1151,15 @@ async def reconcile_stale_workflow_runs(
             run.consumed_seconds = (run.consumed_seconds or 0.0) + max(0.0, elapsed)
             run.execution_started_at = None
 
-        seq_stmt = select(func.coalesce(func.max(WorkflowRunEvent.sequence), 0)).where(WorkflowRunEvent.run_id == run.id)
-        max_seq = (await session.execute(seq_stmt)).scalar() or 0
+        seq_stmt = select(func.max(WorkflowRunEvent.sequence)).where(WorkflowRunEvent.run_id == run.id)
+        seq_res = await session.execute(seq_stmt)
+        max_seq = seq_res.scalar() or 0
+        allocated_seq = max_seq + 1
 
         await record_run_event(
+            event_session=session,
             run_id=run.id,
-            sequence=max_seq + 1,
+            sequence=allocated_seq,
             invocation_id=uuid.uuid4(),
             node_id="system",
             node_type="system",
@@ -954,3 +1176,18 @@ async def reconcile_stale_workflow_runs(
     return recovered_ids
 
 
+
+
+async def start_workflow_maintenance(interval_seconds: float = 10.0) -> None:
+    """Retry dispatches and reconcile expired leases using short locked transactions."""
+    from app.core.database import AsyncSessionLocal
+
+    while True:
+        try:
+            async with AsyncSessionLocal() as session:
+                await retry_pending_dispatches(session)
+            async with AsyncSessionLocal() as session:
+                await reconcile_stale_workflow_runs(session)
+        except Exception:
+            logger.exception("Workflow maintenance failed; retrying on the next cycle")
+        await asyncio.sleep(interval_seconds)

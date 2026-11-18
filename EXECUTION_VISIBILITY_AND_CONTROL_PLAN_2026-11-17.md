@@ -4,6 +4,19 @@ Date: 2026-11-17
 Status: Approved Implementation Plan  
 Prerequisite: Phase 1 (Thread Locking & Reliability Milestone) ✅ committed (`912e992`)
 
+### Recovery corrections — 2026-11-18
+
+The historical completion checklists below are superseded by this verification note for the current changes:
+
+- Resume now returns HTTP 202 and persists its decision in the dispatch outbox. Workers resume the same checkpoint with a fresh execution generation; callers poll run details for the result.
+- Application lifespan starts periodic dispatch retry and expired-lease reconciliation. Maintenance endpoints require administrator access.
+- Workers finalize through a conditional database update matching worker, generation, active status, and unexpired lease. Expired active runs require reconciliation rather than automatic replay.
+- Events commit independently with atomic sequence allocation. Control/recovery events use their existing locked transaction to avoid self-blocking. Persistence failures stop execution rather than falling back to an uncommitted transaction.
+- Tool occurrence identity is deterministic and protected by a database uniqueness constraint. Running/uncertain prior outcomes require reconciliation; execution metadata stays outside validated business arguments.
+- Apply Alembic through `workflow_continuations` before starting the changed application. This adds `workflow_dispatches.resume_payload` and the unique logical tool occurrence constraint. Existing duplicate logical occurrences must be reviewed before adding that constraint; no historical rows are deleted automatically.
+- Offline verification: 200 passed, 102 service-backed tests skipped, two dependency deprecation warnings. Pyright: zero errors and warnings. Migration SQL rendering is covered offline.
+- Disposable PostgreSQL verification remains pending: Docker was unavailable during this work. Integration fixtures and queued-resume expectations were corrected, but no application database or cloud resources were used.
+
 ---
 
 ## 1. Overview & Architectural Principles

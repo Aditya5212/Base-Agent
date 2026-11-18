@@ -43,6 +43,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     sweeper_task = None
+    workflow_maintenance_task = None
     app.state.startup_ready = False
 
     # Check database connectivity during startup
@@ -99,11 +100,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if settings.ENVIRONMENT == "production":
             raise RuntimeError("Required database is unavailable")
 
+    if initialization_ok:
+        from app.services.workflow_service import start_workflow_maintenance
+        workflow_maintenance_task = asyncio.create_task(start_workflow_maintenance())
+
     app.state.startup_ready = initialization_ok
     yield
 
     # Graceful shutdown
     logger.info("Shutting down %s...", settings.PROJECT_NAME)
+    if workflow_maintenance_task:
+        workflow_maintenance_task.cancel()
+        await asyncio.gather(workflow_maintenance_task, return_exceptions=True)
     if sweeper_task:
         sweeper_task.cancel()
         try:

@@ -21,6 +21,11 @@ def test_all_migrations_render_offline_with_execution_and_indexing_columns():
     assert "control_request" in ddl
     assert "budget_seconds" in ddl
     assert "lease_expires_at" in ddl
+    assert "generation" in ddl
+    assert "workflow_dispatches" in ddl
+    assert "workflow_tool_invocations" in ddl
+    assert "resume_payload" in ddl
+    assert "uq_tool_invocation_occurrence" in ddl
 
 
 @pytest.mark.asyncio

@@ -494,6 +494,7 @@ class WorkflowRunResponse(BaseModel):
     execution_started_at: datetime | None = None
     worker_id: str | None = None
     lease_expires_at: datetime | None = None
+    generation: int = 0
     input_data: dict[str, Any]
     output_data: dict[str, Any] | None
     error_message: str | None

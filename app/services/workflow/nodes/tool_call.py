@@ -5,13 +5,16 @@ from datetime import datetime, timezone
 import json
 import logging
 from typing import Any
+import uuid
 
 from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 from langgraph.types import interrupt
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.schemas.workflow import ToolCallNodeConfig
 from app.services.rag_tools import get_user_rag_tool_map
 from app.services.workflow.state import WorkflowState, render_template_value
+from app.services.workflow.tracing import _CURRENT_DB_SESSION, redact_value
 
 logger = logging.getLogger(__name__)
 
@@ -76,12 +79,78 @@ def build_tool_call_node(node_id: str, config_dict: dict[str, Any]):
             else:
                 resolved_args[arg_key] = rendered
 
-        # Attach deterministic tool idempotency key for HTTP/tool execution
+        # Resolve deterministic invocation identity and idempotency key
         run_id = state.get("run_id")
+        occurrence = 1
+        tool_idempotency_key = None
+        inv_id_uuid = None
+
         if run_id:
-            inv_id = state.get("current_invocation_id") or "1"
-            tool_idempotency_key = f"{run_id}:{node_id}:{inv_id}:1"
-            resolved_args.setdefault("__idempotency_key__", tool_idempotency_key)
+            node_occurrences = state.setdefault("node_occurrences", {})
+            occurrence = node_occurrences.get(node_id, 1)
+            node_invocations = state.setdefault("node_invocations", {})
+            occ_key = f"{node_id}:{occurrence}"
+            if occ_key not in node_invocations:
+                node_invocations[occ_key] = str(uuid.uuid5(uuid.UUID(str(run_id)), occ_key))
+            inv_id_str = node_invocations[occ_key]
+            try:
+                inv_id_uuid = uuid.UUID(inv_id_str)
+            except Exception:
+                inv_id_uuid = uuid.uuid4()
+            tool_idempotency_key = f"{run_id}:{node_id}:{inv_id_str}:{occurrence}"
+
+        # Check persisted tool invocation record for safe replay / result reuse
+        variables = dict(state.get("variables") or {})
+        history = list(state.get("node_history") or [])
+        history.append(node_id)
+
+        active_sess = _CURRENT_DB_SESSION.get()
+        use_db_invocations = active_sess is None or isinstance(active_sess, AsyncSession)
+
+        if run_id and tool_idempotency_key and use_db_invocations:
+            try:
+                from app.core.database import AsyncSessionLocal
+                from app.models.workflow import WorkflowToolInvocation
+                from sqlalchemy import select
+
+                async with AsyncSessionLocal() as inv_sess:
+                    # Serialize preparation with a unique logical occurrence, even after replay.
+                    from sqlalchemy.dialects.postgresql import insert
+                    await inv_sess.execute(
+                        insert(WorkflowToolInvocation).values(
+                            id=inv_id_uuid, run_id=uuid.UUID(str(run_id)), node_id=node_id,
+                            logical_occurrence=occurrence, idempotency_key=tool_idempotency_key,
+                            status="prepared", tool_name=config.tool_name,
+                            arguments_json=redact_value(resolved_args, max_str_len=500),
+                        ).on_conflict_do_nothing(constraint="uq_tool_invocation_occurrence")
+                    )
+                    stmt = select(WorkflowToolInvocation).where(
+                        WorkflowToolInvocation.run_id == uuid.UUID(str(run_id)),
+                        WorkflowToolInvocation.node_id == node_id,
+                        WorkflowToolInvocation.logical_occurrence == occurrence,
+                    ).with_for_update()
+                    res = await inv_sess.execute(stmt)
+                    cached_inv = res.scalar_one_or_none()
+                    if cached_inv is None:
+                        raise RuntimeError("Tool invocation preparation failed")
+                    tool_idempotency_key = cached_inv.idempotency_key
+                    inv_id_uuid = cached_inv.id
+                    if cached_inv.status in ("running", "uncertain", "failed"):
+                        raise RuntimeError("Previous tool outcome requires reconciliation before replay")
+
+                    if cached_inv and cached_inv.status == "succeeded" and cached_inv.result_data is not None:
+                        logger.info("Reusing cached tool result for idempotency key '%s'", tool_idempotency_key)
+                        res_val = (
+                            cached_inv.result_data.get("result")
+                            if isinstance(cached_inv.result_data, dict) and "result" in cached_inv.result_data and len(cached_inv.result_data) == 1
+                            else cached_inv.result_data
+                        )
+                        variables[config.output_variable] = res_val
+                        return {"variables": variables, "node_history": history}
+
+                    await inv_sess.commit()
+            except Exception as inv_err:
+                raise RuntimeError("Cannot safely prepare or replay tool invocation") from inv_err
 
         # Outside the error/retry wrapper: interrupts must reach the graph runtime.
         if config.requires_approval:
@@ -91,9 +160,34 @@ def build_tool_call_node(node_id: str, config_dict: dict[str, Any]):
             if not isinstance(decision, dict) or decision.get("approved") is not True:
                 raise PermissionError(f"Approval denied for tool '{config.tool_name}'")
 
-        variables = dict(state.get("variables") or {})
-        history = list(state.get("node_history") or [])
-        history.append(node_id)
+        if run_id and tool_idempotency_key and use_db_invocations:
+            try:
+                from app.core.database import AsyncSessionLocal
+                from app.models.workflow import WorkflowToolInvocation
+                from sqlalchemy import update
+
+                async with AsyncSessionLocal() as inv_sess:
+                    started = await inv_sess.execute(
+                        update(WorkflowToolInvocation)
+                        .where(
+                            WorkflowToolInvocation.idempotency_key == tool_idempotency_key,
+                            WorkflowToolInvocation.status == "prepared",
+                        )
+                        .values(status="running", updated_at=datetime.now(timezone.utc))
+                        .returning(WorkflowToolInvocation.id)
+                    )
+                    if started.scalar_one_or_none() is None:
+                        raise RuntimeError("Tool invocation already started; reconciliation required")
+                    await inv_sess.commit()
+            except Exception:
+                raise RuntimeError("Cannot persist tool execution start")
+
+        execution_metadata = {
+            "idempotency_key": tool_idempotency_key,
+            "run_id": str(run_id) if run_id else None,
+            "node_id": node_id,
+            "invocation_id": str(inv_id_uuid) if inv_id_uuid else None,
+        }
 
         async def _execute():
             # Check built-in tools
@@ -117,7 +211,7 @@ def build_tool_call_node(node_id: str, config_dict: dict[str, Any]):
 
             # Check dynamic custom tool registry (Phase 3.1)
             from app.core.database import AsyncSessionLocal
-            from app.services.tool_registry import ToolRegistry
+            from app.services.tool_registry import ToolRegistry, set_tool_execution_metadata, reset_tool_execution_metadata
 
             async with AsyncSessionLocal() as session:
                 custom_tools = await ToolRegistry.resolve_tools(
@@ -126,7 +220,11 @@ def build_tool_call_node(node_id: str, config_dict: dict[str, Any]):
                     db=session,
                 )
                 if custom_tools:
-                    return await custom_tools[0].ainvoke(resolved_args)
+                    token = set_tool_execution_metadata(execution_metadata)
+                    try:
+                        return await custom_tools[0].ainvoke(resolved_args)
+                    finally:
+                        reset_tool_execution_metadata(token)
 
             raise ValueError(f"Unknown or inaccessible tool '{config.tool_name}'")
 
@@ -147,9 +245,55 @@ def build_tool_call_node(node_id: str, config_dict: dict[str, Any]):
 
         # 2. Execute with ToolRetryMiddleware and ToolErrorMiddleware
         try:
-            variables[config.output_variable] = await _execute_with_retries()
+            exec_result = await _execute_with_retries()
+            variables[config.output_variable] = exec_result
+
+            if run_id and tool_idempotency_key and use_db_invocations:
+                try:
+                    from app.core.database import AsyncSessionLocal
+                    from app.models.workflow import WorkflowToolInvocation
+                    from sqlalchemy import update
+
+                    save_res = {"result": exec_result}
+                    async with AsyncSessionLocal() as inv_sess:
+                        await inv_sess.execute(
+                            update(WorkflowToolInvocation)
+                            .where(WorkflowToolInvocation.idempotency_key == tool_idempotency_key)
+                            .values(
+                                status="succeeded",
+                                result_data=save_res,
+                                updated_at=datetime.now(timezone.utc),
+                            )
+                        )
+                        await inv_sess.commit()
+                except Exception as exc:
+                    raise RuntimeError("Tool completed but its result could not be persisted") from exc
+
         except Exception as exc:
             logger.error("Tool execution node '%s' failed: %s", node_id, exc, exc_info=True)
+
+            if run_id and tool_idempotency_key and use_db_invocations:
+                try:
+                    from app.core.database import AsyncSessionLocal
+                    from app.models.workflow import WorkflowToolInvocation
+                    from sqlalchemy import update
+
+                    is_timeout = isinstance(exc, (TimeoutError, asyncio.TimeoutError))
+                    fail_status = "uncertain" if is_timeout else "failed"
+                    async with AsyncSessionLocal() as inv_sess:
+                        await inv_sess.execute(
+                            update(WorkflowToolInvocation)
+                            .where(WorkflowToolInvocation.idempotency_key == tool_idempotency_key)
+                            .values(
+                                status=fail_status,
+                                error_message=str(exc),
+                                updated_at=datetime.now(timezone.utc),
+                            )
+                        )
+                        await inv_sess.commit()
+                except Exception:
+                    pass
+
             if config.catch_errors:
                 variables[config.output_variable] = {
                     "error": True,

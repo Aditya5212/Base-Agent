@@ -53,8 +53,12 @@ async def test_durable_tool_approval_resume_after_pool_restart_uses_snapshot():
         success = [item for item in outcomes if not isinstance(item, Exception)]
         failure = [item for item in outcomes if isinstance(item, Exception)]
         assert len(success) == 1
-        assert success[0].status == "COMPLETED"
-        assert success[0].output_data == {"tool_result": 4}
+        assert success[0].status == "PENDING"
+        async with AsyncSessionLocal() as db:
+            assert await svc.claim_workflow_run(db, run.id, "approval-worker")
+            completed = await svc.execute_claimed_run(db, run.id, "approval-worker")
+            assert completed.status == "COMPLETED"
+            assert completed.output_data == {"tool_result": 4}
         assert len(failure) == 1 and isinstance(failure[0], HTTPException) and failure[0].status_code == 400
     finally:
         if run is not None:

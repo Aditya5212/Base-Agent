@@ -7,6 +7,7 @@ import re
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 
 from app.core.database import AsyncSessionLocal
 from app.schemas.agent import AgentConfig
@@ -50,7 +51,7 @@ def check_agent_input(messages: list[Any], cfg: AgentConfig) -> None:
         raise ValueError("Input does not match the configured validation pattern")
 
 
-async def invoke_agent(llm: Any, messages: list[Any], cfg: AgentConfig, user_id: str, runnable_config: Any) -> list[Any]:
+async def invoke_agent(llm: Any, messages: list[Any], cfg: AgentConfig, user_id: str, runnable_config: RunnableConfig) -> list[Any]:
     validate_runtime_config(cfg)
     check_agent_input(messages, cfg)
     schema = None
